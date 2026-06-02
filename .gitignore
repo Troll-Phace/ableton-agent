@@ -1,1 +1,12 @@
 .DS_Store
+node_modules/
+dist/
+
+*.log
+*.ablx
+*.tsbuildinfo
+
+.env
+
+.claude/settings.local.json
+.claude/state/
