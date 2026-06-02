@@ -1,0 +1,91 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Bash(git status)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(npm start)",
+      "Bash(npm run build)",
+      "Bash(npm run build:dev)",
+      "Bash(npm run package)",
+      "Bash(npm test)",
+      "Bash(npm run test:*)",
+      "Bash(npm run lint)",
+      "Bash(npm run format)",
+      "Bash(npx vitest *)",
+      "Bash(npx tsc --noEmit)"
+    ],
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(rm -rf /)",
+      "Bash(rm -rf /*)",
+      "Bash(: > *)",
+      "Bash(chmod 777 *)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat .claude/state/progress.md 2>/dev/null || echo 'No progress file yet.'",
+            "statusMessage": "Loading phase progress..."
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(cat /dev/stdin | jq -r '.tool_input.file_path // empty'); case \"$file\" in *.ts|*.tsx|*.js|*.jsx|*.json|*.css|*.html) npx prettier --write \"$file\" 2>/dev/null;; esac; exit 0",
+            "statusMessage": "Auto-formatting (Prettier)..."
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "file=$(cat /dev/stdin | jq -r '.tool_input.file_path // empty'); case \"$file\" in *.env*|*secret*|*credential*|*apikey*|*api-key*|*.lock|*-lock.*|*.ablx) echo \"Protected file: $file\" >&2; exit 2;; esac; exit 0"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo \"- $(date +'%Y-%m-%d %H:%M'): Session ended\" >> .claude/state/progress.md 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "matcher": "auto|manual",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cat .claude/state/progress.md 2>/dev/null || true",
+            "statusMessage": "Re-injecting phase context..."
+          }
+        ]
+      }
+    ]
+  },
+  "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"
+  }
+}
