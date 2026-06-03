@@ -16,6 +16,7 @@
   "exclude": [
     "tests/webview-render.test.ts",
     "tests/webview-transport.test.ts",
-    "tests/webview-close.test.ts"
+    "tests/webview-close.test.ts",
+    "tests/webview-settings.test.ts"
   ]
 }

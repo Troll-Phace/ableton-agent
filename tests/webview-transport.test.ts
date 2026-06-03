@@ -91,6 +91,7 @@ function recordingSink(): ChatSink & { statuses: string[]; errors: string[] } {
   return {
     statuses,
     errors,
+    renderHistory(): void {},
     appendAssistantDelta(): void {},
     finishAssistant(): void {},
     appendToolActivity(): void {},

@@ -19,7 +19,7 @@
  *     `ready`, `user_message`, `confirm_response`, `cancel`, `set_config`
  * - ext → webview  ({@link ServerMessage}):
  *     `config_state`, `assistant_delta`, `assistant_done`, `tool_activity`,
- *     `confirm_request`, `refs_updated`, `error`
+ *     `confirm_request`, `refs_updated`, `error`, `history`
  *
  * Phase 7 wires only the `ready` / `user_message` / `cancel` inbound subset and
  * the `assistant_delta` / `assistant_done` / `tool_activity` / `refs_updated` /
@@ -119,6 +119,29 @@ export interface ErrorPayload {
   message: string;
 }
 
+/**
+ * One restored conversation turn projected to renderable text (Phase 10 UI
+ * rehydration). Carries ONLY the display role + text — never tool internals,
+ * raw content blocks, system text, or any key/secret (§10).
+ */
+export interface HistoryItem {
+  /** Whether this line is a user utterance or an assistant reply. */
+  role: "user" | "assistant";
+  /** The display text for this turn (already projected by the extension). */
+  text: string;
+}
+
+/**
+ * `history` payload: the restored conversation, replayed into a freshly-opened
+ * chat window so a reopened session shows the prior messages rather than a blank
+ * chat. Sent once, right after `config_state` on `ready`, only when there is
+ * renderable history (§13, §10).
+ */
+export interface HistoryPayload {
+  /** The restored turns, in order, projected to user/assistant text lines. */
+  items: HistoryItem[];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Envelope + message unions                                                  */
 /* -------------------------------------------------------------------------- */
@@ -191,6 +214,16 @@ export type ConfirmRequestMessage = Envelope<
 export type RefsUpdatedMessage = Envelope<"refs_updated", RefsUpdatedPayload>;
 /** `error`: a failure to surface in the UI. */
 export type ErrorMessage = Envelope<"error", ErrorPayload>;
+/**
+ * `history`: the restored conversation replayed on `ready` (Phase 10 UI
+ * rehydration).
+ *
+ * DELIBERATE PROTOCOL EXTENSION: §13's message table was treated as "frozen"
+ * through Phases 7/8/9, but this is a real, documented feature — a reopened chat
+ * must show its restored history. This new server→webview type is intentional
+ * and additive; no existing message type is altered.
+ */
+export type HistoryMessage = Envelope<"history", HistoryPayload>;
 
 /** Discriminated union of every webview → extension message. */
 export type ClientMessage =
@@ -208,7 +241,8 @@ export type ServerMessage =
   | ToolActivityMessage
   | ConfirmRequestMessage
   | RefsUpdatedMessage
-  | ErrorMessage;
+  | ErrorMessage
+  | HistoryMessage;
 
 /** Discriminated union of every protocol message, either direction. */
 export type ProtocolMessage = ClientMessage | ServerMessage;
@@ -233,6 +267,7 @@ export interface MessageByType {
   confirm_request: ConfirmRequestMessage;
   refs_updated: RefsUpdatedMessage;
   error: ErrorMessage;
+  history: HistoryMessage;
 }
 
 /** The set of webview → ext discriminants, for runtime classification. */
@@ -253,6 +288,7 @@ const SERVER_TYPES: ReadonlySet<MessageType> = new Set<MessageType>([
   "confirm_request",
   "refs_updated",
   "error",
+  "history",
 ]);
 
 /* -------------------------------------------------------------------------- */
@@ -332,6 +368,24 @@ function isNonEmptyString(value: unknown): value is string {
 /** True if `value` is an array whose every element is a string. */
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
+}
+
+/**
+ * True if `value` is a valid {@link HistoryItem}: a record whose `role` is the
+ * string `"user"` or `"assistant"` and whose `text` is a string. Defensive (no
+ * throw) — used to validate restored `history` frames element-by-element.
+ */
+function isHistoryItem(value: unknown): value is HistoryItem {
+  return (
+    isRecord(value) &&
+    (value.role === "user" || value.role === "assistant") &&
+    typeof value.text === "string"
+  );
+}
+
+/** True if `value` is an array whose every element is a {@link HistoryItem}. */
+function isHistoryItemArray(value: unknown): value is HistoryItem[] {
+  return Array.isArray(value) && value.every(isHistoryItem);
 }
 
 /** True if `value` is a known {@link MessageType} discriminant. */
@@ -434,6 +488,11 @@ function validatePayload(type: MessageType, payload: unknown): string | null {
       return typeof payload.message === "string"
         ? null
         : `"error" requires a string "message"`;
+
+    case "history":
+      return isHistoryItemArray(payload.items)
+        ? null
+        : `"history" requires an "items" array of { role: "user" | "assistant", text: string }`;
 
     default: {
       // Exhaustiveness guard: every MessageType must be handled above.

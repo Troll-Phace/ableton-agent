@@ -17,7 +17,16 @@
 import "./chat.css";
 
 import { closeModal } from "./host-bridge.js";
-import { ChatTransport, type ChatSink } from "./transport.js";
+import {
+  createSettingsView,
+  type SettingsViewHandle,
+  type SettingsState,
+} from "./settings.js";
+import {
+  ChatTransport,
+  deriveWebSocketUrl,
+  type ChatSink,
+} from "./transport.js";
 
 /* -------------------------------------------------------------------------- */
 /* DOM construction                                                           */
@@ -33,6 +42,10 @@ interface ChatUi {
   readonly sendButton: HTMLButtonElement;
   /** The header close button ("✕") that closes the modal. */
   readonly closeButton: HTMLButtonElement;
+  /** The header gear button that opens the settings view. */
+  readonly settingsButton: HTMLButtonElement;
+  /** Empty host element the settings view mounts into (in place of the chat). */
+  readonly settingsContainer: HTMLElement;
 }
 
 /**
@@ -55,6 +68,20 @@ function buildUi(root: HTMLElement): ChatUi {
   titleEl.id = "header-title";
   titleEl.textContent = "Claude";
 
+  // Header controls cluster: gear (settings) + close, right-aligned.
+  const headerControls = document.createElement("div");
+  headerControls.id = "header-controls";
+
+  const settingsButton = document.createElement("button");
+  settingsButton.id = "settings-button";
+  settingsButton.type = "button";
+  settingsButton.setAttribute("aria-label", "Settings");
+  // The glyph is decorative; the accessible name comes from aria-label.
+  const settingsGlyph = document.createElement("span");
+  settingsGlyph.setAttribute("aria-hidden", "true");
+  settingsGlyph.textContent = "⚙";
+  settingsButton.appendChild(settingsGlyph);
+
   const closeButton = document.createElement("button");
   closeButton.id = "close-button";
   closeButton.type = "button";
@@ -65,12 +92,18 @@ function buildUi(root: HTMLElement): ChatUi {
   closeGlyph.textContent = "✕";
   closeButton.appendChild(closeGlyph);
 
-  header.append(titleEl, closeButton);
+  headerControls.append(settingsButton, closeButton);
+  header.append(titleEl, headerControls);
 
   const log = document.createElement("div");
   log.id = "log";
   log.setAttribute("role", "log");
   log.setAttribute("aria-live", "polite");
+
+  // The settings view mounts here, in place of the chat. Empty (and CSS-hidden)
+  // until the first-run gate or the gear opens it.
+  const settingsContainer = document.createElement("div");
+  settingsContainer.id = "settings-container";
 
   const inputBar = document.createElement("div");
   inputBar.id = "input-bar";
@@ -93,9 +126,16 @@ function buildUi(root: HTMLElement): ChatUi {
   sendButton.textContent = "Send";
 
   inputBar.append(label, input, sendButton);
-  root.append(header, log, inputBar);
+  root.append(header, log, settingsContainer, inputBar);
 
-  return { log, input, sendButton, closeButton };
+  return {
+    log,
+    input,
+    sendButton,
+    closeButton,
+    settingsButton,
+    settingsContainer,
+  };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -240,6 +280,44 @@ export function createSink(
   };
 
   const sink: ChatSink = {
+    renderHistory(items: { role: "user" | "assistant"; text: string }[]): void {
+      if (items.length === 0) {
+        return;
+      }
+      // Each restored message is a finished, standalone bubble reusing the SAME
+      // classes as live bubbles: `.msg.msg-user` (right-aligned, identical to a
+      // locally-echoed user bubble) and `.msg.msg-agent` (a finished assistant
+      // bubble — full text set at once, NO caret, NOT streamed). All text via
+      // `.textContent`, so model/host strings carry no markup (XSS-inert).
+      //
+      // This deliberately does NOT touch the streaming accumulator
+      // (`streamBubble`/`streamText`/`streamCaret`), so the next real
+      // `assistant_delta` still opens a fresh bubble.
+      for (const item of items) {
+        const bubble = document.createElement("div");
+        bubble.className =
+          item.role === "user" ? "msg msg-user" : "msg msg-agent";
+        bubble.textContent = item.text;
+        log.appendChild(bubble);
+      }
+
+      // A subtle, decorative divider separating the restored block from the
+      // live conversation. Token-styled, reduced-motion safe (the global
+      // prefers-reduced-motion rule disables animation), and a11y-inert: it is
+      // marked aria-hidden so the restored bubbles (already announced as log
+      // content) are not double-narrated, and it traps no focus.
+      const divider = document.createElement("div");
+      divider.className = "history-divider";
+      divider.setAttribute("aria-hidden", "true");
+      const dividerLabel = document.createElement("span");
+      dividerLabel.className = "history-divider-label";
+      dividerLabel.textContent = "Restored from your last session";
+      divider.appendChild(dividerLabel);
+      log.appendChild(divider);
+
+      scrollToBottom();
+    },
+
     appendAssistantDelta(text: string): void {
       const textNode = streamText ?? openStreamBubble();
       textNode.appendData(text);
@@ -413,7 +491,14 @@ function mount(): void {
     throw new Error('Webview root element "#app" not found.');
   }
 
-  const { log, input, sendButton, closeButton } = buildUi(root);
+  const {
+    log,
+    input,
+    sendButton,
+    closeButton,
+    settingsButton,
+    settingsContainer,
+  } = buildUi(root);
 
   // Holder so the confirm-card callback can reach the transport: the sink is
   // built first (the transport takes it in its constructor), so the callback
@@ -422,6 +507,70 @@ function mount(): void {
   const sink = createSink(log, (planId, approved) => {
     holder.transport?.sendConfirmResponse(planId, approved);
   });
+
+  // --- Settings view gating --------------------------------------------- //
+  // The latest non-secret config snapshot. `null` until the first
+  // `config_state` arrives; the first frame decides whether the settings view
+  // gates the chat (no key yet) or the chat shows immediately.
+  let configState: SettingsState | null = null;
+  let settingsView: SettingsViewHandle | null = null;
+
+  /** Show the chat shell; hide the settings view. */
+  const showChat = (): void => {
+    settingsView?.destroy();
+    settingsView = null;
+    root.classList.remove("settings-open");
+    input.focus();
+  };
+
+  /** Mount (or re-render) the settings view in place of the chat. */
+  const openSettings = (): void => {
+    const state: SettingsState = configState ?? { hasKey: false, model: "" };
+    root.classList.add("settings-open");
+    if (settingsView !== null) {
+      settingsView.update(state);
+      return;
+    }
+    settingsView = createSettingsView(
+      settingsContainer,
+      state,
+      (apiKey, model) => {
+        // The key's only exit point. Forward it to the host; the settings view
+        // has already scrubbed its own input by the time this returns.
+        holder.transport?.sendSetConfig(apiKey, model);
+      }
+    );
+  };
+
+  /**
+   * Apply a `config_state` snapshot. The FIRST frame gates first-run: if no key
+   * is on file, open the settings view instead of the chat. A later frame with
+   * `hasKey: true` tears the settings view down and reveals the chat (unless the
+   * user opened settings manually, in which case it stays open and just
+   * refreshes its non-secret status).
+   */
+  const onConfigState = (state: SettingsState): void => {
+    const isFirstFrame = configState === null;
+    const justGainedKey =
+      !isFirstFrame &&
+      configState !== null &&
+      !configState.hasKey &&
+      state.hasKey;
+    configState = state;
+
+    if (isFirstFrame && !state.hasKey) {
+      openSettings();
+      return;
+    }
+    if (settingsView !== null) {
+      settingsView.update(state);
+      // A key was just saved during first-run gating → reveal the chat. If the
+      // user opened settings manually (key already present), leave it open.
+      if (justGainedKey) {
+        showChat();
+      }
+    }
+  };
 
   /** Append the user's own bubble locally (the transport does not echo it). */
   const appendUserBubble = (text: string): void => {
@@ -432,7 +581,9 @@ function mount(): void {
     log.scrollTop = log.scrollHeight;
   };
 
-  const transport = new ChatTransport(sink);
+  const transport = new ChatTransport(sink, deriveWebSocketUrl(), {
+    onConfigState,
+  });
   holder.transport = transport;
 
   /** Read, render, and send the current input; clear and refocus. */
@@ -458,6 +609,17 @@ function mount(): void {
   closeButton.addEventListener("click", () => {
     closeModal();
   });
+  settingsButton.addEventListener("click", () => {
+    // Toggle: if settings are already open, the gear returns to the chat
+    // (only when a key is on file — first-run gating cannot be dismissed).
+    if (settingsView !== null) {
+      if (configState?.hasKey === true) {
+        showChat();
+      }
+      return;
+    }
+    openSettings();
+  });
   input.addEventListener("input", autoSize);
   input.addEventListener("keydown", (event: KeyboardEvent) => {
     // Enter sends; Shift+Enter inserts a newline.
@@ -474,9 +636,20 @@ function mount(): void {
   // the key. Once a card is answered it removes its listener, so its Esc no
   // longer fires and a subsequent Esc closes the chat as normal.
   document.addEventListener("keydown", (event: KeyboardEvent) => {
-    if (event.key === "Escape" && !event.defaultPrevented) {
-      closeModal();
+    if (event.key !== "Escape" || event.defaultPrevented) {
+      return;
     }
+    // While the settings view is open: Esc returns to the chat if a key is on
+    // file (dismissible), but is swallowed during first-run gating (no key yet),
+    // so the user cannot escape into a chat that has no key to operate with.
+    if (settingsView !== null) {
+      event.preventDefault();
+      if (configState?.hasKey === true) {
+        showChat();
+      }
+      return;
+    }
+    closeModal();
   });
 
   transport.connect();

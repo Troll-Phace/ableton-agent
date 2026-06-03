@@ -50,6 +50,21 @@ const RECONNECT_BACKOFF_MS = 750;
  */
 export interface ChatSink {
   /**
+   * Render a restored conversation transcript into the message log, in
+   * chronological order, BEFORE any live messages. Called once at session
+   * start (driven by the host's `history` frame) when there is prior history.
+   *
+   * Each item is a finished, standalone bubble reusing the same DOM/classes as
+   * a locally-echoed user bubble (`role: "user"`) or a finished assistant
+   * bubble (`role: "assistant"`) — assistant text is set all at once, never
+   * streamed and with no caret. This MUST NOT touch the live-streaming
+   * accumulator, so the next real `assistant_delta` still opens a fresh bubble.
+   *
+   * @param items - the restored messages in chronological order (text-only).
+   */
+  renderHistory(items: { role: "user" | "assistant"; text: string }[]): void;
+
+  /**
    * Append streamed assistant text to the in-flight assistant line, creating
    * that line on first delta of a turn.
    *
@@ -112,6 +127,9 @@ export interface ChatSink {
  */
 export class ChatTransport {
   private readonly sink: ChatSink;
+  private readonly onConfigState:
+    | ((state: { hasKey: boolean; model: string }) => void)
+    | undefined;
   private readonly url: string;
   private socket: WebSocket | null = null;
   private reconnectAttempts = 0;
@@ -132,10 +150,23 @@ export class ChatTransport {
    * @param sink - the rendering surface for inbound frames and status lines.
    * @param url - the WS URL to connect to. Defaults to {@link deriveWebSocketUrl}
    *   (same-origin, nonce-carrying), overridable for tests.
+   * @param options - optional wiring. `onConfigState` is invoked with the
+   *   non-secret `{ hasKey, model }` snapshot whenever a `config_state` frame
+   *   arrives (never the key — that only ever flows the other way). Threaded in
+   *   here, mirroring how `onConfirmResponse` threads through `createSink`, so
+   *   the transport itself stays DOM-free and the first-run gate lives in
+   *   `main.ts`.
    */
-  public constructor(sink: ChatSink, url: string = deriveWebSocketUrl()) {
+  public constructor(
+    sink: ChatSink,
+    url: string = deriveWebSocketUrl(),
+    options: {
+      onConfigState?: (state: { hasKey: boolean; model: string }) => void;
+    } = {}
+  ) {
     this.sink = sink;
     this.url = url;
+    this.onConfigState = options.onConfigState;
   }
 
   /** Open the socket (idempotent while a socket is already live/connecting). */
@@ -187,6 +218,34 @@ export class ChatTransport {
       { planId, approved },
       crypto.randomUUID()
     );
+    this.socket.send(serialize(envelope));
+  }
+
+  /**
+   * Send a `set_config` carrying an optional API key and/or model. No-op (with a
+   * status line) when disconnected. The key, when present, travels ONE WAY — out
+   * to the host — and is never retained here: the caller (the settings view)
+   * scrubs its own input after handing it off.
+   *
+   * @param apiKey - the new API key, or `undefined` to leave the host's key
+   *   unchanged (omitted from the payload entirely when undefined).
+   * @param model - the new model id, or `undefined` to leave it unchanged.
+   */
+  public sendSetConfig(apiKey?: string, model?: string): void {
+    if (this.socket === null || this.socket.readyState !== WebSocket.OPEN) {
+      this.sink.appendStatus("Not connected — settings not saved.");
+      return;
+    }
+    // Omit absent fields so a model-only change never clobbers the stored key
+    // and vice versa (the protocol fields are optional).
+    const payload: { apiKey?: string; model?: string } = {};
+    if (apiKey !== undefined) {
+      payload.apiKey = apiKey;
+    }
+    if (model !== undefined) {
+      payload.model = model;
+    }
+    const envelope = message("set_config", payload, crypto.randomUUID());
     this.socket.send(serialize(envelope));
   }
 
@@ -328,8 +387,25 @@ export class ChatTransport {
       this.sink.appendConfirmCard(planId, summary, actions);
       return;
     }
-    // config_state is not wired this phase (Phase 10).
-    console.log("[transport] unhandled server frame:", msg.type);
+    if (isMessageOfType(msg, "config_state")) {
+      // Non-secret only: { hasKey, model }. Forwarded to main.ts's first-run
+      // gate; the key itself is NEVER part of this frame and never enters the
+      // webview.
+      const { hasKey, model } = msg.payload;
+      this.onConfigState?.({ hasKey, model });
+      return;
+    }
+    if (isMessageOfType(msg, "history")) {
+      // Restored prior-session transcript (text-only, chronological). Rendered
+      // as finished, standalone bubbles BEFORE any live message; never touches
+      // the streaming accumulator.
+      this.sink.renderHistory(msg.payload.items);
+      return;
+    }
+    // Exhaustive: every ServerMessage variant is handled above, so `msg` is
+    // `never` here. This guard keeps the switch honest if the protocol grows.
+    const _exhaustive: never = msg;
+    console.log("[transport] unhandled server frame:", _exhaustive);
   }
 }
 

@@ -391,6 +391,20 @@ export interface SetSpec {
   scenes?: NodeSpec[];
   cuePoints?: NodeSpec[];
 }
+
+/**
+ * Optional control over the fake `ctx.environment` (Phase 10). Both fields
+ * default to `undefined` — the SDK's first-class "no storage granted" path —
+ * so existing tests that never touch persistence are unaffected. A test that
+ * exercises the config / transcript stores passes a real `fs.mkdtempSync` dir
+ * here (and cleans it up in `afterEach`).
+ */
+export interface EnvSpec {
+  /** `ctx.environment.storageDirectory` (defaults to `undefined`). */
+  storageDirectory?: string;
+  /** `ctx.environment.tempDirectory` (defaults to `undefined`). */
+  tempDirectory?: string;
+}
 // #endregion
 
 // #region Public context interface
@@ -413,6 +427,16 @@ export interface SetSpec {
  */
 export interface FakeExtensionContext {
   application: { song: FakeSong };
+
+  /**
+   * Mirror of the SDK `ctx.environment`. Per `.claude/rules/testing.md` the
+   * FakeExtensionContext is expected to expose `environment`; consumers
+   * (`ChatSession`, the config/transcript stores) read `storageDirectory` /
+   * `tempDirectory`, both of which the real SDK types as `string | undefined`.
+   * Backed by sync own-properties so a plain `ctx.environment.storageDirectory`
+   * read works exactly like the real (synchronous) getter.
+   */
+  environment: { storageDirectory?: string; tempDirectory?: string };
 
   /** Synchronous; throws a single generic `Error` for deleted/wrong-type/unknown — never returns null. */
   getObjectFromHandle<T>(handle: Handle, type: AbstractCtor<T>): T;
@@ -505,7 +529,10 @@ export interface FakeExtensionContext {
  * {@link SetSpec} to customize, or omit it for the deterministic default Set
  * documented on {@link makeFakeContext}.
  */
-export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
+export function makeFakeContext(
+  spec?: SetSpec,
+  env: EnvSpec = {}
+): FakeExtensionContext {
   let nextId = 1n;
   const allocId = (): bigint => nextId++;
 
@@ -1542,6 +1569,10 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
 
   return {
     application: { song },
+    environment: {
+      storageDirectory: env.storageDirectory,
+      tempDirectory: env.tempDirectory,
+    },
     getObjectFromHandle,
     withinTransaction,
     get transactions() {

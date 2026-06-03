@@ -22,6 +22,17 @@
  * leaks a port or an open socket.
  */
 
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { WebSocket } from "ws";
@@ -1319,6 +1330,410 @@ describe("chatSession_confirmation_roundTrip", () => {
     // No confirm_request frame was sent for a pre-aborted signal.
     await settle();
     expect(collector.ofType("confirm_request")).toHaveLength(0);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 11. Session glue — set_config persistence + no-key-leak (Phase 10, §10)      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Drives the REAL `set_config` path over the `ws` client against a `ChatSession`
+ * whose fake context carries a temp `storageDirectory`. Proves the §10
+ * contract end-to-end:
+ *  - a `set_config` with a key writes `config.json` (key present on disk) and
+ *    replies `config_state` with `hasKey:true` + the new model;
+ *  - a `set_config` against an UNDEFINED storage dir still flips in-memory
+ *    `hasKey` and replies `config_state` (nothing persisted);
+ *  - the key the client sent NEVER appears in any server→client frame, even
+ *    after `set_config` (the no-key-leak guarantee, applied over EVERY frame).
+ *
+ * It also proves transcript restore across two `ChatSession` instances sharing
+ * one temp dir: a scripted turn persists, and a second session restores the
+ * prior turn's transcript on construction.
+ */
+describe("chatSession_setConfig_persistsAndNeverLeaksKey", () => {
+  /** Per-test temp storage dir for the session's config / transcript. */
+  let storageDir: string;
+
+  beforeEach(() => {
+    storageDir = mkdtempSync(join(tmpdir(), "abl-session-"));
+  });
+
+  afterEach(() => {
+    rmSync(storageDir, { recursive: true, force: true });
+  });
+
+  /** A fake context with a real temp `storageDirectory` wired into env. */
+  function fakeCtxWithStorage(
+    dir: string | undefined
+  ): ConstructorParameters<typeof ChatSession>[0] {
+    return makeFakeContext(undefined, {
+      storageDirectory: dir,
+    }) as unknown as ConstructorParameters<typeof ChatSession>[0];
+  }
+
+  /** A leak-bearing key value used as the input the client sends. */
+  const SECRET_KEY = "sk-ant-set-config-secret";
+
+  it("chatSession_setConfigWithKey_writesConfigJsonAndRepliesHasKeyTrue", async () => {
+    const { server, info } = await startServer();
+    new ChatSession(fakeCtxWithStorage(storageDir), server, {
+      model: "claude-sonnet-4-6",
+    });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(
+      serialize(
+        message(
+          "set_config",
+          { apiKey: SECRET_KEY, model: "claude-opus-4-20250514" },
+          "id-sc1"
+        )
+      )
+    );
+    await collector.until((f) => f.some((m) => m.type === "config_state"));
+
+    // The reply carries hasKey:true + the new model — never the key value.
+    const cfg = collector.ofType("config_state")[0];
+    if (cfg.type === "config_state") {
+      expect(cfg.payload.hasKey).toBe(true);
+      expect(cfg.payload.model).toBe("claude-opus-4-20250514");
+    }
+
+    // The key landed on disk (Node-only persistence), and the model too.
+    const onDisk = readFileSync(join(storageDir, "config.json"), "utf8");
+    expect(onDisk).toContain(SECRET_KEY);
+    expect(onDisk).toContain("claude-opus-4-20250514");
+
+    // Yet NO outbound frame — config_state or otherwise — leaked the key.
+    assertNoKeyLeak(collector.frames);
+    // Belt-and-suspenders: the literal secret never crossed any frame.
+    for (const frame of collector.frames) {
+      expect(serialize(frame)).not.toContain(SECRET_KEY);
+    }
+  });
+
+  it("chatSession_setConfigUndefinedStorage_flipsInMemoryHasKeyNoPersist", async () => {
+    const { server, info } = await startServer();
+    // Undefined storageDirectory: nothing to persist, but the live session
+    // must still honor the change in-memory and reply config_state.
+    new ChatSession(fakeCtxWithStorage(undefined), server, {
+      model: "claude-sonnet-4-6",
+    });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    // First confirm the pre-set_config state has no key.
+    socket.send(serialize(message("ready", {}, "id-r")));
+    await collector.until((f) => f.some((m) => m.type === "config_state"));
+    const before = collector.ofType("config_state")[0];
+    if (before.type === "config_state") {
+      expect(before.payload.hasKey).toBe(false);
+    }
+
+    // Now set a key with no storage dir → in-memory flip, fresh config_state.
+    socket.send(
+      serialize(message("set_config", { apiKey: SECRET_KEY }, "id-sc2"))
+    );
+    await collector.until(
+      (f) => f.filter((m) => m.type === "config_state").length >= 2
+    );
+    const after = collector.ofType("config_state")[1];
+    if (after.type === "config_state") {
+      expect(after.payload.hasKey).toBe(true);
+    }
+    assertNoKeyLeak(collector.frames);
+    for (const frame of collector.frames) {
+      expect(serialize(frame)).not.toContain(SECRET_KEY);
+    }
+  });
+
+  it("chatSession_transcriptRestore_secondSessionSeesPriorTurn", async () => {
+    // A scripted runner that appends one assistant message and returns the grown
+    // transcript — the session persists it under storageDir after the turn.
+    const runTurn = (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const grown: typeof args.transcript = [
+        ...args.transcript,
+        { role: "user", content: args.text },
+        { role: "assistant", content: "remembered-reply" },
+      ];
+      args.events.assistantDone("end_turn");
+      return Promise.resolve({ ok: true, messages: grown, refs: [] });
+    };
+
+    // Session 1: run a turn that persists the transcript to disk.
+    const first = await startServer();
+    const session1 = new ChatSession(
+      fakeCtxWithStorage(storageDir),
+      first.server,
+      {
+        runTurn,
+      }
+    );
+    const socket1 = await connect(toWsUrl(first.info.url));
+    const collector1 = new FrameCollector(socket1);
+    socket1.send(
+      serialize(message("user_message", { text: "remember this" }, "id-t1"))
+    );
+    await collector1.until((f) => f.some((m) => m.type === "refs_updated"));
+    // Flush on dispose for good measure, then tear this server down.
+    session1.dispose();
+    await first.server.close();
+
+    // The transcript landed under sessions/.
+    expect(existsSync(join(storageDir, "sessions"))).toBe(true);
+
+    // Session 2: a brand-new ChatSession sharing the same storageDir restores
+    // the prior turn on construction. We prove the restored transcript is fed
+    // forward by having the runner echo back its length.
+    let observedPriorLength = -1;
+    const runTurn2 = (args: TurnRunArgs): Promise<TurnRunResult> => {
+      observedPriorLength = args.transcript.length;
+      args.events.assistantDone("end_turn");
+      return Promise.resolve({ ok: true, messages: args.transcript, refs: [] });
+    };
+    const second = await startServer();
+    new ChatSession(fakeCtxWithStorage(storageDir), second.server, {
+      runTurn: runTurn2,
+    });
+    const socket2 = await connect(toWsUrl(second.info.url));
+    const collector2 = new FrameCollector(socket2);
+    socket2.send(
+      serialize(message("user_message", { text: "continue" }, "id-t2"))
+    );
+    await collector2.until((f) => f.some((m) => m.type === "refs_updated"));
+
+    // The restored transcript had the 2 messages session 1 persisted (user +
+    // assistant), proving cross-session continuity through the real store.
+    expect(observedPriorLength).toBe(2);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 12. Session glue — `ready` history rehydration (Phase 10 follow-up, §10/§13)  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Drives the REAL `handleReady` → `projectHistory`/`extractDisplayText` path over
+ * a `ws` client against a `ChatSession` whose transcript is restored from a temp
+ * `storageDirectory` (a `sessions/<id>.json` written before construction). Proves:
+ *  - on `ready`, the server emits `config_state` THEN exactly one `history` frame
+ *    whose `items` equal the projected user/assistant display text, IN ORDER;
+ *  - tool_result-only user messages and tool_use-only assistant messages are
+ *    SKIPPED, while an assistant message carrying BOTH a text block and a tool_use
+ *    block contributes its text (the projection rule);
+ *  - an empty/first-run transcript yields NO `history` frame (only `config_state`);
+ *  - the §10 no-key-leak guarantee still holds over every frame, the history one
+ *    included.
+ *
+ * A `MessageParam`-typed transcript is written to disk; `MessageParam.content`
+ * admits string OR an array of content blocks, which is exactly what the
+ * projection iterates — so this exercises both the string and array branches of
+ * `extractDisplayText`.
+ */
+describe("chatSession_ready_rehydratesHistory", () => {
+  /** Per-test temp storage dir holding the seeded `sessions/<id>.json`. */
+  let storageDir: string;
+
+  beforeEach(() => {
+    storageDir = mkdtempSync(join(tmpdir(), "abl-history-"));
+  });
+
+  afterEach(() => {
+    rmSync(storageDir, { recursive: true, force: true });
+  });
+
+  /** A fake context wired to the temp storage dir (transcript restore on ctor). */
+  function fakeCtxWithStorage(
+    dir: string | undefined
+  ): ConstructorParameters<typeof ChatSession>[0] {
+    return makeFakeContext(undefined, {
+      storageDirectory: dir,
+    }) as unknown as ConstructorParameters<typeof ChatSession>[0];
+  }
+
+  /** Write a transcript to `<storageDir>/sessions/<id>.json` so it is restored. */
+  function seedTranscript(messages: unknown[]): void {
+    const sessionsDir = join(storageDir, "sessions");
+    mkdirSync(sessionsDir, { recursive: true });
+    writeFileSync(
+      join(sessionsDir, "seeded.json"),
+      JSON.stringify(messages),
+      "utf8"
+    );
+  }
+
+  /**
+   * A realistic tool-use round transcript:
+   *   1. user (string)                          → kept ("what's in this track?")
+   *   2. assistant [text + tool_use]            → kept (its text only)
+   *   3. user [tool_result]                     → SKIPPED (no text block)
+   *   4. assistant [text]                       → kept (final reply)
+   * Expected projected items: exactly the 3 text turns (1, 2, 4) in order; the
+   * tool_use / tool_result internals never reach the wire.
+   */
+  const TOOL_ROUND_TRANSCRIPT: unknown[] = [
+    { role: "user", content: "what's in this track?" },
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "Let me check the project." },
+        {
+          type: "tool_use",
+          id: "toolu_1",
+          name: "live_get_project",
+          input: {},
+        },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result",
+          tool_use_id: "toolu_1",
+          content: "tracks: [Bass]",
+        },
+      ],
+    },
+    {
+      role: "assistant",
+      content: [{ type: "text", text: "A Reverb and a Compressor." }],
+    },
+  ];
+
+  it("chatSession_ready_emitsConfigStateThenHistoryWithProjectedItems", async () => {
+    seedTranscript(TOOL_ROUND_TRANSCRIPT);
+
+    const { server, info } = await startServer();
+    // The session restores the seeded transcript on construction.
+    new ChatSession(fakeCtxWithStorage(storageDir), server, {
+      model: "claude-sonnet-4-6",
+    });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("ready", {}, "id-ready")));
+    await collector.until((f) => f.some((m) => m.type === "history"));
+    // Drain so any (erroneous) second history frame the suppression bug would add
+    // has a chance to arrive before we count — pins the count at one.
+    await settle();
+
+    // Exactly one config_state and one history frame, config_state FIRST.
+    expect(collector.ofType("config_state")).toHaveLength(1);
+    expect(collector.ofType("history")).toHaveLength(1);
+    const types = collector.frames.map((f) => f.type);
+    expect(types.indexOf("config_state")).toBeLessThan(
+      types.indexOf("history")
+    );
+
+    // The projected items: the tool_result-only user msg and the tool_use block
+    // are dropped; the assistant [text + tool_use] contributes ONLY its text.
+    const hist = collector.ofType("history")[0];
+    expect(hist.type).toBe("history");
+    if (hist.type === "history") {
+      expect(hist.payload.items).toEqual([
+        { role: "user", text: "what's in this track?" },
+        { role: "assistant", text: "Let me check the project." },
+        { role: "assistant", text: "A Reverb and a Compressor." },
+      ]);
+    }
+
+    // No history frame may carry an API key (§10 — text-only display projection).
+    assertNoKeyLeak(collector.frames);
+  });
+
+  it("chatSession_ready_multiTextBlocksJoinedByNewline", async () => {
+    // An assistant turn whose content array has two text blocks → joined by "\n";
+    // a string-content user turn → used verbatim. Pins the join rule of
+    // `extractDisplayText` and the string branch.
+    seedTranscript([
+      { role: "user", content: "summarize" },
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Line one." },
+          { type: "text", text: "Line two." },
+        ],
+      },
+    ]);
+
+    const { server, info } = await startServer();
+    new ChatSession(fakeCtxWithStorage(storageDir), server);
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("ready", {}, "id-ready")));
+    await collector.until((f) => f.some((m) => m.type === "history"));
+
+    const hist = collector.ofType("history")[0];
+    if (hist.type === "history") {
+      expect(hist.payload.items).toEqual([
+        { role: "user", text: "summarize" },
+        { role: "assistant", text: "Line one.\nLine two." },
+      ]);
+    }
+  });
+
+  it("chatSession_ready_pureToolTranscript_emitsNoHistoryFrame", async () => {
+    // A transcript with ONLY tool plumbing (tool_use assistant + tool_result user)
+    // projects to zero renderable items → NO history frame is sent (config_state
+    // only), so a session that holds only tool turns never sends an empty frame.
+    seedTranscript([
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: "toolu_1",
+            name: "live_get_project",
+            input: {},
+          },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "toolu_1", content: "ok" },
+        ],
+      },
+    ]);
+
+    const { server, info } = await startServer();
+    new ChatSession(fakeCtxWithStorage(storageDir), server);
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("ready", {}, "id-ready")));
+    await collector.until((f) => f.some((m) => m.type === "config_state"));
+    // Drain so a (buggy) history frame for a no-text transcript would land first.
+    await settle();
+
+    expect(collector.ofType("config_state")).toHaveLength(1);
+    expect(collector.ofType("history")).toHaveLength(0);
+  });
+
+  it("chatSession_ready_emptyFirstRunTranscript_emitsNoHistoryFrame", async () => {
+    // No seeded sessions/ at all → empty restored transcript → config_state only.
+    const { server, info } = await startServer();
+    new ChatSession(fakeCtxWithStorage(storageDir), server);
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("ready", {}, "id-ready")));
+    await collector.until((f) => f.some((m) => m.type === "config_state"));
+    await settle();
+
+    expect(collector.ofType("config_state")).toHaveLength(1);
+    expect(collector.ofType("history")).toHaveLength(0);
   });
 });
 

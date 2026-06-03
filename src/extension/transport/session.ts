@@ -5,11 +5,12 @@
  *
  * One {@link ChatSession} exists **per open modal**. It owns:
  *  - the inbound dispatcher (`server.onMessage`), branching with
- *    {@link isMessageOfType} over the §13 client subset wired this phase
- *    (`ready` / `user_message` / `cancel`); `confirm_response` / `set_config`
- *    are defined-but-unwired (Phases 9/10) and ignored gracefully;
+ *    {@link isMessageOfType} over the §13 client subset
+ *    (`ready` / `user_message` / `cancel` / `confirm_response` / `set_config`);
+ *    any other type is ignored gracefully;
  *  - the in-memory transcript (`Anthropic.MessageParam[]`) carried across turns
- *    of this session (durable persistence is Phase 10);
+ *    of this session and mirrored to disk after each turn for cross-session
+ *    continuity (§10, restored on construction);
  *  - an {@link AgentEvents} adapter that serializes each loop event to a §13
  *    socket frame via `server.send(message(...))`, minting a fresh
  *    `crypto.randomUUID()` id per frame;
@@ -23,7 +24,9 @@
  *
  * **Key discipline (§10):** the Anthropic API key never enters any outbound
  * {@link ProtocolMessage} — `config_state` carries only the boolean `hasKey`. The
- * key lives in Node (env for now; Phase 10 reads it from `config.json`).
+ * key lives in Node only, read from `storageDirectory/config.json` (with the
+ * `ANTHROPIC_API_KEY` env fallback) via the config store; it is never echoed by
+ * `set_config`.
  *
  * **Concurrent turns:** a single turn runs at a time. If a `user_message` arrives
  * while a turn is in flight, the session rejects it with one `error` frame
@@ -45,15 +48,29 @@ import {
   isMessageOfType,
   message,
   type ClientMessage,
+  type HistoryItem,
   type ProtocolMessage,
 } from "../../shared/protocol.js";
 import { runAgentLoop, type AgentEvents } from "../agent-loop.js";
-import { createClaudeClient, MODEL } from "../claude-client.js";
+import { createClaudeClient } from "../claude-client.js";
+import {
+  loadConfig,
+  resolveApiKey,
+  resolveModel,
+  saveConfig,
+  toConfigState,
+  type Config,
+} from "../config-store.js";
 import { ReferenceTable } from "../references.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import { LiveToolRuntime } from "../tool-registry.js";
 
 import type { TransportServer } from "./server.js";
+import {
+  loadLatestTranscript,
+  newSessionId,
+  persistTranscript,
+} from "./transcript-store.js";
 
 /** Log prefix mirroring the host's `console.*` convention. */
 const LOG_PREFIX = "[session]";
@@ -174,9 +191,35 @@ export class ChatSession<V extends ApiVersion> {
   private readonly opts: ChatSessionOptions;
 
   /**
-   * In-memory transcript carried across turns of THIS session. The loop appends
-   * the assistant + tool_result messages and returns the updated array, which we
-   * adopt so multi-turn context accumulates (Phase 10 makes this durable).
+   * The SDK storage directory (`ctx.environment.storageDirectory`), or
+   * `undefined` when none is granted (first run / no storage). Cached at
+   * construction; the persistence helpers treat `undefined` as a first-class
+   * no-op path (§10).
+   */
+  private readonly storageDir: string | undefined;
+
+  /**
+   * The host-side config (API key, model, defaults) loaded from
+   * `storageDirectory/config.json` at construction (§10). Re-cached in
+   * {@link handleSetConfig} when the user updates settings so the running session
+   * reflects the change immediately. NEVER serialized to the webview — only the
+   * `{ hasKey, model }` projection ({@link toConfigState}) crosses the wire.
+   */
+  private config: Config;
+
+  /**
+   * The id of THIS session's transcript file under
+   * `storageDirectory/sessions/<sessionId>.json`. Reused from the restored
+   * session on construction (so a continued conversation overwrites the same
+   * file), else freshly minted (§10).
+   */
+  private readonly sessionId: string;
+
+  /**
+   * In-memory transcript carried across turns of THIS session, seeded from the
+   * latest persisted session on construction (cross-session continuity, §10). The
+   * loop appends the assistant + tool_result messages and returns the updated
+   * array, which we adopt and mirror to disk after every turn.
    */
   private transcript: Anthropic.MessageParam[] = [];
 
@@ -213,6 +256,37 @@ export class ChatSession<V extends ApiVersion> {
     this.ctx = ctx;
     this.server = server;
     this.opts = opts;
+
+    // Cache the storage dir and load the host config (§10). `loadConfig` never
+    // throws and treats an undefined dir as a first-class first-run path.
+    this.storageDir = ctx.environment.storageDirectory;
+    this.config = loadConfig(this.storageDir);
+
+    // Honest, once-per-session launch line so the operator can see whether
+    // persistence is live (§10). Logs ONLY the directory path and an enabled
+    // boolean — never the API key or transcript contents. When the dir is
+    // undefined the stores no-op, so call that out with the dev-flag hint.
+    if (this.storageDir !== undefined) {
+      console.log(
+        `${LOG_PREFIX} storage directory: ${this.storageDir} — persistence enabled`
+      );
+    } else {
+      console.log(
+        `${LOG_PREFIX} storage directory: undefined — persistence disabled (pass --storage-directory)`
+      );
+    }
+
+    // Restore the most recent transcript for cross-session continuity (§10). A
+    // restored record reuses its sessionId so the continued thread overwrites the
+    // same file; otherwise we start a fresh, empty session.
+    const restored = loadLatestTranscript(this.storageDir);
+    if (restored !== null) {
+      this.transcript = restored.messages;
+      this.sessionId = restored.sessionId;
+    } else {
+      this.sessionId = newSessionId();
+    }
+
     this.server.onMessage((msg) => {
       this.dispatch(msg);
     });
@@ -225,8 +299,8 @@ export class ChatSession<V extends ApiVersion> {
   /**
    * Route one validated inbound {@link ClientMessage} to its handler.
    *
-   * Wired this phase: `ready`, `user_message`, `cancel`. `confirm_response`
-   * (Phase 9) and `set_config` (Phase 10) are ignored gracefully with a debug
+   * Wired: `ready`, `user_message`, `cancel`, `confirm_response` (Phase 9),
+   * `set_config` (Phase 10). Any other type is ignored gracefully with a debug
    * log — never an error to the user. Never throws (the transport's handler
    * wrapper also guards, but we keep this total for safety).
    */
@@ -248,24 +322,94 @@ export class ChatSession<V extends ApiVersion> {
         this.handleConfirmResponse(msg.payload.planId, msg.payload.approved);
         return;
       }
-      // set_config (Phase 10): not wired here.
-      console.debug(`${LOG_PREFIX} ignoring unwired message "${msg.type}"`);
+      if (isMessageOfType(msg, "set_config")) {
+        this.handleSetConfig(msg.payload.apiKey, msg.payload.model);
+        return;
+      }
+      // Exhaustive: every `ClientMessage` variant is handled above, so `msg` is
+      // `never` here. The cast keeps the log total in case an unknown type slips
+      // past the transport's validation at runtime — never an error to the user.
+      console.debug(
+        `${LOG_PREFIX} ignoring unrecognized message "${(msg as { type: string }).type}"`
+      );
     } catch (err) {
       console.error(`${LOG_PREFIX} dispatch failed for "${msg.type}"`, err);
     }
   }
 
   /**
-   * Answer `ready` with a best-effort `config_state` carrying only the boolean
-   * `hasKey` (never the key itself, §10) and the active model. `hasKey` reflects
-   * whether a key is available to the host now (env fallback for this phase).
+   * Answer `ready` with a `config_state` carrying only the boolean `hasKey`
+   * (never the key itself, §10) and the active model, both derived from the
+   * loaded {@link Config} via {@link toConfigState}. `hasKey` reflects a key in
+   * config OR the env fallback; `model` reflects `resolveModel`.
    */
   private handleReady(): void {
-    const hasKey = this.hasApiKey();
-    // Single source of truth for the default model (the client's `MODEL`); an
-    // explicit `opts.model` override wins.
-    const model = this.opts.model ?? MODEL;
-    this.send(message("config_state", { hasKey, model }, randomUUID()));
+    this.send(
+      message("config_state", toConfigState(this.config), randomUUID())
+    );
+
+    // Phase 10 UI rehydration: a reopened window connects fresh, so replay the
+    // restored transcript (§10) into the chat as text-only history. Purely
+    // additive to `ready` — config_state above and the key discipline are
+    // untouched. Project each `MessageParam` to a single display string and emit
+    // ONE `history` frame; suppress entirely when nothing is renderable so a
+    // first-run / pure-tool transcript never sends an empty frame.
+    const items = this.projectHistory();
+    if (items.length > 0) {
+      this.send(message("history", { items }, randomUUID()));
+    }
+  }
+
+  /**
+   * Project the restored {@link transcript} to renderable {@link HistoryItem}s
+   * for the `history` frame (Phase 10 UI rehydration).
+   *
+   * Text-only by design — NEVER serializes tool internals, raw content blocks,
+   * images, or any system/secret content to the webview (§10). For each message:
+   *  - string content → used verbatim;
+   *  - array content → the `text` of every `type:"text"` block, joined by "\n";
+   *    `tool_use` / `tool_result` / image / other blocks are ignored.
+   * A turn is included only when its extracted text is non-empty, which naturally
+   * skips pure tool_result messages (user role) and pure tool_use turns
+   * (assistant role) — those are tool plumbing, not utterances.
+   */
+  private projectHistory(): HistoryItem[] {
+    const items: HistoryItem[] = [];
+    for (const msg of this.transcript) {
+      // The transcript holds "user" / "assistant" MessageParams. The SDK role
+      // type also admits "system"; we never author system turns into the
+      // transcript, but skip defensively so the display role stays exactly
+      // "user" | "assistant" and no system content can leak to the webview (§10).
+      if (msg.role !== "user" && msg.role !== "assistant") {
+        continue;
+      }
+      const text = this.extractDisplayText(msg.content);
+      if (text.length > 0) {
+        items.push({ role: msg.role, text });
+      }
+    }
+    return items;
+  }
+
+  /**
+   * Extract the single display string from one message's `content`: a string is
+   * used as-is; an array contributes the `text` of every `type:"text"` block,
+   * joined by newlines, with all non-text blocks (tool_use / tool_result / image
+   * / etc.) ignored. Returns "" when there is no renderable text.
+   */
+  private extractDisplayText(
+    content: Anthropic.MessageParam["content"]
+  ): string {
+    if (typeof content === "string") {
+      return content;
+    }
+    const parts: string[] = [];
+    for (const block of content) {
+      if (block.type === "text" && typeof block.text === "string") {
+        parts.push(block.text);
+      }
+    }
+    return parts.join("\n");
   }
 
   /** Trip the in-flight turn's abort signal, if any (idempotent). */
@@ -293,6 +437,60 @@ export class ChatSession<V extends ApiVersion> {
       return;
     }
     settle(approved);
+  }
+
+  /**
+   * Apply a `set_config` from the settings UI (Phase 10, §10/§13): persist the
+   * (optional) new key and/or model to `storageDirectory/config.json`, re-cache
+   * the in-memory {@link Config} so the running session reflects the change
+   * immediately, and reply with a fresh `config_state`.
+   *
+   * Key discipline: the key is written in Node only and NEVER echoed — the reply
+   * carries the non-secret `{ hasKey, model }` projection only ({@link toConfigState}).
+   *
+   * Partial semantics: only fields actually provided are overlaid. `apiKey` is
+   * applied only when present AND non-empty (an empty string never clears or
+   * writes a key); `model` is applied only when present.
+   *
+   * Undefined-storageDir honesty: when there is nowhere to persist, `saveConfig`
+   * returns `{ ok:false, error:"no_storage_dir" }`. We STILL merge the partial
+   * into the in-memory config (so this session honors the change) and reply with
+   * `config_state`, but log honestly that it will not survive the session. The
+   * same in-memory merge runs on a `write_failed` so a transient I/O error never
+   * silently drops the user's change for the live session.
+   */
+  private handleSetConfig(
+    apiKey: string | undefined,
+    model: string | undefined
+  ): void {
+    // Build the partial from only the provided, valid fields (§10 partial
+    // semantics). `apiKey` requires non-empty; `model` requires presence.
+    const partial: Partial<Config> = {};
+    if (apiKey !== undefined && apiKey.length > 0) {
+      partial.anthropicApiKey = apiKey;
+    }
+    if (model !== undefined && model.length > 0) {
+      partial.model = model;
+    }
+
+    const result = saveConfig(this.storageDir, partial);
+    if (!result.ok) {
+      // No-key-in-log: detail never contains the key value (config-store
+      // guarantees this). Honest about non-persistence; we still apply in-memory.
+      console.warn(
+        `${LOG_PREFIX} set_config not persisted (${result.error}): ${result.detail} — applying in-memory for this session only`
+      );
+    }
+
+    // Re-cache the live config so this session reflects the change immediately,
+    // regardless of whether the write landed. Shallow-merge mirrors
+    // `saveConfig`'s on-disk merge (top-level keys replace whole values).
+    this.config = { ...this.config, ...partial };
+
+    // Reply with the non-secret projection ONLY — the key never crosses the wire.
+    this.send(
+      message("config_state", toConfigState(this.config), randomUUID())
+    );
   }
 
   /* ----------------------------------------------------------------------- */
@@ -350,6 +548,15 @@ export class ChatSession<V extends ApiVersion> {
       refs = result.refs;
       sendRefs = result.ran !== false;
 
+      // Mirror the transcript to disk for cross-session continuity (§10).
+      // `persistTranscript` never throws, but keep the call defensive so a
+      // surprise can never break the turn or leave a dangling rejection.
+      try {
+        persistTranscript(this.storageDir, this.sessionId, this.transcript);
+      } catch (err) {
+        console.error(`${LOG_PREFIX} failed to persist transcript`, err);
+      }
+
       if (!result.ok && result.errorMessage !== undefined) {
         // EXACTLY ONE `error` frame per failed turn. The session sends the frame
         // ONLY when the runner hands up an (already-sanitized) `errorMessage` —
@@ -398,9 +605,17 @@ export class ChatSession<V extends ApiVersion> {
   private async defaultRunTurn(args: TurnRunArgs): Promise<TurnRunResult> {
     const { text, transcript, events, signal } = args;
 
+    // Resolve the effective key + model from the loaded config (§10). The config
+    // value wins; the env key remains the fallback inside `resolveApiKey`. An
+    // explicit `opts.model` (test seam) still overrides the resolved model.
+    const apiKey = resolveApiKey(this.config);
+    const model = this.opts.model ?? resolveModel(this.config);
+
     // Build the client first so a missing key never appends a dangling user
-    // message to the transcript (the turn simply does not start).
-    const created = createClaudeClient(undefined, this.opts.model);
+    // message to the transcript (the turn simply does not start). The resolved
+    // key is passed explicitly (config wins; env is the fallback already folded
+    // into `resolveApiKey`).
+    const created = createClaudeClient(apiKey, model);
     if (!created.ok) {
       console.error(`${LOG_PREFIX} no Claude client: ${created.err.detail}`);
       return {
@@ -428,7 +643,7 @@ export class ChatSession<V extends ApiVersion> {
       system: buildSystemPrompt(),
       snapshot: SNAPSHOT_PLACEHOLDER,
       messages: transcript,
-      model: this.opts.model,
+      model,
       maxTokens: this.opts.maxTokens,
       signal,
       requestConfirmation: this.buildRequestConfirmation(signal),
@@ -566,21 +781,20 @@ export class ChatSession<V extends ApiVersion> {
     for (const settle of [...this.pendingConfirmations.values()]) {
       settle(false);
     }
+
+    // Final transcript flush on modal close so the last turn's state is durable
+    // for the next launch (§10). Best-effort and defensive — a persistence
+    // failure here must never throw out of `dispose`.
+    try {
+      persistTranscript(this.storageDir, this.sessionId, this.transcript);
+    } catch (err) {
+      console.error(`${LOG_PREFIX} failed to flush transcript on dispose`, err);
+    }
   }
 
   /* ----------------------------------------------------------------------- */
   /* Helpers                                                                 */
   /* ----------------------------------------------------------------------- */
-
-  /**
-   * Whether an Anthropic API key is available to the host right now. Reads the
-   * env fallback only (Phase 10 adds the `config.json` source). NEVER returns or
-   * logs the key itself.
-   */
-  private hasApiKey(): boolean {
-    const key = process.env.ANTHROPIC_API_KEY;
-    return typeof key === "string" && key.length > 0;
-  }
 
   /** Send one server frame; the transport no-ops when no client is connected. */
   private send(msg: ProtocolMessage): void {

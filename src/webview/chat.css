@@ -100,7 +100,16 @@ body {
   color: var(--text-primary);
 }
 
-#close-button {
+/* Right-aligned header control cluster (gear + close). */
+#header-controls {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+#close-button,
+#settings-button {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -118,12 +127,15 @@ body {
 }
 
 #close-button:hover,
-#close-button:active {
+#close-button:active,
+#settings-button:hover,
+#settings-button:active {
   background: var(--bg-surface);
   color: var(--text-primary);
 }
 
-#close-button:focus-visible {
+#close-button:focus-visible,
+#settings-button:focus-visible {
   outline: 2px solid var(--text-secondary);
   outline-offset: 1px;
 }
@@ -136,6 +148,114 @@ body {
   flex-direction: column;
   gap: var(--space-2);
   padding: var(--space-4);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Settings view (first-run key capture + re-openable from the header gear)   */
+/* -------------------------------------------------------------------------- */
+
+/*
+ * The settings view mounts into #settings-container, which replaces the chat in
+ * the layout. While #app has .settings-open: hide the log + input bar and flex
+ * the settings host into the body. This keeps the chat DOM intact (so streamed
+ * state is preserved) while gating its visibility behind the key capture.
+ */
+#settings-container {
+  display: none;
+}
+
+#app.settings-open #log,
+#app.settings-open #input-bar {
+  display: none;
+}
+
+#app.settings-open #settings-container {
+  flex: 1 1 auto;
+  display: block;
+  overflow-y: auto;
+  padding: var(--space-5);
+}
+
+.settings-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  max-width: 360px;
+  margin: 0 auto;
+}
+
+.settings-heading {
+  margin: 0;
+  font: var(--type-title);
+  color: var(--text-primary);
+}
+
+.settings-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.settings-label {
+  font: var(--type-label);
+  color: var(--text-primary);
+}
+
+/* Sunken masked key input + model select share the sunken control treatment. */
+.settings-input,
+.settings-select {
+  min-height: 24px;
+  padding: var(--space-2);
+  font: var(--type-body);
+  color: var(--text-primary);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+}
+
+.settings-input::placeholder {
+  color: var(--text-secondary);
+}
+
+.settings-input:focus-visible,
+.settings-select:focus-visible {
+  outline: 2px solid var(--text-secondary);
+  outline-offset: 1px;
+}
+
+/* Helper text — non-essential hint, secondary color. */
+.settings-helper {
+  margin: 0;
+  font: var(--type-hint);
+  color: var(--text-secondary);
+}
+
+.settings-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* Save pill: accent fill on the active/primary action. */
+.settings-save {
+  min-height: 24px;
+  padding: var(--space-1) var(--space-4);
+  font: var(--type-label);
+  color: var(--accent-fg);
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: opacity 120ms ease-out;
+}
+
+.settings-save:hover,
+.settings-save:active {
+  opacity: 0.85;
+}
+
+.settings-save:focus-visible {
+  outline: 2px solid var(--text-secondary);
+  outline-offset: 1px;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -195,6 +315,31 @@ body {
 /* Subtle non-end_turn stop-reason hint appended to a finished bubble. */
 .stop-hint {
   color: var(--text-secondary);
+  font: var(--type-hint);
+}
+
+/* Decorative divider after a restored-history block: a centered, low-emphasis
+ * label flanked by hairline rules. aria-hidden (set in the DOM), traps no
+ * focus, and inherits the global reduced-motion guard (no own animation). */
+.history-divider {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-2) 0;
+  color: var(--text-secondary);
+}
+
+.history-divider::before,
+.history-divider::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--border);
+}
+
+.history-divider-label {
+  flex: 0 0 auto;
   font: var(--type-hint);
 }
 
