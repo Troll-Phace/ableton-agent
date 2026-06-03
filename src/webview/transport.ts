@@ -108,6 +108,16 @@ export class ChatTransport {
   private closedByCaller = false;
 
   /**
+   * Whether the current connection has yielded at least one valid inbound
+   * `ServerMessage`. Gates the one-time `reconnectAttempts` reset so the counter
+   * only clears on *confirmed* bidirectional communication — never on the raw
+   * socket `open`, which can fire even for a connection the server then rejects
+   * post-handshake (the latent infinite-reconnect footgun). Set true on the
+   * first valid server frame; cleared on `close` so each new connection re-arms.
+   */
+  private receivedServerFrame = false;
+
+  /**
    * @param sink - the rendering surface for inbound frames and status lines.
    * @param url - the WS URL to connect to. Defaults to {@link deriveWebSocketUrl}
    *   (same-origin, nonce-carrying), overridable for tests.
@@ -168,7 +178,12 @@ export class ChatTransport {
     this.socket = socket;
 
     socket.addEventListener("open", () => {
-      this.reconnectAttempts = 0;
+      // NOTE: do NOT reset `reconnectAttempts` here. A raw `open` only means the
+      // browser accepted the upgrade; the server may still reject the connection
+      // post-handshake and close it. Resetting the counter on `open` would let
+      // such a reject→reconnect cycle loop forever, never hitting the cap. The
+      // counter is reset only on the first valid inbound server frame (see
+      // `handleRaw`), which proves real bidirectional communication.
       this.sink.appendStatus("Connected.");
       socket.send(serialize(message("ready", {}, crypto.randomUUID())));
     });
@@ -183,6 +198,9 @@ export class ChatTransport {
 
     socket.addEventListener("close", () => {
       this.socket = null;
+      // Re-arm the one-time counter reset for the next connection: a fresh
+      // socket must again prove itself with a valid inbound server frame.
+      this.receivedServerFrame = false;
       if (this.closedByCaller) {
         return;
       }
@@ -234,6 +252,14 @@ export class ChatTransport {
         result.message.type
       );
       return;
+    }
+    // First valid server frame on this connection confirms real bidirectional
+    // communication — only now is it safe to clear the reconnect counter. Gated
+    // by `receivedServerFrame` so the reset happens once per connection (any
+    // valid server frame qualifies; `config_state` is not special-cased).
+    if (!this.receivedServerFrame) {
+      this.receivedServerFrame = true;
+      this.reconnectAttempts = 0;
     }
     this.dispatch(result.message);
   }
