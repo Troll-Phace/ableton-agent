@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["tests/**/*", "src/shared/**/*"]
+  "include": ["tests/**/*", "src/shared/**/*", "src/extension/**/*"]
 }

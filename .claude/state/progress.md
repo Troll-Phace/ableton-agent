@@ -1,11 +1,11 @@
 # Project Progress — Ableton Claude Agent
 
 ## Current Phase
-Phase: 3
-Title: Reference & Identity Layer (R1)
+Phase: 4
+Title: Claude Client & Tool-Use Loop
 Status: NOT STARTED
 Started: 2026-06-02
-> Next: Phase 2 GATE PASSED (Outcome D). Begin shared core — Phases 3, 4, 5, 6, 10 are outcome-independent; Phases 7/8/9/13 now target the **D** task sets.
+> Next: Phase 3 COMPLETE. Continue shared core — Phases 4, 5, 6, 10 remain outcome-independent (Phase 4 Claude loop, Phase 5 depends on 3+4). Phases 7/8/9/13 target the **D** task sets.
 
 ## Architecture Decision (Spike R3)
 Outcome: **D** — all three probes passed. Localhost WS full-duplex; persistent streaming chat; in-chat confirm cards; **act-in-place** mutations.
@@ -41,10 +41,17 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - [x] 2.2 Ran probes 3.1 → 3.2b → 3.2a → 3.3 + R5 in Live 12.4.5b3 Beta (user-driven; logs via npm start terminal)
 - [x] 2.3 Recorded **Outcome D** + **R5 = atomic rollback** above with full per-probe evidence
 
-## Current Phase Tasks (Phase 3 — Reference & Identity Layer)
-- [ ] 3.1 Ref grammar + parser/serializer in src/shared/refs.ts (pure)
-- [ ] 3.2 Reference Table + resolver in src/extension (re-resolve every call, drift detection, structured errors)
-- [ ] 3.3 Tests vs FakeExtensionContext (happy path, index drift, rename, deletion, ambiguity, type mismatch; 90%+ coverage)
+### Phase 3 — Reference & Identity Layer (R1) ✅ COMPLETE (2026-06-02)
+- [x] 3.1 Ref grammar + parser/serializer in `src/shared/refs.ts` (pure; no SDK/DOM). Discriminated-union segment model; percent-encode `%`/`:`/`/` in name field; `parseRef` (lexical) + `validateRef` (structural) + `serializeRef` + `shiftSiblingIndices` + `RefParseError`.
+- [x] 3.2 Resolver in `src/extension/references.ts`: `resolveRef`/`refFromHandle`/`ReferenceTable`. Re-reads `song` fresh every call, walks live collection getters (no handle caching), unique-name re-anchor with re-minted canonicalRef, leaf type-assertion via `getObjectFromHandle` (base class), `type_mismatch`-vs-`ref_unresolved` via base-`DataModelObject` re-probe. `ReferenceTable` holds canonical ref strings only.
+- [x] 3.3 `tests/fixtures/fake-extension-context.ts` (SDK double; sync getter collections, throwing `getObjectFromHandle`, drift helpers) + `tests/refs.test.ts` (69) + `tests/references.test.ts` (63). **133 tests pass.** Coverage: refs.ts 96.12% lines / 92.98% branch; references.ts 90.13% lines / 83.14% branch.
+- QA gate (code-reviewer): **PASS, 0 CRITICAL, 0 MAJOR.** Handle discipline, structured-error contract, and shared/extension purity all verified against the real SDK `.d.mts`. Success criteria met (fresh handles every call; drift → correct structured error; ≥90% coverage).
+- Key wiring note: resolver takes an optional 3rd `tokens: ClassTokens` arg defaulting to real SDK base constructors; tests inject `FakeClass`-backed tokens (`as unknown as ClassTokens`) so the resolver runs unmodified against both fake and SDK.
+
+#### Phase 3 follow-ups (non-blocking, tracked)
+- **R3-1 (MINOR):** `tsconfig.tests.json` `include` was widened to `src/extension/**/*` so `references.test.ts` can import across workspaces (project-reference route blocked by `noEmit:true` → TS6310). `tsc -b` exits 0; add a one-line rationale comment in the tsconfig when next touched.
+- **R3-2 (MINOR):** `refFromHandle` Phase-3 scope: anchors top-level `track`/`scene`/`cuePoint` only; return/main tracks and nested handles return `type_mismatch` — nested reverse-anchoring layered in a later phase.
+- **R3-3 (dep):** added `@vitest/coverage-v8` (dev-only) — the project had no coverage provider; resolves the M3 vitest-coverage gap.
 
 ## Session Log
 (no sessions yet)
@@ -61,3 +68,5 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - 2026-06-02 19:11: Session ended
 - 2026-06-02 19:14: Session ended
 - 2026-06-02 19:19: Session ended
+- 2026-06-02 19:48: Session ended
+- 2026-06-02 20:32: Session ended
