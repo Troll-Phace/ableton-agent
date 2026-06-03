@@ -1,0 +1,11 @@
+dist/
+node_modules/
+vendor/
+*.ablx
+
+# Orchestration + docs are managed outside the source toolchain; do not reformat.
+.claude/
+docs/
+CLAUDE.md
+README.md
+*.md

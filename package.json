@@ -1,0 +1,45 @@
+{
+  "name": "ableton-claude-agent",
+  "version": "1.0.0",
+  "main": "dist/extension.js",
+  "engines": {
+    "node": ">=24.14.1"
+  },
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b && tsx build.ts --production",
+    "build:dev": "tsc -b && tsx build.ts",
+    "build:webview": "vite build",
+    "start": "npm run build:dev && extensions-cli run",
+    "package": "npm run build && extensions-cli package",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@ableton-extensions/sdk": "file:./vendor/ableton-extensions-sdk-1.0.0-beta.0.tgz",
+    "@anthropic-ai/sdk": "^0.100.1",
+    "ws": "^8.21.0"
+  },
+  "devDependencies": {
+    "@ableton-extensions/cli": "file:./vendor/ableton-extensions-cli-1.0.0-beta.0.tgz",
+    "@eslint/js": "^9.39.4",
+    "@types/node": "^24.1.0",
+    "@types/ws": "^8.18.1",
+    "@vitest/coverage-v8": "^3.2.6",
+    "esbuild": "0.28.0",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "jiti": "^2.7.0",
+    "prettier": "^3.8.3",
+    "tsx": "^4.19.0",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.60.1",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.3.3",
+    "vitest": "^3.2.6"
+  }
+}
