@@ -355,8 +355,12 @@ describe("runAgentLoop — is_error framing", () => {
   });
 
   it("agentLoop_mutationError_setsIsErrorAndEmitsErrorActivity", async () => {
+    // Uses a NON-destructive mutation (live_update_track) so this exercises the
+    // generic mutation-error framing through the normal flush path. (A destructive
+    // tool like live_delete would route through the Phase-9 confirmation gate
+    // instead — covered separately in the confirmation-gate suite below.)
     const runtime = new FakeToolRuntime({
-      classifier: { live_delete: "mutation" },
+      classifier: { live_update_track: "mutation" },
       mutationResults: {
         m1: {
           content: JSON.stringify({ error: "type_mismatch" }),
@@ -366,7 +370,7 @@ describe("runAgentLoop — is_error framing", () => {
     });
     const events = makeEvents();
     const turns: ScriptedTurn[] = [
-      toolUseTurn([{ id: "m1", name: "live_delete", input: {} }]),
+      toolUseTurn([{ id: "m1", name: "live_update_track", input: {} }]),
       textTurn("ok"),
     ];
     const result = await runAgentLoop(makeLoopInput(turns, runtime, events));
@@ -380,7 +384,7 @@ describe("runAgentLoop — is_error framing", () => {
       }
     }
     const statuses = events.activity
-      .filter((a) => a.tool === "live_delete")
+      .filter((a) => a.tool === "live_update_track")
       .map((a) => a.status);
     expect(statuses).toEqual(["started", "error"]);
   });
@@ -497,6 +501,314 @@ describe("runAgentLoop — AbortSignal", () => {
     // The read ran, but the mutation flush was skipped by the abort check.
     expect(runtime.callLog.some((c) => c.phase === "read")).toBe(true);
     expect(runtime.flushCount).toBe(0);
+  });
+});
+
+describe("runAgentLoop — destructive-action confirmation gate (Phase 9, §9/§13)", () => {
+  /**
+   * Drive a scripted destructive turn (`live_delete`) through the loop with a
+   * controllable `requestConfirmation` seam, then a terminal text turn. Returns
+   * the loop result, the recording events, the runtime, and the captured plan.
+   */
+  async function runDestructiveTurn(opts: {
+    confirm?: (plan: {
+      summary: string;
+      actions: string[];
+      calls: ToolCall[];
+    }) => Promise<boolean>;
+    over?: Partial<RunLoopInput>;
+    extraCalls?: { id: string; name: string; input: unknown }[];
+  }): Promise<{
+    result: Awaited<ReturnType<typeof runAgentLoop>>;
+    events: RecordedEvents;
+    runtime: FakeToolRuntime;
+    capturedPlan: {
+      summary: string;
+      actions: string[];
+      calls: ToolCall[];
+    } | null;
+  }> {
+    let capturedPlan: {
+      summary: string;
+      actions: string[];
+      calls: ToolCall[];
+    } | null = null;
+    const requestConfirmation =
+      opts.confirm === undefined
+        ? undefined
+        : (plan: { summary: string; actions: string[]; calls: ToolCall[] }) => {
+            capturedPlan = plan;
+            return opts.confirm!(plan);
+          };
+
+    const runtime = new FakeToolRuntime({
+      classifier: {
+        live_delete: "mutation",
+        live_update_track: "mutation",
+      },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        {
+          id: "del1",
+          name: "live_delete",
+          input: { target: "track:1:Bass" },
+        },
+        ...(opts.extraCalls ?? []),
+      ]),
+      textTurn("acknowledged"),
+    ];
+
+    const result = await runAgentLoop(
+      makeLoopInput(turns, runtime, events, {
+        ...(requestConfirmation ? { requestConfirmation } : {}),
+        ...opts.over,
+      })
+    );
+    return { result, events, runtime, capturedPlan };
+  }
+
+  it("agentLoop_destructiveApproved_flushesOnceNoDecline", async () => {
+    const { result, runtime, capturedPlan } = await runDestructiveTurn({
+      confirm: () => Promise.resolve(true),
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.stopReason).toBe("end_turn");
+    }
+    // Approval ⇒ the batch flushes exactly once.
+    expect(runtime.flushCount).toBe(1);
+    const flush = runtime.callLog.find((c) => c.phase === "flush");
+    expect(flush?.calls.map((c) => c.id)).toEqual(["del1"]);
+
+    // No user_declined / confirmation_unavailable result was synthesized.
+    if (result.ok) {
+      const content = result.messages[2].content;
+      if (Array.isArray(content)) {
+        const wire = JSON.stringify(content);
+        expect(wire).not.toMatch(/user_declined/);
+        expect(wire).not.toMatch(/confirmation_unavailable/);
+      }
+    }
+
+    // The plan handed to the seam carried the correct summary/actions/calls.
+    expect(capturedPlan).not.toBeNull();
+    expect(capturedPlan?.actions).toEqual(["Delete track:1:Bass"]);
+    expect(capturedPlan?.summary).toContain("1 thing");
+    expect(capturedPlan?.calls.map((c) => c.id)).toEqual(["del1"]);
+  });
+
+  it("agentLoop_destructiveDeclined_skipsFlushSynthesizesUserDeclinedEndsOkTurn", async () => {
+    const { result, events, runtime } = await runDestructiveTurn({
+      confirm: () => Promise.resolve(false),
+    });
+
+    // Decline is NOT a turn failure: the loop falls through to a normal end_turn.
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.stopReason).toBe("end_turn");
+    }
+    // No transaction was opened.
+    expect(runtime.flushCount).toBe(0);
+
+    // Every mutation id got a user_declined, is_error result.
+    if (result.ok) {
+      const content = result.messages[2].content;
+      expect(Array.isArray(content)).toBe(true);
+      if (Array.isArray(content)) {
+        const block = content[0] as Anthropic.ToolResultBlockParam;
+        expect(block.tool_use_id).toBe("del1");
+        expect(block.is_error).toBe(true);
+        expect(JSON.stringify(block.content)).toMatch(/user_declined/);
+      }
+    }
+    // Narrated as an error activity for the declined call.
+    const statuses = events.activity
+      .filter((a) => a.tool === "live_delete")
+      .map((a) => a.status);
+    expect(statuses).toEqual(["error"]);
+  });
+
+  it("agentLoop_destructiveDeclined_wholeMixedBatchDeclinedTogether", async () => {
+    // A mixed batch (destructive + non-destructive) shares one transaction, so a
+    // decline cancels the WHOLE batch — every mutation id gets user_declined.
+    const { result, runtime } = await runDestructiveTurn({
+      confirm: () => Promise.resolve(false),
+      extraCalls: [
+        {
+          id: "upd1",
+          name: "live_update_track",
+          input: { track: "track:0:X" },
+        },
+      ],
+    });
+
+    expect(result.ok).toBe(true);
+    expect(runtime.flushCount).toBe(0);
+    if (result.ok) {
+      const content = result.messages[2].content;
+      if (Array.isArray(content)) {
+        const ids = content.map(
+          (b) => (b as Anthropic.ToolResultBlockParam).tool_use_id
+        );
+        expect(ids).toEqual(["del1", "upd1"]);
+        for (const b of content) {
+          const block = b as Anthropic.ToolResultBlockParam;
+          expect(block.is_error).toBe(true);
+          expect(JSON.stringify(block.content)).toMatch(/user_declined/);
+        }
+      }
+    }
+  });
+
+  it("agentLoop_declineStillSurfacesRefsViaNormalEndTurn", async () => {
+    // Decline continues the loop to end_turn (ok:true) so the turn completes
+    // normally — the surrounding session emits refs_updated as usual. Here we
+    // just assert the loop terminates successfully (ran), not as a failure.
+    const { result, events } = await runDestructiveTurn({
+      confirm: () => Promise.resolve(false),
+    });
+    expect(result.ok).toBe(true);
+    expect(events.done).toEqual(["end_turn"]);
+    expect(events.errors).toHaveLength(0);
+  });
+
+  it("agentLoop_destructiveFilterOp_isGatedByConfirmation", async () => {
+    // op:"filter" on live_edit_midi_notes is destructive → gated. Approve here.
+    let captured: { actions: string[] } | null = null;
+    const runtime = new FakeToolRuntime({
+      classifier: { live_edit_midi_notes: "mutation" },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        {
+          id: "flt1",
+          name: "live_edit_midi_notes",
+          input: { clip: "track:1:Keys/clip:0:Chords", op: "filter" },
+        },
+      ]),
+      textTurn("ok"),
+    ];
+
+    const result = await runAgentLoop(
+      makeLoopInput(turns, runtime, events, {
+        requestConfirmation: (plan) => {
+          captured = { actions: plan.actions };
+          return Promise.resolve(true);
+        },
+      })
+    );
+
+    expect(result.ok).toBe(true);
+    expect(runtime.flushCount).toBe(1);
+    expect(captured).not.toBeNull();
+    expect((captured as { actions: string[] } | null)?.actions).toEqual([
+      "Filter notes in track:1:Keys/clip:0:Chords (removes notes outside the kept range)",
+    ]);
+  });
+
+  it("agentLoop_nonDestructiveMutation_neverCallsConfirmationSeam", async () => {
+    // A non-destructive batch must never invoke the confirmation seam.
+    let called = false;
+    const runtime = new FakeToolRuntime({
+      classifier: { live_update_track: "mutation" },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        { id: "u1", name: "live_update_track", input: { track: "t" } },
+      ]),
+      textTurn("done"),
+    ];
+
+    const result = await runAgentLoop(
+      makeLoopInput(turns, runtime, events, {
+        requestConfirmation: () => {
+          called = true;
+          return Promise.resolve(true);
+        },
+      })
+    );
+
+    expect(result.ok).toBe(true);
+    expect(called).toBe(false);
+    expect(runtime.flushCount).toBe(1);
+  });
+
+  it("agentLoop_cancelWhileAwaitingConfirmation_abortReturnsNoFlush", async () => {
+    // THE critical race (decision 5): a cancel WHILE the card is open must take
+    // the aborted-return path, NOT the decline path. The seam aborts the signal
+    // then resolves false (mirroring the session's abort listener → settle(false)).
+    const controller = new AbortController();
+    const { result, runtime } = await runDestructiveTurn({
+      over: { signal: controller.signal },
+      confirm: () => {
+        controller.abort();
+        return Promise.resolve(false);
+      },
+    });
+
+    // Aborted-return: ok:false with error "aborted", not a decline (which is ok:true).
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.err.error).toBe("aborted");
+    }
+    expect(runtime.flushCount).toBe(0);
+  });
+
+  it("agentLoop_noConfirmationSeam_destructiveFailsClosedNoFlush", async () => {
+    // Fail-closed (decision 4): a destructive call with NO requestConfirmation
+    // wired must skip the flush and synthesize confirmation_unavailable, never
+    // auto-approve.
+    const { result, events, runtime } = await runDestructiveTurn({
+      confirm: undefined,
+    });
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.stopReason).toBe("end_turn");
+    }
+    expect(runtime.flushCount).toBe(0);
+    if (result.ok) {
+      const content = result.messages[2].content;
+      if (Array.isArray(content)) {
+        const block = content[0] as Anthropic.ToolResultBlockParam;
+        expect(block.is_error).toBe(true);
+        expect(JSON.stringify(block.content)).toMatch(
+          /confirmation_unavailable/
+        );
+      }
+    }
+    // The fail-closed path narrates an error (no started narration).
+    const statuses = events.activity
+      .filter((a) => a.tool === "live_delete")
+      .map((a) => a.status);
+    expect(statuses).toEqual(["error"]);
+  });
+
+  it("agentLoop_noSeam_nonDestructiveBatch_stillFlushesUnchanged", async () => {
+    // Regression: the fail-closed gate must only bite destructive batches. A
+    // non-destructive batch with NO seam flushes exactly as before Phase 9.
+    const runtime = new FakeToolRuntime({
+      classifier: { live_update_track: "mutation", live_set_param: "mutation" },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        { id: "m1", name: "live_update_track", input: { track: "t" } },
+        { id: "m2", name: "live_set_param", input: {} },
+      ]),
+      textTurn("done"),
+    ];
+
+    const result = await runAgentLoop(makeLoopInput(turns, runtime, events));
+    expect(result.ok).toBe(true);
+    expect(runtime.flushCount).toBe(1);
+    const flush = runtime.callLog.find((c) => c.phase === "flush");
+    expect(flush?.calls.map((c) => c.id)).toEqual(["m1", "m2"]);
   });
 });
 

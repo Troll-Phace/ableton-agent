@@ -183,6 +183,20 @@ export class ChatSession<V extends ApiVersion> {
   /** The in-flight turn's abort controller, or `null` when idle. */
   private activeTurn: AbortController | null = null;
 
+  /**
+   * Pending destructive-action confirmations awaiting a `confirm_response`
+   * (Phase 9, §9/§13), keyed by `planId`. The value is the **`settle`** fn (not
+   * the raw `resolve`): calling `settle(approved)` resolves the awaiting
+   * `requestConfirmation` promise, self-deletes this entry, and detaches its
+   * abort listener — so the map self-empties as each settles. Settled by a
+   * `confirm_response`, by the turn's `signal` abort (cancel / dispose / modal
+   * close), or by the `dispose` drain. Never carries any key/secret (§10).
+   */
+  private readonly pendingConfirmations = new Map<
+    string,
+    (approved: boolean) => void
+  >();
+
   /** True once {@link ChatSession.dispose} has run (idempotency guard). */
   private disposed = false;
 
@@ -230,7 +244,11 @@ export class ChatSession<V extends ApiVersion> {
         this.handleCancel();
         return;
       }
-      // confirm_response (Phase 9) / set_config (Phase 10): not wired here.
+      if (isMessageOfType(msg, "confirm_response")) {
+        this.handleConfirmResponse(msg.payload.planId, msg.payload.approved);
+        return;
+      }
+      // set_config (Phase 10): not wired here.
       console.debug(`${LOG_PREFIX} ignoring unwired message "${msg.type}"`);
     } catch (err) {
       console.error(`${LOG_PREFIX} dispatch failed for "${msg.type}"`, err);
@@ -256,6 +274,25 @@ export class ChatSession<V extends ApiVersion> {
       console.debug(`${LOG_PREFIX} cancel — aborting in-flight turn`);
       this.activeTurn.abort();
     }
+  }
+
+  /**
+   * Resolve a pending destructive-action confirmation from a `confirm_response`
+   * (Phase 9, §13). Looks up the `settle` fn by `planId`; an unknown id (already
+   * settled by abort/dispose, a double-response, or a stale/forged id) is ignored
+   * gracefully with a debug log — never an error frame (mirroring the dispatch's
+   * unwired-message tolerance). Calling `settle` self-deletes the entry and
+   * detaches its abort listener.
+   */
+  private handleConfirmResponse(planId: string, approved: boolean): void {
+    const settle = this.pendingConfirmations.get(planId);
+    if (settle === undefined) {
+      console.debug(
+        `${LOG_PREFIX} confirm_response for unknown/settled planId "${planId}"`
+      );
+      return;
+    }
+    settle(approved);
   }
 
   /* ----------------------------------------------------------------------- */
@@ -394,6 +431,7 @@ export class ChatSession<V extends ApiVersion> {
       model: this.opts.model,
       maxTokens: this.opts.maxTokens,
       signal,
+      requestConfirmation: this.buildRequestConfirmation(signal),
     });
 
     if (!result.ok) {
@@ -406,6 +444,68 @@ export class ChatSession<V extends ApiVersion> {
     }
 
     return { ok: true, messages: result.messages, refs: refs.all() };
+  }
+
+  /**
+   * Build the loop's `requestConfirmation` gate for one turn (Phase 9, outcome D,
+   * §9/§13). Called by the loop BEFORE flushing a destructive mutation batch; it
+   * mints a `planId`, registers a `settle` fn, sends a `confirm_request` frame
+   * (only `planId`/`summary`/`actions` — never a key/secret, §10), and resolves
+   * when the matching `confirm_response` arrives.
+   *
+   * Settling paths (no timeout — every path resolves cleanly so the loop never
+   * hangs):
+   *  - user `confirm_response` → {@link handleConfirmResponse} → `settle(approved)`;
+   *  - the turn's `signal` aborts (cancel button / `dispose` / modal close) →
+   *    the `abort` listener → `settle(false)`. The loop re-checks `signal.aborted`
+   *    after the await and takes the aborted-return path (decision 5), so a cancel
+   *    is NOT mistaken for a decline.
+   *
+   * If the signal is ALREADY aborted when the gate is called, resolve `false`
+   * immediately without sending a card. `plan.calls` is intentionally unused: the
+   * loop owns the structured tool results; only `summary`/`actions` cross the wire.
+   */
+  private buildRequestConfirmation(
+    signal: AbortSignal
+  ): (plan: {
+    summary: string;
+    actions: string[];
+    calls: unknown[];
+  }) => Promise<boolean> {
+    return (plan) =>
+      new Promise<boolean>((resolve) => {
+        // Pre-aborted: don't even send a card; the loop will abort-return.
+        if (signal.aborted) {
+          resolve(false);
+          return;
+        }
+        const planId = randomUUID();
+        let settled = false;
+        // `settle` references `onAbort` only inside its body (which runs after
+        // both are initialized), and `onAbort` references `settle` likewise — so
+        // declaring `settle` first as a const arrow is TDZ-safe at runtime.
+        const settle = (approved: boolean): void => {
+          if (settled) {
+            return; // idempotent — first settle wins (response vs abort race).
+          }
+          settled = true;
+          this.pendingConfirmations.delete(planId);
+          signal.removeEventListener("abort", onAbort);
+          resolve(approved);
+        };
+        const onAbort = (): void => {
+          settle(false);
+        };
+        this.pendingConfirmations.set(planId, settle);
+        signal.addEventListener("abort", onAbort, { once: true });
+        this.send(
+          message(
+            "confirm_request",
+            { planId, summary: plan.summary, actions: plan.actions },
+            randomUUID()
+          )
+        );
+      });
   }
 
   /**
@@ -456,6 +556,15 @@ export class ChatSession<V extends ApiVersion> {
       console.debug(`${LOG_PREFIX} dispose — aborting in-flight turn`);
       this.activeTurn.abort();
       this.activeTurn = null;
+    }
+    // Defensively drain any pending confirmations. Aborting the turn above
+    // normally fires each `onAbort` → `settle(false)` (which self-deletes), so
+    // this loop is usually a no-op; it is kept total in case a pending was
+    // registered without (or after) the abort. Snapshot the values first since
+    // `settle` mutates the map. Each `settle(false)` unblocks its awaiting loop
+    // with a decline; the loop's post-await abort re-check then ends cleanly.
+    for (const settle of [...this.pendingConfirmations.values()]) {
+      settle(false);
     }
   }
 

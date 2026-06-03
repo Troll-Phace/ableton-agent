@@ -256,3 +256,186 @@ describe("createSink — XSS / escaping", () => {
     expect(log.querySelector("b")).toBeNull();
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* Confirm card (Phase 9, outcome D — in-chat destructive confirmation)        */
+/* -------------------------------------------------------------------------- */
+
+describe("createSink — confirm card", () => {
+  /** A spying sink bound to {@link log} that records onConfirmResponse calls. */
+  function spyingSink(): {
+    sink: ChatSink;
+    calls: { planId: string; approved: boolean }[];
+  } {
+    const calls: { planId: string; approved: boolean }[] = [];
+    const spied = createSink(log, (planId, approved) => {
+      calls.push({ planId, approved });
+    });
+    return { sink: spied, calls };
+  }
+
+  it("test_webview_confirm_rendersCardWithTitleAndItemPerAction", () => {
+    const { sink: s } = spyingSink();
+    s.appendConfirmCard("plan-1", "This will permanently change 2 things.", [
+      "Delete track:1:Bass",
+      "Delete scene:0:Intro",
+    ]);
+
+    const card = log.querySelector(".confirm-card");
+    expect(card).not.toBeNull();
+    // The card is a labelled group for assistive tech.
+    expect(card?.getAttribute("role")).toBe("group");
+    expect(card?.getAttribute("aria-label")).toBe(
+      "Destructive action confirmation"
+    );
+    // Title = the summary headline.
+    expect(card?.querySelector(".confirm-title")?.textContent).toBe(
+      "This will permanently change 2 things."
+    );
+    // One list item per action, in order, as inert text.
+    const items = card?.querySelectorAll(".confirm-item");
+    expect(items).toHaveLength(2);
+    expect(items?.[0]?.textContent).toBe("Delete track:1:Bass");
+    expect(items?.[1]?.textContent).toBe("Delete scene:0:Intro");
+  });
+
+  it("test_webview_confirm_destructiveButtonHasExplicitLabelNeverOk", () => {
+    const { sink: s } = spyingSink();
+    s.appendConfirmCard("plan-2", "summary", [
+      "Delete track:1:Bass",
+      "Delete scene:0:Intro",
+      "Delete device:0:Reverb",
+    ]);
+
+    const destructive = log.querySelector(".confirm-btn-destructive");
+    expect(destructive).not.toBeNull();
+    // Explicit, action-stating label derived from the actions — never a bare "OK".
+    expect(destructive?.textContent).toBe("Delete 3 items");
+    expect(destructive?.textContent).not.toBe("OK");
+    // Cancel is explicit too.
+    expect(log.querySelector(".confirm-btn-cancel")?.textContent).toBe(
+      "Cancel"
+    );
+  });
+
+  it("test_webview_confirm_singleDeleteLabelIsSingular", () => {
+    const { sink: s } = spyingSink();
+    s.appendConfirmCard("plan-3", "summary", ["Delete track:1:Bass"]);
+    expect(log.querySelector(".confirm-btn-destructive")?.textContent).toBe(
+      "Delete 1 item"
+    );
+  });
+
+  it("test_webview_confirm_mixedActionsLabelIsConfirmNActions", () => {
+    const { sink: s } = spyingSink();
+    s.appendConfirmCard("plan-4", "summary", [
+      "Delete track:1:Bass",
+      "Filter notes in track:1:Keys/clip:0:Chords (removes notes outside the kept range)",
+    ]);
+    // Not all deletes → the generic explicit label, still never "OK".
+    const label = log.querySelector(".confirm-btn-destructive")?.textContent;
+    expect(label).toBe("Confirm — 2 actions");
+    expect(label).not.toBe("OK");
+  });
+
+  it("test_webview_confirm_clickDestructiveCallsBackApprovedTrueOnce", () => {
+    const { sink: s, calls } = spyingSink();
+    s.appendConfirmCard("plan-5", "summary", ["Delete track:1:Bass"]);
+
+    const destructive = log.querySelector<HTMLButtonElement>(
+      ".confirm-btn-destructive"
+    );
+    destructive?.click();
+    expect(calls).toEqual([{ planId: "plan-5", approved: true }]);
+
+    // A second click is a no-op (answered exactly once).
+    destructive?.click();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("test_webview_confirm_clickCancelCallsBackApprovedFalseOnce", () => {
+    const { sink: s, calls } = spyingSink();
+    s.appendConfirmCard("plan-6", "summary", ["Delete track:1:Bass"]);
+
+    const cancel = log.querySelector<HTMLButtonElement>(".confirm-btn-cancel");
+    cancel?.click();
+    expect(calls).toEqual([{ planId: "plan-6", approved: false }]);
+
+    // After Cancel, clicking the destructive button must NOT fire again.
+    log.querySelector<HTMLButtonElement>(".confirm-btn-destructive")?.click();
+    expect(calls).toHaveLength(1);
+  });
+
+  it("test_webview_confirm_escKeyDeclinesAsCancelOnce", () => {
+    const { sink: s, calls } = spyingSink();
+    s.appendConfirmCard("plan-7", "summary", ["Delete track:1:Bass"]);
+
+    const card = log.querySelector(".confirm-card");
+    card?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+    );
+    expect(calls).toEqual([{ planId: "plan-7", approved: false }]);
+
+    // A second Esc is a no-op.
+    card?.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Escape", bubbles: true })
+    );
+    expect(calls).toHaveLength(1);
+  });
+
+  it("test_webview_confirm_afterAnswerButtonsDisabledAndResolvedShown", () => {
+    const { sink: s } = spyingSink();
+    s.appendConfirmCard("plan-8", "summary", ["Delete track:1:Bass"]);
+
+    const destructive = log.querySelector<HTMLButtonElement>(
+      ".confirm-btn-destructive"
+    );
+    const cancel = log.querySelector<HTMLButtonElement>(".confirm-btn-cancel");
+    destructive?.click();
+
+    // Both buttons disabled; the action row hidden; resolved state shown.
+    expect(destructive?.disabled).toBe(true);
+    expect(cancel?.disabled).toBe(true);
+    const resolved = log.querySelector<HTMLElement>(".confirm-resolved");
+    expect(resolved?.hidden).toBe(false);
+    expect(resolved?.textContent).toBe("Approved");
+    expect(resolved?.classList.contains("confirm-resolved-approved")).toBe(
+      true
+    );
+  });
+
+  it("test_webview_confirm_declineShowsDeclinedResolvedState", () => {
+    const { sink: s } = spyingSink();
+    s.appendConfirmCard("plan-9", "summary", ["Delete track:1:Bass"]);
+    log.querySelector<HTMLButtonElement>(".confirm-btn-cancel")?.click();
+
+    const resolved = log.querySelector<HTMLElement>(".confirm-resolved");
+    expect(resolved?.textContent).toBe("Declined");
+    expect(resolved?.classList.contains("confirm-resolved-declined")).toBe(
+      true
+    );
+  });
+
+  it("test_webview_confirm_actionStringsRenderInertNoInjection", () => {
+    const { sink: s } = spyingSink();
+    const evil = '<img src=x onerror="alert(1)"><b>bold</b>';
+    s.appendConfirmCard("plan-10", evil, [evil]);
+
+    // Title + item carry the markup as literal text; no nodes injected.
+    expect(log.querySelector(".confirm-title")?.textContent).toBe(evil);
+    expect(log.querySelector(".confirm-item")?.textContent).toBe(evil);
+    expect(log.querySelector("img")).toBeNull();
+    expect(log.querySelector("b")).toBeNull();
+  });
+
+  it("test_webview_confirm_noCallbackWired_doesNotThrowOnAnswer", () => {
+    // createSink with no onConfirmResponse must still render + answer safely.
+    const noCallbackSink = createSink(log);
+    noCallbackSink.appendConfirmCard("plan-11", "summary", [
+      "Delete track:1:Bass",
+    ]);
+    expect(() =>
+      log.querySelector<HTMLButtonElement>(".confirm-btn-destructive")?.click()
+    ).not.toThrow();
+  });
+});

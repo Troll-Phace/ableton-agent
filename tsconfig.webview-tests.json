@@ -15,6 +15,7 @@
   "include": [
     "tests/webview-render.test.ts",
     "tests/webview-transport.test.ts",
+    "tests/webview-close.test.ts",
     // Deliberate overlap: `src/webview/**` is owned by tsconfig.webview.json and `src/shared/**`
     // by tsconfig.shared.json. The editor flags this as TS6307, but project `references` would
     // force those projects to emit (a referenced project may not set noEmit -> TS6310, confirmed

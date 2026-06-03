@@ -100,6 +100,7 @@ function recordingSink(): ChatSink & { statuses: string[]; errors: string[] } {
     appendStatus(text: string): void {
       statuses.push(text);
     },
+    appendConfirmCard(): void {},
   };
 }
 

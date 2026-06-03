@@ -86,6 +86,17 @@ export interface ChatSink {
    * @param text - the status text.
    */
   appendStatus(text: string): void;
+
+  /**
+   * Render an unmistakable destructive-action confirm card with explicit
+   * Cancel / approve controls. The card answers exactly once, then resolves to
+   * an inert "Approved"/"Declined" state.
+   *
+   * @param planId - the plan id echoed back in `confirm_response`.
+   * @param summary - the human-readable headline (states the total count).
+   * @param actions - the itemized destructive actions the card lists.
+   */
+  appendConfirmCard(planId: string, summary: string, actions: string[]): void;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -154,6 +165,26 @@ export class ChatTransport {
     const envelope = message(
       "user_message",
       { text: trimmed },
+      crypto.randomUUID()
+    );
+    this.socket.send(serialize(envelope));
+  }
+
+  /**
+   * Send a `confirm_response` answering a prior `confirm_request`. No-op (with a
+   * status line) when disconnected — a stale card cannot be answered offline.
+   *
+   * @param planId - the plan id from the `confirm_request` being answered.
+   * @param approved - the user's decision (`true` = run the destructive batch).
+   */
+  public sendConfirmResponse(planId: string, approved: boolean): void {
+    if (this.socket === null || this.socket.readyState !== WebSocket.OPEN) {
+      this.sink.appendStatus("Not connected — confirmation not sent.");
+      return;
+    }
+    const envelope = message(
+      "confirm_response",
+      { planId, approved },
       crypto.randomUUID()
     );
     this.socket.send(serialize(envelope));
@@ -292,7 +323,12 @@ export class ChatTransport {
       console.log("[transport] refs_updated:", msg.payload.refs.length, "refs");
       return;
     }
-    // config_state / confirm_request are not wired this phase (Phases 9/10).
+    if (isMessageOfType(msg, "confirm_request")) {
+      const { planId, summary, actions } = msg.payload;
+      this.sink.appendConfirmCard(planId, summary, actions);
+      return;
+    }
+    // config_state is not wired this phase (Phase 10).
     console.log("[transport] unhandled server frame:", msg.type);
   }
 }

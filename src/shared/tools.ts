@@ -500,6 +500,105 @@ export function classify(toolName: string): ToolClass {
 }
 
 // ---------------------------------------------------------------------------
+// Destructive-action classification + plan summary (Phase 9, §8.2 `D`, §9)
+//
+// The confirmation flow (§9/§13) gates a mutation batch when ANY call in it is
+// destructive. The **destructive set is deliberately narrow** (user-decided):
+// `live_delete` (always) and `live_edit_midi_notes` with `op:"filter"` (it
+// removes notes outside the kept range). `live_modify_device_chain` is additive
+// — NOT destructive — so it is not gated here. This predicate is the SINGLE
+// source of truth shared by the agent loop, the summarizer below, and the tests
+// (so the loop, the system prompt, and the UI can never drift apart).
+//
+// Both functions are PURE and TOTAL: `input` arrives off the wire as `unknown`,
+// so they narrow defensively and NEVER throw on a malformed/non-object value. A
+// malformed call is not provably destructive (so the predicate returns `false`);
+// the executor rejects bad input later with a structured error (§9).
+// ---------------------------------------------------------------------------
+
+/**
+ * Narrow an `unknown` to a plain string-keyed record without throwing. Returns
+ * `undefined` for `null`, arrays, and non-objects, so callers can read fields
+ * defensively. Kept local (a 2-line guard) rather than imported from
+ * `protocol.ts` — both are shared siblings and this avoids a cross-module dep.
+ */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Whether a tool call is **destructive** and therefore must pass through the
+ * confirmation flow (§9/§13) before its batch is committed.
+ *
+ * `true` for `live_delete` (always) and for `live_edit_midi_notes` when
+ * `input.op === "filter"`; `false` for every other tool and for any call whose
+ * `input` is malformed/non-object (not provably destructive — the executor
+ * rejects bad input later, §9). Total: never throws.
+ *
+ * @param name the tool name (matched against the destructive set).
+ * @param input the call's raw arguments, off the wire as `unknown`.
+ */
+export function isDestructiveCall(name: string, input: unknown): boolean {
+  if (name === "live_delete") {
+    return true;
+  }
+  if (name === "live_edit_midi_notes") {
+    return asRecord(input)?.op === "filter";
+  }
+  return false;
+}
+
+/**
+ * Human-readable description of a destructive batch for the confirmation card
+ * (§13 `confirm_request` payload). `summary` is the headline shown to the user;
+ * `actions` is one line per destructive call, in order, for the itemized list.
+ */
+export interface DestructivePlanText {
+  /** Headline stating the total destructive count (e.g. "This will permanently change 2 things…"). */
+  summary: string;
+  /** One human-readable line per destructive call, in call order. */
+  actions: string[];
+}
+
+/**
+ * Build the user-facing {@link DestructivePlanText} for a destructive batch.
+ *
+ * Takes the structural `{ name, input }` view of each call (NOT the loop's
+ * `ToolCall` — shared must not import extension types, per code-style). Callers
+ * pass only the destructive subset; `actions` describes those calls and
+ * `summary` states their total count (singular/plural correct). PURE,
+ * deterministic, no ids; reads `input` fields defensively and never throws —
+ * a missing/malformed field falls back to a generic phrasing.
+ *
+ * @param calls the destructive calls, in the order they were emitted.
+ */
+export function summarizeDestructivePlan(
+  calls: ReadonlyArray<{ name: string; input: unknown }>
+): DestructivePlanText {
+  const actions = calls.map(({ name, input }) => {
+    const record = asRecord(input);
+    if (name === "live_edit_midi_notes") {
+      const clip = record?.clip;
+      const clipText = typeof clip === "string" && clip ? clip : "a clip";
+      return `Filter notes in ${clipText} (removes notes outside the kept range)`;
+    }
+    // live_delete (and any other call routed here as destructive).
+    const target = record?.target;
+    return typeof target === "string" && target
+      ? `Delete ${target}`
+      : "Delete an object";
+  });
+
+  const count = calls.length;
+  const noun = count === 1 ? "thing" : "things";
+  const summary = `This will permanently change ${count} ${noun} and cannot be undone automatically by the agent.`;
+
+  return { summary, actions };
+}
+
+// ---------------------------------------------------------------------------
 // JSON-schema fragment helpers (keep the definitions DRY + readable)
 // ---------------------------------------------------------------------------
 

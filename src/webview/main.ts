@@ -16,6 +16,7 @@
 
 import "./chat.css";
 
+import { closeModal } from "./host-bridge.js";
 import { ChatTransport, type ChatSink } from "./transport.js";
 
 /* -------------------------------------------------------------------------- */
@@ -30,17 +31,41 @@ interface ChatUi {
   readonly input: HTMLTextAreaElement;
   /** The send pill button. */
   readonly sendButton: HTMLButtonElement;
+  /** The header close button ("✕") that closes the modal. */
+  readonly closeButton: HTMLButtonElement;
 }
 
 /**
- * Build the chat DOM inside `#app`: a scrolling message list and a pinned input
- * bar (visually-hidden label + multiline textarea + send pill).
+ * Build the chat DOM inside `#app`: a compact header bar (title + close), a
+ * scrolling message list, and a pinned input bar (visually-hidden label +
+ * multiline textarea + send pill).
  *
  * @param root - the mounted `#app` element.
- * @returns the constructed log element and the input/button controls.
+ * @returns the constructed log element and the input/close/send controls.
  */
 function buildUi(root: HTMLElement): ChatUi {
   root.replaceChildren();
+
+  // Header bar: app title (left) + close button (right). Kept compact so the
+  // 420×560 modal still fits with the message list flexing below it.
+  const header = document.createElement("div");
+  header.id = "header-bar";
+
+  const titleEl = document.createElement("div");
+  titleEl.id = "header-title";
+  titleEl.textContent = "Claude";
+
+  const closeButton = document.createElement("button");
+  closeButton.id = "close-button";
+  closeButton.type = "button";
+  closeButton.setAttribute("aria-label", "Close chat");
+  // The glyph is decorative; the accessible name comes from aria-label.
+  const closeGlyph = document.createElement("span");
+  closeGlyph.setAttribute("aria-hidden", "true");
+  closeGlyph.textContent = "✕";
+  closeButton.appendChild(closeGlyph);
+
+  header.append(titleEl, closeButton);
 
   const log = document.createElement("div");
   log.id = "log";
@@ -68,9 +93,9 @@ function buildUi(root: HTMLElement): ChatUi {
   sendButton.textContent = "Send";
 
   inputBar.append(label, input, sendButton);
-  root.append(log, inputBar);
+  root.append(header, log, inputBar);
 
-  return { log, input, sendButton };
+  return { log, input, sendButton, closeButton };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -95,9 +120,16 @@ function buildUi(root: HTMLElement): ChatUi {
  * against a jsdom `log` to drive and assert the real DOM.
  *
  * @param log - the message-list element to append rendered frames into.
+ * @param onConfirmResponse - optional callback invoked when a confirm card is
+ *   answered (Cancel/Esc → `false`, destructive → `true`). Threaded in so the
+ *   card buttons can reply WITHOUT this sink importing the transport, keeping
+ *   `createSink` unit-testable against a bare jsdom `log`.
  * @returns the {@link ChatSink} implementation bound to `log`.
  */
-export function createSink(log: HTMLElement): ChatSink {
+export function createSink(
+  log: HTMLElement,
+  onConfirmResponse?: (planId: string, approved: boolean) => void
+): ChatSink {
   /** Pin the viewport to the latest content. */
   const scrollToBottom = (): void => {
     log.scrollTop = log.scrollHeight;
@@ -187,6 +219,26 @@ export function createSink(log: HTMLElement): ChatSink {
     }
   };
 
+  /**
+   * Derive an explicit, action-stating label for the destructive button —
+   * NEVER a bare "OK". When every listed action is a delete, summarize as
+   * "Delete N item(s)"; otherwise fall back to "Confirm — N action(s)". The
+   * count always pluralizes so the label matches the listed actions exactly.
+   *
+   * @param actions - the destructive actions the card itemizes.
+   * @returns the destructive button's visible label.
+   */
+  const deriveConfirmLabel = (actions: string[]): string => {
+    const count = actions.length;
+    const allDeletes =
+      count > 0 &&
+      actions.every((a) => a.trim().toLowerCase().startsWith("delete"));
+    if (allDeletes) {
+      return `Delete ${String(count)} item${count === 1 ? "" : "s"}`;
+    }
+    return `Confirm — ${String(count)} action${count === 1 ? "" : "s"}`;
+  };
+
   const sink: ChatSink = {
     appendAssistantDelta(text: string): void {
       const textNode = streamText ?? openStreamBubble();
@@ -244,6 +296,100 @@ export function createSink(log: HTMLElement): ChatSink {
     appendStatus(text: string): void {
       appendLine("status", text);
     },
+
+    appendConfirmCard(
+      planId: string,
+      summary: string,
+      actions: string[]
+    ): void {
+      const card = document.createElement("div");
+      card.className = "confirm-card";
+      card.setAttribute("role", "group");
+      card.setAttribute("aria-label", "Destructive action confirmation");
+
+      // Title — the plan summary (states the total destructive count).
+      const title = document.createElement("div");
+      title.className = "confirm-title";
+      title.textContent = summary;
+
+      // Itemized destructive actions (inert, plain text).
+      const list = document.createElement("ul");
+      list.className = "confirm-list";
+      for (const action of actions) {
+        const item = document.createElement("li");
+        item.className = "confirm-item";
+        item.textContent = action;
+        list.appendChild(item);
+      }
+
+      // Action row: Cancel + an explicitly-labelled destructive button.
+      const row = document.createElement("div");
+      row.className = "confirm-actions";
+
+      const cancelButton = document.createElement("button");
+      cancelButton.type = "button";
+      cancelButton.className = "confirm-btn confirm-btn-cancel";
+      cancelButton.textContent = "Cancel";
+
+      const destructiveButton = document.createElement("button");
+      destructiveButton.type = "button";
+      destructiveButton.className = "confirm-btn confirm-btn-destructive";
+      destructiveButton.textContent = deriveConfirmLabel(actions);
+
+      // Resolved-state line (replaces the buttons once the card is answered),
+      // so the decision is conveyed by explicit text — never color alone.
+      const resolved = document.createElement("div");
+      resolved.className = "confirm-resolved";
+      resolved.hidden = true;
+
+      let answered = false;
+
+      /** Answer the card exactly once: reply, then lock into an inert state. */
+      const answer = (approved: boolean): void => {
+        if (answered) {
+          return;
+        }
+        answered = true;
+        cancelButton.disabled = true;
+        destructiveButton.disabled = true;
+        card.removeEventListener("keydown", onKeydown);
+        // Don't double-surface a decline as a scary failure: the card's own
+        // resolved text is the user-facing signal (the backend still emits a
+        // tool_activity "error" for the model, which is fine).
+        resolved.textContent = approved ? "Approved" : "Declined";
+        resolved.classList.toggle("confirm-resolved-approved", approved);
+        resolved.classList.toggle("confirm-resolved-declined", !approved);
+        resolved.hidden = false;
+        row.hidden = true;
+        onConfirmResponse?.(planId, approved);
+      };
+
+      /** Esc while the card is focused is treated as Cancel. */
+      function onKeydown(event: KeyboardEvent): void {
+        if (event.key === "Escape") {
+          event.preventDefault();
+          answer(false);
+        }
+      }
+
+      cancelButton.addEventListener("click", () => {
+        answer(false);
+      });
+      destructiveButton.addEventListener("click", () => {
+        answer(true);
+      });
+      card.addEventListener("keydown", onKeydown);
+
+      row.append(cancelButton, destructiveButton);
+      card.append(title, list, row, resolved);
+      log.appendChild(card);
+      scrollToBottom();
+
+      // Default focus to the SAFE control (Cancel) so an inadvertent Enter
+      // never fires the destructive path. The destructive button stays one Tab
+      // away, and Esc also declines.
+      cancelButton.focus();
+    },
   };
 
   return sink;
@@ -267,8 +413,15 @@ function mount(): void {
     throw new Error('Webview root element "#app" not found.');
   }
 
-  const { log, input, sendButton } = buildUi(root);
-  const sink = createSink(log);
+  const { log, input, sendButton, closeButton } = buildUi(root);
+
+  // Holder so the confirm-card callback can reach the transport: the sink is
+  // built first (the transport takes it in its constructor), so the callback
+  // reads `holder.transport` lazily rather than capturing it eagerly.
+  const holder: { transport: ChatTransport | null } = { transport: null };
+  const sink = createSink(log, (planId, approved) => {
+    holder.transport?.sendConfirmResponse(planId, approved);
+  });
 
   /** Append the user's own bubble locally (the transport does not echo it). */
   const appendUserBubble = (text: string): void => {
@@ -280,6 +433,7 @@ function mount(): void {
   };
 
   const transport = new ChatTransport(sink);
+  holder.transport = transport;
 
   /** Read, render, and send the current input; clear and refocus. */
   const submit = (): void => {
@@ -301,12 +455,27 @@ function mount(): void {
   };
 
   sendButton.addEventListener("click", submit);
+  closeButton.addEventListener("click", () => {
+    closeModal();
+  });
   input.addEventListener("input", autoSize);
   input.addEventListener("keydown", (event: KeyboardEvent) => {
     // Enter sends; Shift+Enter inserts a newline.
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       submit();
+    }
+  });
+
+  // Top-level Esc closes the chat (the documented "Esc closes the chat"
+  // affordance). An OPEN confirm card owns Esc=decline: its own keydown
+  // listener fires first (it is closer to the target in the bubble path) and
+  // calls preventDefault(), so we skip closing when the card already consumed
+  // the key. Once a card is answered it removes its listener, so its Esc no
+  // longer fires and a subsequent Esc closes the chat as normal.
+  document.addEventListener("keydown", (event: KeyboardEvent) => {
+    if (event.key === "Escape" && !event.defaultPrevented) {
+      closeModal();
     }
   });
 

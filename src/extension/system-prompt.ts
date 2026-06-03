@@ -14,8 +14,9 @@
  * (`live_get_*`) supply detail on demand.
  *
  * The "You cannot…" list (§9) is lifted verbatim from `docs/ARCHITECTURE.md` §9;
- * each entry was validated against the installed Extensions SDK type surface in
- * Spike R3 (all 8 limitations are genuine). The honesty rule pairs it with the
+ * each entry was validated against the installed Extensions SDK type surface
+ * documented in §14 (SDK Capability Map — all 8 limitations are genuine). The
+ * honesty rule pairs it with the
  * `report_limitation` tool so an unsupported request becomes an explicit "I
  * can't do that, but I can do this" — never a fake success (§1.3, §9).
  *
@@ -48,7 +49,7 @@ The model decides; the extension acts. You never touch Live directly: you emit s
 - Render analysis is reported in seconds; the tool boundary otherwise speaks beats.
 
 # Confirmation
-Destructive actions — deletions (live_delete), MIDI note 'filter' operations, and destructive device-chain operations — require explicit user confirmation in the chat before they execute. When you intend a destructive action, describe it clearly and wait for the user's confirmation; the chat UI surfaces a confirm card for it. Non-destructive edits do not require confirmation.
+Destructive actions — deletions (live_delete) and MIDI note 'filter' operations (live_edit_midi_notes with op 'filter') — require explicit user confirmation in the chat before they execute. When you intend a destructive action, describe it clearly and wait for the user's confirmation; the chat UI surfaces a confirm card for it. Non-destructive edits do not require confirmation. Do not batch destructive and non-destructive actions in the same turn — declining a confirmation cancels the entire batch.
 
 # You cannot
 - Process real-time audio or apply DSP ("make it warmer/louder/punchier").

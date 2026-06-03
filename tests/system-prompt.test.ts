@@ -102,6 +102,29 @@ describe("system-prompt — verbatim §9 cannot-list", () => {
   });
 });
 
+describe("system-prompt — confirmation section (Phase 9 reconciliation, §9/§13)", () => {
+  it("systemPrompt_text_confirmationNamesDeleteAndFilterOnly", () => {
+    // The reconciled confirmation section gates exactly the §8.2 D-marked set:
+    // live_delete + MIDI 'filter'. It must NOT name device-chain ops (those are
+    // additive — the predicate isDestructiveCall agrees), or the prompt, the
+    // predicate, and the executors would drift (plan §8.2 / risk areas).
+    const text = promptText();
+    expect(text).toContain("live_delete");
+    expect(text).toContain("filter");
+    expect(text).toContain("live_edit_midi_notes");
+    // The pre-Phase-9 "destructive device-chain operations" claim was removed.
+    expect(text).not.toContain("device-chain");
+    expect(text).not.toContain("device chain");
+  });
+
+  it("systemPrompt_text_warnsAgainstBatchingDestructiveWithNonDestructive", () => {
+    // A decline cancels the whole batch (one transaction, §7), so the prompt
+    // steers the model away from mixing destructive + non-destructive in a turn.
+    const text = promptText().toLowerCase();
+    expect(text).toContain("do not batch destructive");
+  });
+});
+
 describe("system-prompt — honesty + units", () => {
   it("systemPrompt_text_instructsReportLimitationForUnsupportedAsks", () => {
     // The honesty rule pairs the cannot-list with the report_limitation tool so an

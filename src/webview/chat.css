@@ -83,6 +83,51 @@ body {
   background: var(--bg-primary);
 }
 
+/* Compact header bar: app title (left) + close button (right). */
+#header-bar {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border);
+}
+
+#header-title {
+  font: var(--type-title);
+  color: var(--text-primary);
+}
+
+#close-button {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 var(--space-2);
+  font: var(--type-label);
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background-color 120ms ease-out;
+}
+
+#close-button:hover,
+#close-button:active {
+  background: var(--bg-surface);
+  color: var(--text-primary);
+}
+
+#close-button:focus-visible {
+  outline: 2px solid var(--text-secondary);
+  outline-offset: 1px;
+}
+
 /* Scrolling message list. */
 #log {
   flex: 1 1 auto;
@@ -233,6 +278,107 @@ body {
 .line-warning {
   color: var(--warning);
   font: var(--type-body);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Confirm card (destructive approval)                                        */
+/* -------------------------------------------------------------------------- */
+
+/* Unmistakable destructive-approval card: surface bg + a 2px error left rail. */
+.confirm-card {
+  align-self: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 90%;
+  padding: var(--space-3);
+  background: var(--bg-surface);
+  border-left: 2px solid var(--error);
+  border-radius: var(--radius-md);
+  animation: msg-enter 100ms ease-out;
+}
+
+.confirm-title {
+  color: var(--text-primary);
+  font: var(--type-body);
+}
+
+/* Itemized destructive actions — low-emphasis hint text. */
+.confirm-list {
+  margin: 0;
+  padding-left: var(--space-4);
+  color: var(--text-secondary);
+  font: var(--type-hint);
+}
+
+.confirm-item {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+/* Shared pill-button base for both confirm actions. */
+.confirm-btn {
+  min-height: 24px;
+  padding: var(--space-1) var(--space-3);
+  font: var(--type-label);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition: background-color 120ms ease-out;
+}
+
+.confirm-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* Cancel: recessive surface button. */
+.confirm-btn-cancel {
+  color: var(--text-primary);
+  background: var(--bg-surface);
+}
+
+.confirm-btn-cancel:hover:not(:disabled),
+.confirm-btn-cancel:active:not(:disabled) {
+  background: var(--bg-input);
+}
+
+/* Destructive primary: filled error, explicit label (never a bare "OK"). */
+.confirm-btn-destructive {
+  color: var(--accent-fg);
+  background: var(--error);
+  border-color: var(--error);
+}
+
+.confirm-btn-destructive:hover:not(:disabled),
+.confirm-btn-destructive:active:not(:disabled) {
+  opacity: 0.85;
+}
+
+/* Visible focus ring on both confirm actions. */
+.confirm-btn:focus-visible {
+  outline: 2px solid var(--text-secondary);
+  outline-offset: 1px;
+}
+
+/* Resolved state — explicit text carries the outcome, not color alone. */
+.confirm-resolved {
+  align-self: flex-end;
+  font: var(--type-hint);
+}
+
+.confirm-resolved-approved {
+  color: var(--text-secondary);
+}
+
+.confirm-resolved-declined {
+  color: var(--text-secondary);
 }
 
 /* -------------------------------------------------------------------------- */

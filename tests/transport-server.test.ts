@@ -1022,6 +1022,316 @@ describe("chatSession_turnExecution_viaInjectedRunner", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* 10. Session glue — destructive-action confirmation round-trip (Phase 9)     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The shape of the loop's confirmation gate the session builds per turn
+ * (`ChatSession.buildRequestConfirmation`). It is a private method, so we reach
+ * it through a typed accessor — this drives the REAL session machinery (the
+ * `pendingConfirmations` map, the `confirm_request` frame send, the
+ * `confirm_response` dispatch, the abort listener, and the `dispose` drain) over
+ * a real `ws` round-trip, exactly as the default runner would in production. We
+ * cannot use the default runner directly here (it constructs a real network
+ * Claude client), so the injected `runTurn` seam stands in for the loop and
+ * invokes this real gate the way `runAgentLoop` does before a destructive flush.
+ */
+type RequestConfirmation = (plan: {
+  summary: string;
+  actions: string[];
+  calls: unknown[];
+}) => Promise<boolean>;
+
+/** Typed view of the session's private confirmation builder (real code under test). */
+interface SessionConfirmAccess {
+  buildRequestConfirmation(signal: AbortSignal): RequestConfirmation;
+}
+
+/** Reach the real private `buildRequestConfirmation` without `any`. */
+function confirmGateOf(
+  session: unknown,
+  signal: AbortSignal
+): RequestConfirmation {
+  return (session as SessionConfirmAccess).buildRequestConfirmation(signal);
+}
+
+describe("chatSession_confirmation_roundTrip", () => {
+  function fakeCtx(): ConstructorParameters<typeof ChatSession>[0] {
+    return makeFakeContext() as unknown as ConstructorParameters<
+      typeof ChatSession
+    >[0];
+  }
+
+  /** A destructive plan as the loop's summarizer would produce it. */
+  const PLAN: { summary: string; actions: string[]; calls: unknown[] } = {
+    summary:
+      "This will permanently change 1 thing and cannot be undone automatically by the agent.",
+    actions: ["Delete track:1:Bass"],
+    calls: [],
+  };
+
+  it("chatSession_confirmRequestFrame_carriesPlanIdSummaryActionsNoKey", async () => {
+    // The injected runner stands in for the loop: it invokes the session's REAL
+    // confirmation gate (which sends a `confirm_request`) and resolves once the
+    // user answers. We approve, then assert the turn proceeds to assistant_done +
+    // refs_updated, and that the confirm_request frame preceded them.
+    let approved: boolean | null = null;
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const gate = confirmGateOf(session, args.signal);
+      approved = await gate({ ...PLAN });
+      args.events.assistantDone("end_turn");
+      return {
+        ok: true,
+        messages: [{ role: "assistant", content: "deleted" }],
+        refs: ["track:1:Keys"],
+      };
+    };
+
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(
+      serialize(message("user_message", { text: "delete bass" }, "id-c1"))
+    );
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+
+    const cr = collector.ofType("confirm_request")[0];
+    expect(cr.type).toBe("confirm_request");
+    let planId = "";
+    if (cr.type === "confirm_request") {
+      expect(typeof cr.payload.planId).toBe("string");
+      expect(cr.payload.planId.length).toBeGreaterThan(0);
+      expect(cr.payload.summary).toBe(PLAN.summary);
+      expect(cr.payload.actions).toEqual(["Delete track:1:Bass"]);
+      planId = cr.payload.planId;
+    }
+
+    // Approve → the gate resolves true, the runner finishes, refs follow.
+    socket.send(
+      serialize(
+        message("confirm_response", { planId, approved: true }, "id-r1")
+      )
+    );
+    await collector.until((f) => f.some((m) => m.type === "refs_updated"));
+
+    expect(approved).toBe(true);
+    expect(collector.ofType("assistant_done")).toHaveLength(1);
+    // confirm_request came before assistant_done/refs_updated in the stream.
+    const types = collector.frames.map((f) => f.type);
+    expect(types.indexOf("confirm_request")).toBeLessThan(
+      types.indexOf("assistant_done")
+    );
+    expect(collector.ofType("error")).toHaveLength(0);
+    assertNoKeyLeak(collector.frames);
+  });
+
+  it("chatSession_confirmResponseApprovedTrue_gateResolvesTrue", async () => {
+    // The runner awaits the gate, then resolves `done` — we await that (not a
+    // bare settle) so the socket-delivered confirm_response has fully driven the
+    // gate before we assert. Deterministic, no sleeps.
+    const done = deferred<boolean>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const resolved = await confirmGateOf(session, args.signal)({ ...PLAN });
+      done.resolve(resolved);
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-a")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+    const planId = planIdOf(collector);
+    socket.send(
+      serialize(
+        message("confirm_response", { planId, approved: true }, "id-ra")
+      )
+    );
+    expect(await done.promise).toBe(true);
+  });
+
+  it("chatSession_confirmResponseApprovedFalse_gateResolvesFalseCleanDecline", async () => {
+    const done = deferred<boolean>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const resolved = await confirmGateOf(session, args.signal)({ ...PLAN });
+      done.resolve(resolved);
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-d")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+    const planId = planIdOf(collector);
+    socket.send(
+      serialize(
+        message("confirm_response", { planId, approved: false }, "id-rd")
+      )
+    );
+    expect(await done.promise).toBe(false);
+    // A decline emits no error frame from the session (the card is the signal).
+    await settle();
+    expect(collector.ofType("error")).toHaveLength(0);
+  });
+
+  it("chatSession_doubleConfirmResponseSamePlanId_secondIgnoredIdempotent", async () => {
+    const done = deferred<void>();
+    let settleCount = 0;
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      await confirmGateOf(session, args.signal)({ ...PLAN });
+      settleCount += 1;
+      done.resolve();
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-dd")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+    const planId = planIdOf(collector);
+
+    // First response settles the gate; the second (same planId) must be ignored.
+    socket.send(
+      serialize(
+        message("confirm_response", { planId, approved: true }, "id-rd1")
+      )
+    );
+    socket.send(
+      serialize(
+        message("confirm_response", { planId, approved: false }, "id-rd2")
+      )
+    );
+    await done.promise;
+    await settle(); // give a (buggy) second settle a chance to land before counting
+    // The gate resolved exactly once (first response wins); no crash, no second
+    // settle. No error frame from the ignored duplicate.
+    expect(settleCount).toBe(1);
+    expect(collector.ofType("error")).toHaveLength(0);
+  });
+
+  it("chatSession_unknownPlanId_ignoredGracefullyNoErrorFrame", async () => {
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      // Park the gate so the turn stays in flight; we never answer the real plan.
+      await confirmGateOf(session, args.signal)({ ...PLAN });
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-u")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+
+    // A confirm_response for a planId the session never minted is ignored.
+    socket.send(
+      serialize(
+        message(
+          "confirm_response",
+          { planId: "not-a-real-plan", approved: true },
+          "id-bad"
+        )
+      )
+    );
+    await settle();
+    // No error frame — the unknown id is dropped with a debug log only.
+    expect(collector.ofType("error")).toHaveLength(0);
+    // The real plan is still pending (no spurious settle), so dispose can drain it.
+    session.dispose();
+    await settle();
+  });
+
+  it("chatSession_cancelWhilePending_settlesFalseNoHangNoExtraFrames", async () => {
+    const done = deferred<{ resolved: boolean; aborted: boolean }>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const resolved = await confirmGateOf(session, args.signal)({ ...PLAN });
+      // Mirror the loop's post-await abort re-check (decision 5): a cancel while
+      // the card is open settles the gate false AND aborts the signal.
+      done.resolve({ resolved, aborted: args.signal.aborted });
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-cx")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+    const beforeCancel = collector.frames.length;
+
+    // Cancel mid-card → the session aborts the turn signal → the gate's abort
+    // listener settles it false; the turn ends with no hang.
+    socket.send(serialize(message("cancel", {}, "id-cancel")));
+    const outcome = await done.promise;
+
+    expect(outcome.resolved).toBe(false);
+    expect(outcome.aborted).toBe(true);
+    // No extra frames beyond the confirm_request (ran:false → no refs_updated).
+    await settle();
+    expect(collector.frames.length).toBe(beforeCancel);
+  });
+
+  it("chatSession_disposeWhilePending_drainsSettlesFalseNoHang", async () => {
+    const done = deferred<boolean>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const resolved = await confirmGateOf(session, args.signal)({ ...PLAN });
+      done.resolve(resolved);
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-dz")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+
+    // dispose() (modal close) aborts the turn + drains pending confirmations.
+    session.dispose();
+    expect(await done.promise).toBe(false);
+  });
+
+  it("chatSession_preAbortedSignal_gateResolvesFalseWithoutSendingCard", async () => {
+    const done = deferred<boolean>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      // The session set activeTurn; abort it BEFORE invoking the gate so the
+      // pre-aborted branch (resolve false, no frame) is exercised.
+      session.dispose();
+      const resolved = await confirmGateOf(session, args.signal)({ ...PLAN });
+      done.resolve(resolved);
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-pa")));
+    expect(await done.promise).toBe(false);
+    // No confirm_request frame was sent for a pre-aborted signal.
+    await settle();
+    expect(collector.ofType("confirm_request")).toHaveLength(0);
+  });
+});
+
+/** Extract the planId from the first confirm_request frame a collector saw. */
+function planIdOf(collector: FrameCollector): string {
+  const cr = collector.ofType("confirm_request")[0];
+  if (cr.type === "confirm_request") {
+    return cr.payload.planId;
+  }
+  throw new Error("no confirm_request frame to read planId from");
+}
+
+/* -------------------------------------------------------------------------- */
 /* Local helpers                                                              */
 /* -------------------------------------------------------------------------- */
 
