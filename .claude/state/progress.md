@@ -1,11 +1,11 @@
 # Project Progress — Ableton Claude Agent
 
 ## Current Phase
-Phase: 4
-Title: Claude Client & Tool-Use Loop
+Phase: 5
+Title: Tool Registry & Executors
 Status: NOT STARTED
 Started: 2026-06-02
-> Next: Phase 3 COMPLETE. Continue shared core — Phases 4, 5, 6, 10 remain outcome-independent (Phase 4 Claude loop, Phase 5 depends on 3+4). Phases 7/8/9/13 target the **D** task sets.
+> Next: Phase 4 COMPLETE. Phase 5 (tool schemas in `src/shared/tools.ts` + executors) depends on Phases 3+4 — it implements the `ToolRuntime` seam (`toolDefinitions`/`classify`/`executeRead`/`flushMutations`) defined in `src/extension/agent-loop.ts`, wrapping `flushMutations` in a single `withinTransaction` (§7). Phase 6 fills the real system prompt + cannot-list. Phases 7/8/9/13 target the **D** task sets.
 
 ## Architecture Decision (Spike R3)
 Outcome: **D** — all three probes passed. Localhost WS full-duplex; persistent streaming chat; in-chat confirm cards; **act-in-place** mutations.
@@ -32,7 +32,7 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 
 #### Phase 1 follow-ups (non-blocking, tracked)
 - **M1 (revisit @ Phase 18):** entry is CJS `dist/extension.js` while package.json is `"type":"module"` — matches the official scaffolder template; Live host evaluates as CJS so load works. Validate against a real `.ablx` at packaging; switch to `dist/extension.cjs` only if host/standard-ESM resolution requires it.
-- **M4 (remove @ Phase 4):** inert `import Anthropic` + `Anthropic.name` log in src/extension/index.ts is a Phase-1 bundle-inclusion probe; remove when the real Claude client lands.
+- **M4 (RESOLVED @ Phase 4, 2026-06-02):** the inert `import Anthropic` + `Anthropic.name` bundle-probe was removed from src/extension/index.ts when the real Claude client landed; `activate()` is now the tempo-log only (no client at activation — no background mode).
 - **M3 (maintenance):** vitest <4.1.0 dev-only advisory GHSA-5xrq-8626-4rwp (`npm audit --omit=dev` = 0); bump to vitest 4.x in a maintenance step.
 - **M2 (Phase 18):** README is stale scaffolder boilerplate (refs src/extension.ts; omits test/lint/format scripts).
 
@@ -53,6 +53,13 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - **R3-2 (MINOR):** `refFromHandle` Phase-3 scope: anchors top-level `track`/`scene`/`cuePoint` only; return/main tracks and nested handles return `type_mismatch` — nested reverse-anchoring layered in a later phase.
 - **R3-3 (dep):** added `@vitest/coverage-v8` (dev-only) — the project had no coverage provider; resolves the M3 vitest-coverage gap.
 
+### Phase 4 — Claude Client & Tool-Use Loop ✅ COMPLETE (2026-06-02)
+- [x] 4.1 Claude client wrapper `src/extension/claude-client.ts`: wraps `@anthropic-ai/sdk` v0.100.1; **manual `messages.stream` loop** (NOT beta `toolRunner`). Default `MODEL="claude-sonnet-4-6"`, `MAX_TOKENS=4096`. Injectable `MessagesClient`/`MessageStreamLike` seam (tests swap a scripted fake; production adapter constructs `new Anthropic({apiKey})`). Prompt caching per §15.1: `cache_control:{type:"ephemeral"}` on the **last** system block + **last** tool; snapshot in a **separate, uncached** user block. `runTurn` streams deltas → `onDelta`, resolves the assembled final message (`content`/`stop_reason`/`usage`); honors `AbortSignal`; maps abort/`APIError`/other → structured `{error,detail,hint}`, never throws.
+- [x] 4.2 Agentic loop `src/extension/agent-loop.ts`: DI seams `ToolRuntime` (`toolDefinitions`/`classify`/`executeRead`/`flushMutations`) + `AgentEvents` (`assistantDelta`/`toolActivity`/`assistantDone`/`error`). Per assistant iteration: collect ALL `tool_use` blocks → run reads immediately in-order → **check abort BEFORE** flushing → flush ALL mutations in **ONE** `flushMutations(calls)` (§7 seam Phase 5 wraps in `withinTransaction`). `tool_result` blocks appended in same order/ids; `is_error:true` on error payloads. Exits on `end_turn`/`max_tokens`/`stop_sequence`/`refusal`; iteration cap (default `DEFAULT_MAX_ITERATIONS=10`) — no infinite loop. Defensive guards for no-block/short-flush/wrong-id.
+- [x] 4.3 Removed the Phase-1 M4 `Anthropic` bundle-probe from `index.ts` (tempo-log only; no client at activation). Tests: `tests/fixtures/fake-anthropic-client.ts` (scriptable `FakeMessagesClient`, captures request params) + `tests/fixtures/fake-tool-runtime.ts` (classifier + ordered call log) + `tests/claude-client.test.ts` (25) + `tests/agent-loop.test.ts` (22). **180 tests pass** (47 new + 133 prior). Coverage: claude-client.ts **98.75%** lines, agent-loop.ts **100%** lines (uncovered = production SDK adapter body, untestable without live network per the stub-only decision).
+- QA gate (code-reviewer): **PASS, 0 CRITICAL, 0 MAJOR, 2 MINOR (bookkeeping only).** Verified: manual-loop, mutation-batch boundary, abort-before-flush, cache_control placement, structured-error contract (never throws/no-ops), no API key in any source/test, strict TS no `any`, no phase bleed (no real schemas/system-prompt/snapshot/transport — only seams). `tsc -b` 0 / `npm test` 180 / `npm run lint` 0.
+- Decisions: **stub-only tests** (no live API call this phase); key via **constructor arg + `process.env.ANTHROPIC_API_KEY` fallback** (Phase 10 supplies from config.json). Model **sonnet 4.6** (`claude-sonnet-4-6`, confirmed valid `Model` literal in installed SDK).
+
 ## Session Log
 (no sessions yet)
 - 2026-06-02 16:10: Session ended
@@ -70,3 +77,7 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - 2026-06-02 19:19: Session ended
 - 2026-06-02 19:48: Session ended
 - 2026-06-02 20:32: Session ended
+- 2026-06-02 20:34: Session ended
+- 2026-06-02 21:07: Session ended
+- 2026-06-02 21:11: Session ended
+- 2026-06-02 21:11: Session ended
