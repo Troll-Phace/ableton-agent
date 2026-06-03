@@ -27,6 +27,11 @@
 
 import type Anthropic from "@anthropic-ai/sdk";
 
+import {
+  isDestructiveCall,
+  summarizeDestructivePlan,
+} from "../shared/tools.js";
+
 import type {
   AssistantDeltaSink,
   ClaudeClient,
@@ -152,6 +157,20 @@ export interface RunLoopInput {
   signal?: AbortSignal;
   /** Optional iteration cap override (defaults to {@link DEFAULT_MAX_ITERATIONS}). */
   maxIterations?: number;
+  /**
+   * Optional async confirmation gate (Phase 9, outcome D, §9/§13). Called BEFORE
+   * the mutation flush when the batch contains a destructive call
+   * ({@link isDestructiveCall}). Resolves `true` to proceed with the flush,
+   * `false` to skip the WHOLE flush (the batch shares one transaction, §7). MUST
+   * settle (resolve `false`) on abort so the loop never hangs; the loop re-checks
+   * `signal.aborted` after the await to distinguish a user *cancel* (abort-return)
+   * from a user *decline* (continue the loop). Never rejects.
+   */
+  requestConfirmation?: (plan: {
+    summary: string;
+    actions: string[];
+    calls: ToolCall[];
+  }) => Promise<boolean>;
 }
 
 /** Successful loop result. */
@@ -257,6 +276,7 @@ export async function runAgentLoop(
     model,
     maxTokens,
     signal,
+    requestConfirmation,
   } = input;
   const maxIterations = input.maxIterations ?? DEFAULT_MAX_ITERATIONS;
 
@@ -364,29 +384,114 @@ export async function runAgentLoop(
         events.error(err.detail);
         return { ok: false, err, messages };
       }
-      for (const call of mutationCalls) {
-        events.toolActivity(call.name, summaryOf(call), "started");
+
+      // 3b-i. Confirmation gate (Phase 9, outcome D, §9/§13). If the batch
+      //       contains a destructive call, it must be confirmed before ANY of it
+      //       flushes — the whole batch shares one transaction (§7), so a decline
+      //       skips the entire flush. `proceed` stays true for non-destructive
+      //       batches (which never gate) and for an approved destructive batch.
+      let proceed = true;
+      const destructiveCalls = mutationCalls.filter((call) =>
+        isDestructiveCall(call.name, call.input)
+      );
+      if (destructiveCalls.length > 0) {
+        if (requestConfirmation) {
+          const plan = {
+            ...summarizeDestructivePlan(
+              destructiveCalls.map((call) => ({
+                name: call.name,
+                input: call.input,
+              }))
+            ),
+            calls: destructiveCalls,
+          };
+          const approved = await requestConfirmation(plan);
+
+          // THE critical race (decision 5): a cancel WHILE the card is open must
+          // take the aborted-return path, NOT the decline path. The seam resolves
+          // false on abort, so re-check the signal FIRST — it is the discriminator
+          // between "user cancelled the turn" and "user clicked Decline".
+          if (signal?.aborted) {
+            const err = {
+              error: "aborted" as const,
+              detail: "aborted while awaiting destructive-action confirmation",
+              hint: "the user cancelled; no mutations were applied this iteration",
+            };
+            events.error(err.detail);
+            return { ok: false, err, messages };
+          }
+
+          if (!approved) {
+            // Decline path: skip the WHOLE flush; synthesize a user_declined
+            // result for EVERY mutation id (destructive or not — the batch is
+            // skipped together) so the model re-grounds and ends end_turn. No
+            // transaction is opened. Do NOT return — fall through to step 4.
+            proceed = false;
+            for (const call of mutationCalls) {
+              const payload: ToolResultPayload = {
+                toolUseId: call.id,
+                content: JSON.stringify({
+                  error: "user_declined",
+                  detail:
+                    "the user declined the destructive action; nothing was changed",
+                  hint: "propose a non-destructive alternative or ask what to do instead",
+                }),
+                isError: true,
+              };
+              resultsById.set(payload.toolUseId, payload);
+              events.toolActivity(call.name, summaryOf(call), "error");
+            }
+          }
+        } else {
+          // Fail-closed (decision 4): a destructive action was requested but no
+          // confirmation channel is wired. NEVER auto-approve — skip the flush
+          // and surface a structured configuration error for every mutation id.
+          proceed = false;
+          for (const call of mutationCalls) {
+            const payload: ToolResultPayload = {
+              toolUseId: call.id,
+              content: JSON.stringify({
+                error: "confirmation_unavailable",
+                detail:
+                  "a destructive action was requested but no confirmation channel is wired; nothing was changed",
+                hint: "this is a configuration error — destructive actions require a confirmation UI",
+              }),
+              isError: true,
+            };
+            resultsById.set(payload.toolUseId, payload);
+            events.toolActivity(call.name, summaryOf(call), "error");
+          }
+        }
       }
-      const payloads = await runtime.flushMutations(mutationCalls);
-      for (let i = 0; i < mutationCalls.length; i++) {
-        // Guard against a short payload array; fall back to a structured error.
-        const payload =
-          payloads[i] ??
-          ({
-            toolUseId: mutationCalls[i].id,
-            content: JSON.stringify({
-              error: "mutation_missing_result",
-              detail: "the mutation flush returned no result for this call",
-              hint: "retry the action",
-            }),
-            isError: true,
-          } satisfies ToolResultPayload);
-        resultsById.set(payload.toolUseId, payload);
-        events.toolActivity(
-          mutationCalls[i].name,
-          payload.summary ?? summaryOf(mutationCalls[i]),
-          payload.isError ? "error" : "ok"
-        );
+
+      // 3b-ii. Started-narration + flush — ONLY for an approved destructive batch
+      //        or a non-destructive batch (never on the decline / fail-closed
+      //        paths above, which already populated resultsById).
+      if (proceed) {
+        for (const call of mutationCalls) {
+          events.toolActivity(call.name, summaryOf(call), "started");
+        }
+        const payloads = await runtime.flushMutations(mutationCalls);
+        for (let i = 0; i < mutationCalls.length; i++) {
+          // Guard against a short payload array; fall back to a structured error.
+          const payload =
+            payloads[i] ??
+            ({
+              toolUseId: mutationCalls[i].id,
+              content: JSON.stringify({
+                error: "mutation_missing_result",
+                detail: "the mutation flush returned no result for this call",
+                hint: "retry the action",
+              }),
+              isError: true,
+            } satisfies ToolResultPayload);
+          resultsById.set(payload.toolUseId, payload);
+          events.toolActivity(
+            mutationCalls[i].name,
+            payload.summary ?? summaryOf(mutationCalls[i]),
+            payload.isError ? "error" : "ok"
+          );
+        }
       }
     }
 

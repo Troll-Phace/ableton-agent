@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true,
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "target": "esnext",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "types": ["node"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "tests/webview-render.test.ts",
+    "tests/webview-transport.test.ts",
+    "tests/webview-close.test.ts",
+    // Deliberate overlap: `src/webview/**` is owned by tsconfig.webview.json and `src/shared/**`
+    // by tsconfig.shared.json. The editor flags this as TS6307, but project `references` would
+    // force those projects to emit (a referenced project may not set noEmit -> TS6310, confirmed
+    // on TS 5.9.3), which the bundler-based build deliberately avoids. These webview tests must
+    // type-check against the real webview + shared sources. Overlap is benign under `noEmit`;
+    // `tsc -b` is authoritative and exits 0.
+    "src/webview/**/*",
+    "src/shared/**/*"
+  ]
+}

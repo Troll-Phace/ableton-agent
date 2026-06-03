@@ -5,6 +5,7 @@
     { "path": "./tsconfig.extension.json" },
     { "path": "./tsconfig.webview.json" },
     { "path": "./tsconfig.tests.json" },
+    { "path": "./tsconfig.webview-tests.json" },
     { "path": "./tsconfig.tools.json" }
   ]
 }

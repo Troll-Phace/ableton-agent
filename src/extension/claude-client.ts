@@ -25,7 +25,9 @@
  * never hardcoded, never logged, never serialized to the webview.
  */
 
-import Anthropic from "@anthropic-ai/sdk";
+import { createRequire } from "node:module";
+
+import Anthropic, { type ClientOptions } from "@anthropic-ai/sdk";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -348,9 +350,42 @@ export class ClaudeClient {
  * Adapt the real `@anthropic-ai/sdk` client into the narrow {@link MessagesClient}
  * seam. The constructed `Anthropic` instance — and therefore the API key — is
  * captured in this closure and never exposed.
+ *
+ * The client is constructed with `undici`'s `fetch` passed explicitly (the SDK's
+ * documented `fetch` client option) rather than relying on the host global.
+ * Live's Extension Host provides its own `fetch`, but our `Headers`/`Request`/
+ * `Response` are shimmed from `undici` (see `runtime-shim.ts`); a host `fetch`
+ * from a different impl could reject an undici `Request`/`Headers`. Pinning the
+ * client to undici's `fetch` guarantees the whole fetch stack is one impl.
+ *
+ * `undici`'s `fetch` is acquired via a **lazy `require("undici")`** rather than a
+ * static `import`: a static import would be hoisted by esbuild and evaluate
+ * undici's factory at load — before `runtime-shim.ts` installs the globals undici
+ * touches at eval (`TextDecoder`, …) — which is exactly the load crash the shim
+ * exists to prevent. `realMessagesClient` runs only when a turn starts (well after
+ * load), so requiring undici here is safe; the shim already loaded undici lazily
+ * at import, so this `require` hits the module cache.
+ *
+ * `undici`'s `fetch` and the SDK's `Fetch` type both model the WHATWG Fetch
+ * contract but with structurally distinct `Request`/`Response` types (undici's
+ * `Request` carries `duplex`), so they are not directly assignable. The single
+ * `as unknown as` cast below bridges the two runtime-compatible impls without
+ * `any`; `SdkFetch` is the SDK's own option type, so the seam stays type-checked.
  */
 function realMessagesClient(apiKey: string): MessagesClient {
-  const anthropic = new Anthropic({ apiKey });
+  type SdkFetch = NonNullable<ClientOptions["fetch"]>;
+  // Lazy require (NOT a hoisted static import) — see TSDoc above.
+  const requireFn = createRequire(
+    (globalThis as { __filename?: string; __dirname?: string }).__filename ??
+      (typeof (globalThis as { __dirname?: string }).__dirname === "string"
+        ? `${(globalThis as { __dirname: string }).__dirname}/index.js`
+        : `${process.cwd()}/index.js`)
+  );
+  const { fetch: undiciFetch } = requireFn("undici") as {
+    fetch: unknown;
+  };
+  const fetch = undiciFetch as SdkFetch;
+  const anthropic = new Anthropic({ apiKey, fetch });
   return {
     stream(params: Anthropic.MessageStreamParams): MessageStreamLike {
       // The SDK MessageStream is a structural superset of MessageStreamLike.

@@ -395,14 +395,30 @@ export interface LiveImportAudioArgs {
   source: string;
 }
 
+/**
+ * `report_limitation` — the honesty tool (§8.3, §9). NOT a Live operation: it
+ * records that a requested capability is unsupported and surfaces the closest
+ * supported alternative, so the agent never fakes success. Classified as a
+ * **read** ({@link classify}) so the loop runs it immediately and never queues
+ * it into a transaction.
+ */
+export interface ReportLimitationArgs {
+  /** What the user asked for that cannot be done. */
+  requested: string;
+  /** Why it is unsupported (the §9 reason). */
+  reason: string;
+  /** The closest supported alternative, if any. */
+  alternative?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Tool names + classification
 // ---------------------------------------------------------------------------
 
 /**
  * Every tool name defined in this module, in §8 order (reads, then mutations,
- * then the side-effect tool). `report_limitation` is intentionally absent — it
- * is Phase 6's job.
+ * then the side-effect tools). `report_limitation` is the honesty tool (§8.3,
+ * §9): it runs immediately and never mutates, so it classifies as a **read**.
  */
 export const TOOL_NAMES = [
   // §8.1 read
@@ -424,6 +440,8 @@ export const TOOL_NAMES = [
   "live_delete",
   // §8.3 side-effect (classified as mutation)
   "live_import_audio",
+  // §8.3 honesty tool (classified as read — never queued into a transaction)
+  "report_limitation",
 ] as const;
 
 /** The union of all tool name string literals defined here. */
@@ -466,6 +484,8 @@ export const TOOL_CLASS: Record<ToolName, ToolClass> = {
   live_delete: "mutation",
   // §8.3 side-effect → mutation
   live_import_audio: "mutation",
+  // §8.3 honesty tool → read (immediate; NEVER queued into a transaction, §9)
+  report_limitation: "read",
 };
 
 /**
@@ -477,6 +497,105 @@ export const TOOL_CLASS: Record<ToolName, ToolClass> = {
  */
 export function classify(toolName: string): ToolClass {
   return isToolName(toolName) ? TOOL_CLASS[toolName] : "mutation";
+}
+
+// ---------------------------------------------------------------------------
+// Destructive-action classification + plan summary (Phase 9, §8.2 `D`, §9)
+//
+// The confirmation flow (§9/§13) gates a mutation batch when ANY call in it is
+// destructive. The **destructive set is deliberately narrow** (user-decided):
+// `live_delete` (always) and `live_edit_midi_notes` with `op:"filter"` (it
+// removes notes outside the kept range). `live_modify_device_chain` is additive
+// — NOT destructive — so it is not gated here. This predicate is the SINGLE
+// source of truth shared by the agent loop, the summarizer below, and the tests
+// (so the loop, the system prompt, and the UI can never drift apart).
+//
+// Both functions are PURE and TOTAL: `input` arrives off the wire as `unknown`,
+// so they narrow defensively and NEVER throw on a malformed/non-object value. A
+// malformed call is not provably destructive (so the predicate returns `false`);
+// the executor rejects bad input later with a structured error (§9).
+// ---------------------------------------------------------------------------
+
+/**
+ * Narrow an `unknown` to a plain string-keyed record without throwing. Returns
+ * `undefined` for `null`, arrays, and non-objects, so callers can read fields
+ * defensively. Kept local (a 2-line guard) rather than imported from
+ * `protocol.ts` — both are shared siblings and this avoids a cross-module dep.
+ */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+/**
+ * Whether a tool call is **destructive** and therefore must pass through the
+ * confirmation flow (§9/§13) before its batch is committed.
+ *
+ * `true` for `live_delete` (always) and for `live_edit_midi_notes` when
+ * `input.op === "filter"`; `false` for every other tool and for any call whose
+ * `input` is malformed/non-object (not provably destructive — the executor
+ * rejects bad input later, §9). Total: never throws.
+ *
+ * @param name the tool name (matched against the destructive set).
+ * @param input the call's raw arguments, off the wire as `unknown`.
+ */
+export function isDestructiveCall(name: string, input: unknown): boolean {
+  if (name === "live_delete") {
+    return true;
+  }
+  if (name === "live_edit_midi_notes") {
+    return asRecord(input)?.op === "filter";
+  }
+  return false;
+}
+
+/**
+ * Human-readable description of a destructive batch for the confirmation card
+ * (§13 `confirm_request` payload). `summary` is the headline shown to the user;
+ * `actions` is one line per destructive call, in order, for the itemized list.
+ */
+export interface DestructivePlanText {
+  /** Headline stating the total destructive count (e.g. "This will permanently change 2 things…"). */
+  summary: string;
+  /** One human-readable line per destructive call, in call order. */
+  actions: string[];
+}
+
+/**
+ * Build the user-facing {@link DestructivePlanText} for a destructive batch.
+ *
+ * Takes the structural `{ name, input }` view of each call (NOT the loop's
+ * `ToolCall` — shared must not import extension types, per code-style). Callers
+ * pass only the destructive subset; `actions` describes those calls and
+ * `summary` states their total count (singular/plural correct). PURE,
+ * deterministic, no ids; reads `input` fields defensively and never throws —
+ * a missing/malformed field falls back to a generic phrasing.
+ *
+ * @param calls the destructive calls, in the order they were emitted.
+ */
+export function summarizeDestructivePlan(
+  calls: ReadonlyArray<{ name: string; input: unknown }>
+): DestructivePlanText {
+  const actions = calls.map(({ name, input }) => {
+    const record = asRecord(input);
+    if (name === "live_edit_midi_notes") {
+      const clip = record?.clip;
+      const clipText = typeof clip === "string" && clip ? clip : "a clip";
+      return `Filter notes in ${clipText} (removes notes outside the kept range)`;
+    }
+    // live_delete (and any other call routed here as destructive).
+    const target = record?.target;
+    return typeof target === "string" && target
+      ? `Delete ${target}`
+      : "Delete an object";
+  });
+
+  const count = calls.length;
+  const noun = count === 1 ? "thing" : "things";
+  const summary = `This will permanently change ${count} ${noun} and cannot be undone automatically by the agent.`;
+
+  return { summary, actions };
 }
 
 // ---------------------------------------------------------------------------
@@ -501,14 +620,23 @@ const NOTE_DESCRIPTION_SCHEMA: Record<string, unknown> = {
   type: "object",
   description: "A single MIDI note. Times are in beats.",
   properties: {
-    pitch: { type: "integer", minimum: 0, maximum: 127 },
+    pitch: { type: "integer", description: "MIDI note number, integer 0-127." },
     startTime: { type: "number", description: "Start position, in beats." },
     duration: { type: "number", description: "Length, in beats." },
-    velocity: { type: "integer", minimum: 0, maximum: 127 },
+    velocity: { type: "integer", description: "MIDI velocity, integer 0-127." },
     muted: { type: "boolean" },
-    probability: { type: "number", minimum: 0, maximum: 1 },
-    velocityDeviation: { type: "number" },
-    releaseVelocity: { type: "integer", minimum: 0, maximum: 127 },
+    probability: {
+      type: "number",
+      description: "Trigger probability, 0.0-1.0.",
+    },
+    velocityDeviation: {
+      type: "number",
+      description: "Random velocity spread, in MIDI velocity units.",
+    },
+    releaseVelocity: {
+      type: "integer",
+      description: "MIDI release velocity, integer 0-127.",
+    },
     selected: { type: "boolean" },
   },
   required: ["pitch", "startTime", "duration"],
@@ -531,11 +659,19 @@ const CLIP_LOOP_SETTINGS_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
-/** The JSON-schema fragment for the mixer-param selector {@link MixerParamArg}. */
+/**
+ * The JSON-schema fragment for the mixer-param selector {@link MixerParamArg}.
+ *
+ * This is an `anyOf` **combinator node**. Anthropic's strict tool-use subset
+ * requires a combinator node to be "pure": it may carry ONLY `anyOf` (plus an
+ * optional `description`). Sibling `type` / `additionalProperties` / `properties`
+ * / `required` are rejected (`tools.N.custom: For 'anyOf', '… ' is not
+ * supported`). Each branch inside `anyOf` is a complete object node and carries
+ * its own `type:"object"` + `additionalProperties:false`.
+ */
 const MIXER_PARAM_SCHEMA: Record<string, unknown> = {
-  type: "object",
   description: "Which mixer parameter to target.",
-  oneOf: [
+  anyOf: [
     {
       type: "object",
       properties: { kind: { const: "volume" } },
@@ -552,7 +688,10 @@ const MIXER_PARAM_SCHEMA: Record<string, unknown> = {
       type: "object",
       properties: {
         kind: { const: "send" },
-        index: { type: "integer", minimum: 0 },
+        index: {
+          type: "integer",
+          description: "Send slot index, non-negative integer (0-based).",
+        },
       },
       required: ["kind", "index"],
       additionalProperties: false,
@@ -579,7 +718,12 @@ function readTool(
   const tool: Anthropic.Tool = {
     name,
     description,
-    input_schema: { type: "object", properties, required },
+    input_schema: {
+      type: "object",
+      properties,
+      required,
+      additionalProperties: false,
+    },
   };
   if (inputExamples !== undefined) {
     tool.input_examples = inputExamples;
@@ -587,20 +731,51 @@ function readTool(
   return tool;
 }
 
-/** Build a mutating tool definition (`strict: true`, per §8). */
+/**
+ * Build a mutating tool definition. Mutating tools default to `strict: true`
+ * (§8), but a few may opt out.
+ *
+ * ## Why some mutating tools are NOT strict — the optional-parameter budget
+ * Anthropic's strict tool-use compiles every `strict` schema into a grammar and
+ * caps the **combined** total across all strict schemas in one request at:
+ * **20 strict tools**, **24 optional parameters**, and **16 union-typed
+ * parameters** (platform.claude.com structured-outputs → "Schema complexity
+ * limits"; exceeding any cap returns a 400). Our op-/type-dispatched "bag" tools
+ * (`live_edit_midi_notes`, `live_update_clip`, `live_create_clip`) carry many
+ * fields that are conditionally relevant per `op`/`type` and so *cannot* be
+ * `required` — they alone contribute 28 optional params and blow the 24 cap.
+ * Making them non-strict drops them from the grammar/budget entirely while
+ * leaving every other strict tool (incl. `live_set_param`'s union `target`)
+ * strict and under budget.
+ *
+ * Honesty is **not** weakened: these executors already validate arguments at
+ * runtime and return structured `{error,…}` results (§code-style, §9), so strict
+ * mode added no guarantee they don't already enforce. Names, count, routing, and
+ * executor behavior are unchanged — only the `strict` validation hint differs.
+ *
+ * @param strict whether to set `strict: true` on the tool (default `true`).
+ */
 function mutationTool(
   name: ToolName,
   description: string,
   properties: Record<string, unknown>,
   required: string[],
-  inputExamples?: Array<Record<string, unknown>>
+  inputExamples?: Array<Record<string, unknown>>,
+  strict = true
 ): Anthropic.Tool {
   const tool: Anthropic.Tool = {
     name,
     description,
-    input_schema: { type: "object", properties, required },
-    strict: true,
+    input_schema: {
+      type: "object",
+      properties,
+      required,
+      additionalProperties: false,
+    },
   };
+  if (strict) {
+    tool.strict = true;
+  }
   if (inputExamples !== undefined) {
     tool.input_examples = inputExamples;
   }
@@ -685,7 +860,10 @@ const liveUpdateClip = mutationTool(
     },
   },
   ["clip"],
-  [{ clip: "track:2:Bass/clip:0:Verse", name: "Verse A", looping: true }]
+  [{ clip: "track:2:Bass/clip:0:Verse", name: "Verse A", looping: true }],
+  // Non-strict: all fields are optional partial-update flags (none can be
+  // required); keeps the strict grammar small. Executor validates at runtime.
+  false
 );
 
 const liveEditMidiNotes = mutationTool(
@@ -712,9 +890,7 @@ const liveEditMidiNotes = mutationTool(
     },
     strength: {
       type: "number",
-      minimum: 0,
-      maximum: 1,
-      description: "op='quantize': snap strength (1 = full snap).",
+      description: "op='quantize': snap strength 0.0-1.0 (1 = full snap).",
     },
     timingAmount: {
       type: "number",
@@ -728,10 +904,22 @@ const liveEditMidiNotes = mutationTool(
       type: "object",
       description: "op='filter': keep only notes within these ranges.",
       properties: {
-        pitchMin: { type: "integer", minimum: 0, maximum: 127 },
-        pitchMax: { type: "integer", minimum: 0, maximum: 127 },
-        velocityMin: { type: "integer", minimum: 0, maximum: 127 },
-        velocityMax: { type: "integer", minimum: 0, maximum: 127 },
+        pitchMin: {
+          type: "integer",
+          description: "Lowest pitch to keep, integer 0-127.",
+        },
+        pitchMax: {
+          type: "integer",
+          description: "Highest pitch to keep, integer 0-127.",
+        },
+        velocityMin: {
+          type: "integer",
+          description: "Lowest velocity to keep, integer 0-127.",
+        },
+        velocityMax: {
+          type: "integer",
+          description: "Highest velocity to keep, integer 0-127.",
+        },
       },
       additionalProperties: false,
     },
@@ -754,7 +942,10 @@ const liveEditMidiNotes = mutationTool(
       grid: 0.25,
       strength: 1,
     },
-  ]
+  ],
+  // Non-strict: op-conditional optional fields would blow the 24-optional-param
+  // strict budget; the executor validates per-op at runtime (see mutationTool).
+  false
 );
 
 const liveSetParam = mutationTool(
@@ -762,10 +953,12 @@ const liveSetParam = mutationTool(
   "Set a STATIC value on a device parameter or a mixer parameter (volume/pan/send). This is a single value, NOT automation — there is no automation API. The value is clamped/quantized to the parameter's range.",
   {
     target: {
-      type: "object",
+      // `anyOf` combinator node: must be PURE (only `anyOf` + `description`).
+      // Strict tool-use rejects sibling type/additionalProperties on it; each
+      // branch below is a complete object node instead.
       description:
         "What to set: a device parameter, or a track mixer parameter.",
-      oneOf: [
+      anyOf: [
         {
           type: "object",
           properties: {
@@ -821,9 +1014,8 @@ const liveCreate = mutationTool(
     },
     index: {
       type: "integer",
-      minimum: 0,
       description:
-        "scene only: insertion index (-1 or omitted appends). Ignored for tracks/take lanes.",
+        "scene only: insertion index, non-negative integer (-1 or omitted appends). Ignored for tracks/take lanes.",
     },
     name: { type: "string" },
     takeLaneTrack: refProp("take_lane: the track the lane belongs to."),
@@ -875,7 +1067,10 @@ const liveCreateClip = mutationTool(
         loopEnd: 4,
       },
     },
-  ]
+  ],
+  // Non-strict: type-conditional optional fields (audio vs midi) plus the nested
+  // loopSettings object inflate the strict grammar; executor validates per-type.
+  false
 );
 
 const liveInsertDevice = mutationTool(
@@ -887,7 +1082,10 @@ const liveInsertDevice = mutationTool(
       type: "string",
       description: "A built-in Live device name (e.g. 'Reverb', 'EQ Eight').",
     },
-    index: { type: "integer", minimum: 0 },
+    index: {
+      type: "integer",
+      description: "Insertion index in the device chain, non-negative integer.",
+    },
   },
   ["location", "deviceName", "index"],
   [{ location: "track:2:Bass", deviceName: "EQ Eight", index: 0 }]
@@ -900,7 +1098,11 @@ const liveModifyDeviceChain = mutationTool(
     location: refProp("The device or rack to modify."),
     op: { type: "string", enum: ["duplicate", "insert_chain"] },
     device: refProp("duplicate: the device to duplicate."),
-    index: { type: "integer", minimum: 0 },
+    index: {
+      type: "integer",
+      description:
+        "Insertion index for the new chain/device, non-negative integer.",
+    },
   },
   ["location", "op"],
   [
@@ -954,6 +1156,37 @@ const liveImportAudio = mutationTool(
   [{ source: "https://example.com/loop.wav" }]
 );
 
+// ----- §8.3 honesty tool -----
+
+const reportLimitation = readTool(
+  "report_limitation",
+  "Honesty tool: record that a requested capability is unsupported and surface the closest supported alternative. This changes NOTHING in Live — call it instead of faking success or silently doing nothing when a request needs something you cannot do (see the 'You cannot' list in your instructions). Provide what was requested, why it is unsupported, and (when one exists) the closest supported alternative.",
+  {
+    requested: {
+      type: "string",
+      description: "What the user asked for that cannot be done.",
+    },
+    reason: {
+      type: "string",
+      description: "Why it is unsupported.",
+    },
+    alternative: {
+      type: "string",
+      description: "The closest supported alternative, if any.",
+    },
+  },
+  ["requested", "reason"],
+  [
+    {
+      requested: "automate the filter cutoff to sweep up over 4 bars",
+      reason:
+        "there is no automation/envelope API — live_set_param sets a single static value only",
+      alternative:
+        "set the cutoff to a fixed value, or split the change across a few static values on separate clips",
+    },
+  ]
+);
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -987,6 +1220,8 @@ export const TOOL_DEFINITIONS: readonly Anthropic.Tool[] = [
   liveDelete,
   // §8.3 side-effect
   liveImportAudio,
+  // §8.3 honesty tool (read-classified)
+  reportLimitation,
 ];
 
 /**

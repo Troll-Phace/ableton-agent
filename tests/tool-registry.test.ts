@@ -8,7 +8,12 @@ import type {
   ToolCall,
   ToolResultPayload,
 } from "../src/extension/agent-loop.js";
-import { TOOL_DEFINITIONS, TOOL_NAMES, classify } from "../src/shared/tools.js";
+import {
+  TOOL_CLASS,
+  TOOL_DEFINITIONS,
+  TOOL_NAMES,
+  classify,
+} from "../src/shared/tools.js";
 import {
   makeFakeContext,
   type FakeExtensionContext,
@@ -20,7 +25,8 @@ import {
  * ARCHITECTURE §8, §7, §4). Drives the runtime against the
  * {@link FakeExtensionContext}; the deeper per-executor behavior lives in
  * `executors.test.ts`. Here we pin the wire-facing contract:
- *  - `toolDefinitions()` returns all 16 §8 defs and stamps NO `cache_control`
+ *  - `toolDefinitions()` returns every §8 def (the 15 §8.1/§8.2 tools + the §8.3
+ *    `report_limitation` honesty tool = 17) and stamps NO `cache_control`
  *    (the client owns the breakpoint, §15.1);
  *  - `classify()` matches the shared `classify` for every tool name and defaults
  *    unknown names to `"mutation"` (the safe side, §4 step 5c);
@@ -51,12 +57,16 @@ function body(p: ToolResultPayload): Record<string, unknown> {
 }
 
 describe("tool-registry — definitions", () => {
-  it("toolRegistry_toolDefinitions_returnsAllSixteenDefs", () => {
+  it("toolRegistry_toolDefinitions_returnsAllSeventeenDefs", () => {
     const defs = makeRuntime().toolDefinitions();
-    expect(defs).toHaveLength(16);
+    // 15 §8.1/§8.2 tools + the §8.3 `report_limitation` honesty tool = 17. The
+    // length assertion is pinned to the shared source so it never drifts.
+    expect(defs).toHaveLength(17);
     expect(defs).toHaveLength(TOOL_DEFINITIONS.length);
     const names = defs.map((d) => d.name).sort();
     expect(names).toEqual([...TOOL_NAMES].sort());
+    // The honesty tool is part of the wire surface.
+    expect(names).toContain("report_limitation");
   });
 
   it("toolRegistry_toolDefinitions_stampsNoCacheControl", () => {
@@ -78,7 +88,7 @@ describe("tool-registry — definitions", () => {
     // shared source (the client may stamp the last element's cache_control).
     expect(a).not.toBe(b);
     a.pop();
-    expect(rt.toolDefinitions()).toHaveLength(16);
+    expect(rt.toolDefinitions()).toHaveLength(TOOL_DEFINITIONS.length);
   });
 });
 
@@ -91,9 +101,21 @@ describe("tool-registry — classify", () => {
       "live_get_clip",
       "live_get_device_params",
       "live_render_audio",
+      // §8.3 honesty tool: runs in the read partition so it executes immediately
+      // and is NEVER queued into a transaction (the high-risk wiring detail, §9).
+      "report_limitation",
     ]) {
       expect(rt.classify(name)).toBe("read");
     }
+  });
+
+  it("toolRegistry_classify_reportLimitationIsReadViaSharedTable", () => {
+    // Pin the classification at BOTH seams: the runtime's `classify` AND the
+    // shared `TOOL_CLASS` table the runtime delegates to. If `TOOL_CLASS` ever
+    // dropped report_limitation, classify() would fall to the "mutation" default
+    // and route it to prepare() → unknown_tool (the §9 honesty-tool failure mode).
+    expect(makeRuntime().classify("report_limitation")).toBe("read");
+    expect(TOOL_CLASS.report_limitation).toBe("read");
   });
 
   it("toolRegistry_classify_mutationForMutationTools", () => {
@@ -157,6 +179,44 @@ describe("tool-registry — unknown-tool routing never throws", () => {
     const p = await makeRuntime().executeRead(call("live_update_track", {}));
     expect(p.isError).toBe(true);
     expect(body(p).error).toBe("unknown_tool");
+  });
+});
+
+describe("tool-registry — report_limitation routes through the READ partition (§8.3/§9)", () => {
+  it("toolRegistry_executeRead_reportLimitation_acknowledgesHonestly", async () => {
+    // The honesty tool dispatches through executeRead and returns a non-error
+    // acknowledgment — never a fake success, never an unknown_tool error.
+    const p = await makeRuntime().executeRead(
+      call("report_limitation", {
+        requested: "draw automation",
+        reason: "live_set_param only sets a static value (§9)",
+        alternative: "set a single static value",
+      })
+    );
+    expect(p.isError).toBeUndefined();
+    const data = body(p);
+    expect(data.acknowledged).toBe(true);
+    expect(data.requested).toBe("draw automation");
+  });
+
+  it("toolRegistry_flushMutations_reportLimitation_hitsUnknownToolNotAMutation", async () => {
+    // The lock-in for the high-risk wiring detail: if report_limitation were EVER
+    // routed to the mutation flush (e.g. classify defaulting to "mutation"), the
+    // mutation switch has no case for it and would surface `unknown_tool` and open
+    // NO transaction. Proving that here demonstrates the read classification is
+    // exactly what makes the honesty tool work — and that the safety net holds even
+    // if it were misrouted.
+    const fake = makeFakeContext();
+    const [p] = await makeRuntime(fake).flushMutations([
+      call("report_limitation", {
+        requested: "x",
+        reason: "y",
+      }),
+    ]);
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("unknown_tool");
+    // A misrouted honesty tool must never open a transaction (no phantom undo step).
+    expect(fake.transactions).toEqual([]);
   });
 });
 

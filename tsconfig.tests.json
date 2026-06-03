@@ -12,5 +12,10 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["tests/**/*", "src/shared/**/*", "src/extension/**/*"]
+  "include": ["tests/**/*", "src/shared/**/*", "src/extension/**/*"],
+  "exclude": [
+    "tests/webview-render.test.ts",
+    "tests/webview-transport.test.ts",
+    "tests/webview-close.test.ts"
+  ]
 }
