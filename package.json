@@ -7,8 +7,8 @@
   },
   "type": "module",
   "scripts": {
-    "build": "tsc -b && tsx build.ts --production",
-    "build:dev": "tsc -b && tsx build.ts",
+    "build": "tsc -b && npm run build:webview && tsx build.ts --production",
+    "build:dev": "tsc -b && npm run build:webview && tsx build.ts",
     "build:webview": "vite build",
     "start": "npm run build:dev && extensions-cli run",
     "package": "npm run build && extensions-cli package",
