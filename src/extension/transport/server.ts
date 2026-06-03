@@ -10,10 +10,13 @@
  *  - serves the built single-file SPA (`dist/webview/index.html`) same-origin at
  *    `GET /`, so the webview's WebSocket is same-origin (the cleanest path proven
  *    by spike 3.2 variant (b));
- *  - **nonce-gates** the WebSocket upgrade: a per-session `crypto.randomUUID()`
- *    nonce is embedded in the connect URL (`/?t=<nonce>`) and any upgrade whose
- *    `?t` does not match is destroyed — this stops other localhost processes from
- *    connecting to the chat socket;
+ *  - **nonce-gates** the WebSocket upgrade PRE-handshake (in `verifyClient`): a
+ *    per-session `crypto.randomUUID()` nonce is embedded in the connect URL
+ *    (`/?t=<nonce>`) and any upgrade whose `?t` does not match is refused with an
+ *    HTTP 401 before the handshake completes — this stops other localhost
+ *    processes from connecting to the chat socket, and (because the client's
+ *    `open` never fires) lets the webview's bounded reconnect backoff apply
+ *    instead of looping forever;
  *  - tracks a **single active client** (the modal); a new valid connection
  *    replaces and closes the previous one;
  *  - parses every inbound frame with the pure {@link parseEnvelope} and only
@@ -92,6 +95,46 @@ function rawDataToString(data: WebSocket.RawData): string {
   // `data` is `Buffer | ArrayBuffer` here; `Uint8Array` accepts both and
   // Buffer.from(Uint8Array) is a well-typed overload.
   return Buffer.from(new Uint8Array(data)).toString("utf8");
+}
+
+/**
+ * Extract the `t` query parameter from a raw request URL **without `URL` /
+ * `URLSearchParams`** — Live's Extension Host Node runtime does not expose the
+ * WHATWG URL globals (confirmed in-Live: `URLSearchParams is not defined`).
+ *
+ * Pure string ops + the ECMAScript core `decodeURIComponent` (a language
+ * built-in, always present, NOT a Node global). Handles `?a=1&t=<v>&b=2`
+ * ordering, percent-encoded values, and the bare `?t` form (decodes to `""`).
+ *
+ * @param rawUrl - the request URL (path + optional `?query`), e.g. `/?t=abc`.
+ * @returns the decoded `t` value, or `null` when no `t=` pair is present.
+ *   Throws only if `decodeURIComponent` rejects a malformed escape sequence —
+ *   the caller routes that to the distinct "extraction threw" branch.
+ */
+function extractNonceParam(rawUrl: string): string | null {
+  const queryStart = rawUrl.indexOf("?");
+  if (queryStart === -1) {
+    return null;
+  }
+  const query = rawUrl.slice(queryStart + 1);
+  if (query.length === 0) {
+    return null;
+  }
+  for (const pair of query.split("&")) {
+    if (pair.length === 0) {
+      continue;
+    }
+    const eq = pair.indexOf("=");
+    const key = eq === -1 ? pair : pair.slice(0, eq);
+    if (key !== "t") {
+      continue;
+    }
+    const rawValue = eq === -1 ? "" : pair.slice(eq + 1);
+    // `+` is a legal space encoding in query strings; normalize before decoding
+    // so a nonce (a UUID, which never contains `+`) still compares exactly.
+    return decodeURIComponent(rawValue.replace(/\+/g, " "));
+  }
+  return null;
 }
 
 /** Inline page served when the built SPA is missing (operator must build it). */
@@ -197,10 +240,34 @@ export class TransportServer {
       });
       this.httpServer = server;
 
-      const wss = new WebSocketServer({ server });
+      const wss = new WebSocketServer({
+        server,
+        // Gate the nonce PRE-handshake: `verifyClient` runs before the WS
+        // upgrade is accepted, so a bad/missing nonce is refused with an HTTP
+        // 401 and the client's `open` event NEVER fires. This is the §13 P7-2
+        // hardening AND the cure for the webview's infinite-reconnect loop: the
+        // post-handshake gate (closing 1008 after `open`) let the browser
+        // `WebSocket` fire `open`, reset its reconnect counter, then loop
+        // forever; a pre-handshake 401 keeps the webview's bounded backoff.
+        verifyClient: (
+          info: { req: IncomingMessage },
+          done: (res: boolean, code?: number, message?: string) => void
+        ): void => {
+          if (this.isNonceValid(info.req)) {
+            done(true);
+            return;
+          }
+          console.error(
+            `${LOG_PREFIX} rejecting WS upgrade (pre-handshake 401) — bad/missing nonce (url=${String(
+              info.req.url
+            )})`
+          );
+          done(false, 401, "Unauthorized");
+        },
+      });
       this.wss = wss;
-      wss.on("connection", (socket, req) => {
-        this.handleConnection(socket, req);
+      wss.on("connection", (socket) => {
+        this.handleConnection(socket);
       });
       wss.on("error", (err) => {
         console.error(`${LOG_PREFIX} WebSocketServer error`, err);
@@ -392,28 +459,14 @@ export class TransportServer {
   /* ----------------------------------------------------------------------- */
 
   /**
-   * Handle a new WS connection: enforce the nonce gate, replace any prior
-   * client, and wire message/close/error handlers.
+   * Handle a new (already nonce-validated) WS connection: replace any prior
+   * client and wire message/close/error handlers.
    *
-   * The nonce is validated here (rather than in `verifyClient`) so the gate runs
-   * after the upgrade and the socket can be cleanly destroyed on mismatch.
+   * The nonce gate runs PRE-handshake in `verifyClient` (see {@link start}), so
+   * by the time `connection` fires the nonce is guaranteed valid and no socket
+   * needs destroying here.
    */
-  private handleConnection(socket: WebSocket, req: IncomingMessage): void {
-    if (!this.isNonceValid(req)) {
-      console.error(
-        `${LOG_PREFIX} rejecting WS connection — bad/missing nonce (url=${String(
-          req.url
-        )})`
-      );
-      try {
-        socket.close(1008, "unauthorized");
-        socket.terminate();
-      } catch (err) {
-        console.error(`${LOG_PREFIX} error terminating rejected socket`, err);
-      }
-      return;
-    }
-
+  private handleConnection(socket: WebSocket): void {
     // Single active client: replace and close any previous socket.
     if (this.activeSocket !== null) {
       console.debug(`${LOG_PREFIX} replacing existing client connection`);
@@ -463,20 +516,57 @@ export class TransportServer {
   /**
    * Validate the `?t` nonce query param on the upgrade request URL.
    *
+   * Extraction depends on **nothing beyond ECMAScript core**: it parses the
+   * query string with pure string ops and the language built-in
+   * `decodeURIComponent`, with **zero reliance on `URL` / `URLSearchParams`**.
+   * Live 12.4.5b3's Extension Host Node runtime does **not** expose the WHATWG
+   * URL globals — an in-Live smoke test confirmed `URLSearchParams is not
+   * defined` here, which silently nuked every otherwise-valid nonce (and the
+   * earlier `new URL(...)` form failed the same way). `decodeURIComponent` is a
+   * language built-in (always present, NOT a Node global), so this parser is
+   * safe in the host and in the vitest/Node env alike. Comparison stays exact
+   * equality against the session nonce.
+   *
+   * Parser: slice everything after the first `?`, split the query on `&`, find
+   * the first `t=` pair, and `decodeURIComponent` its value. A `t` with no `=`
+   * (bare `?t`) decodes to the empty string; a missing `t` pair is the distinct
+   * "missing" branch.
+   *
+   * Failures are logged LOUDLY and distinctly so the next Live run is
+   * definitive about *which* branch failed (threw / no `?t` / value mismatch).
+   * The nonce is in the URL and is not a secret, so echoing it here leaks
+   * nothing — the API key lives nowhere near this layer.
+   *
+   * @param req - the HTTP upgrade request carrying the nonce-bearing URL.
    * @returns `true` only when `?t` exactly equals the session nonce.
    */
   private isNonceValid(req: IncomingMessage): boolean {
     const rawUrl = req.url ?? "";
-    // Parse against a loopback base so a path-only `req.url` is valid input.
     let provided: string | null;
     try {
-      provided = new URL(rawUrl, `http://${LOOPBACK_HOST}`).searchParams.get(
-        "t"
+      provided = extractNonceParam(rawUrl);
+    } catch (err) {
+      // Make the swallowed-exception branch UNMISTAKABLE in the host log so a
+      // host-runtime parsing quirk can never masquerade as a generic rejection.
+      console.error(
+        `${LOG_PREFIX} nonce extraction threw — rejecting (rawUrl=${rawUrl})`,
+        err
       );
-    } catch {
       return false;
     }
-    return provided !== null && provided === this.nonce;
+    if (provided === null) {
+      console.error(
+        `${LOG_PREFIX} nonce missing — no "?t" param on upgrade (rawUrl=${rawUrl})`
+      );
+      return false;
+    }
+    if (provided !== this.nonce) {
+      console.error(
+        `${LOG_PREFIX} nonce mismatch — provided="${provided}" expected="${this.nonce}" (rawUrl=${rawUrl})`
+      );
+      return false;
+    }
+    return true;
   }
 
   /** Parse + deliver one inbound frame; never throws to the socket. */

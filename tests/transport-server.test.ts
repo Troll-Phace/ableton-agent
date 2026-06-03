@@ -87,21 +87,55 @@ function waitOpen(socket: WebSocket): Promise<void> {
 }
 
 /**
- * Resolve with the close code once a nonce-gated `ws` connection is closed.
+ * Outcome of awaiting a nonce-gated `ws` connection attempt.
  *
- * The server validates the nonce *after* the WS upgrade completes (see
- * `server.ts` `handleConnection`), so a rejected client may briefly emit `open`
- * before the server closes it with code 1008 — `open` is therefore NOT treated
- * as a failure here; only the eventual close (with its code) settles us. The
- * `error` event (e.g. "abnormal closure") is swallowed so it never rejects.
+ * `opened` records whether the client ever fired `open`. With the PRE-handshake
+ * gate (`verifyClient` → HTTP 401), a rejected client must NEVER open — it fails
+ * the handshake and emits `error` directly. `statusCode` carries the 401 from
+ * `ws`'s `unexpected-response` path when available.
  */
-function waitRejected(socket: WebSocket): Promise<number> {
-  return new Promise<number>((resolve) => {
-    socket.once("error", () => {
-      // Swallow — the close handler reports the authoritative code.
+interface RejectionOutcome {
+  /** True only if the client fired `open` before settling (regression signal). */
+  opened: boolean;
+  /** HTTP status from the failed upgrade, when `ws` surfaces it (e.g. 401). */
+  statusCode: number | null;
+}
+
+/**
+ * Resolve once a nonce-gated `ws` connection attempt settles via `error` or
+ * `close`, capturing whether it ever `open`ed and the rejection HTTP status.
+ *
+ * The server validates the nonce PRE-handshake in `verifyClient` (see
+ * `server.ts` {@link TransportServer.start}); a rejected client therefore fails
+ * the WS handshake — `open` must NOT fire, and `ws` emits `error` (with an
+ * `unexpected-response` carrying HTTP 401). Both `error` and `close` are
+ * swallowed-as-settle so the assertion can inspect `opened`/`statusCode`.
+ */
+function waitRejected(socket: WebSocket): Promise<RejectionOutcome> {
+  return new Promise<RejectionOutcome>((resolve) => {
+    let opened = false;
+    let statusCode: number | null = null;
+    let settled = false;
+    const settle = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      resolve({ opened, statusCode });
+    };
+    socket.once("open", () => {
+      // A regression to a post-handshake gate would set this — the test fails.
+      opened = true;
     });
-    socket.once("close", (code) => {
-      resolve(code);
+    socket.once("unexpected-response", (_req, res) => {
+      statusCode = res.statusCode ?? null;
+      settle();
+    });
+    socket.once("error", () => {
+      settle();
+    });
+    socket.once("close", () => {
+      settle();
     });
   });
 }
@@ -180,6 +214,14 @@ afterEach(async () => {
   for (const socket of harness.sockets) {
     try {
       socket.removeAllListeners();
+      // A pre-handshake-rejected socket may still be CONNECTING here;
+      // `terminate()` on it makes ws emit an `error` ("closed before the
+      // connection was established") asynchronously. With listeners stripped
+      // that would be an UNCAUGHT exception, so re-attach a no-op `error` sink
+      // before terminating. Best-effort teardown either way.
+      socket.on("error", () => {
+        /* swallow teardown noise */
+      });
       socket.terminate();
     } catch {
       // best-effort teardown
@@ -266,6 +308,71 @@ describe("transportServer_nonceGate_acceptsValidRejectsInvalid", () => {
     expect(connected).toBe(true);
   });
 
+  it("transportServer_deriveStyleUrlWithCorrectNonce_connectsAndFiresOnConnect", async () => {
+    // Rebuild the connect URL exactly as the webview's `deriveWebSocketUrl`
+    // does — `ws://127.0.0.1:<port>/?t=<nonce>` from the bound port + nonce —
+    // so this proves the in-Live-shaped URL passes the pre-handshake gate (the
+    // smoke-test failure was THIS shape being rejected as "bad/missing nonce").
+    const { server, info } = await startServer();
+    const parsed = new URL(info.url);
+    const nonce = parsed.searchParams.get("t");
+    expect(nonce).toBeTruthy();
+    const wsUrl = `ws://127.0.0.1:${info.port}/?t=${String(nonce)}`;
+
+    let connected = false;
+    server.onConnect(() => {
+      connected = true;
+    });
+    const socket = await connect(wsUrl);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(connected).toBe(true);
+  });
+
+  it("transportServer_nonceWithExtraParamsAnyOrder_connects", async () => {
+    // The dependency-free parser must find `t=` regardless of position in the
+    // query string. Shape the connect URL as `?a=1&t=<nonce>&b=2` and prove the
+    // pre-handshake gate still accepts it (proves split-on-`&` + find-`t=`).
+    const { server, info } = await startServer();
+    const parsed = new URL(info.url);
+    const nonce = parsed.searchParams.get("t");
+    expect(nonce).toBeTruthy();
+    const wsUrl = `ws://127.0.0.1:${info.port}/?a=1&t=${String(nonce)}&b=2`;
+
+    let connected = false;
+    server.onConnect(() => {
+      connected = true;
+    });
+    const socket = await connect(wsUrl);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(connected).toBe(true);
+  });
+
+  it("transportServer_percentEncodedNonceValue_decodesAndConnects", async () => {
+    // A nonce carrying a percent-encoded byte must round-trip through the
+    // parser's `decodeURIComponent`. We can't change the server's randomUUID
+    // nonce, but we CAN prove the decode path by percent-encoding a character of
+    // the real nonce in the URL — the server decodes it back to the exact nonce
+    // and the gate accepts. (UUIDs use only `[0-9a-f-]`; we encode a hyphen as
+    // `%2D`, which `decodeURIComponent` returns as `-`.)
+    const { server, info } = await startServer();
+    const parsed = new URL(info.url);
+    const nonce = parsed.searchParams.get("t");
+    expect(nonce).toBeTruthy();
+    const nonceStr = String(nonce);
+    // Encode the first hyphen (UUIDs always contain hyphens) as %2D.
+    const encoded = nonceStr.replace("-", "%2D");
+    expect(encoded).not.toBe(nonceStr); // ensure we actually encoded something
+    const wsUrl = `ws://127.0.0.1:${info.port}/?t=${encoded}`;
+
+    let connected = false;
+    server.onConnect(() => {
+      connected = true;
+    });
+    const socket = await connect(wsUrl);
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(connected).toBe(true);
+  });
+
   it("transportServer_wrongNonce_rejectsAndNoOnConnect", async () => {
     const { server, info } = await startServer();
     let connected = false;
@@ -275,9 +382,12 @@ describe("transportServer_nonceGate_acceptsValidRejectsInvalid", () => {
     const bad = toWsUrl(info.url).replace(/\?t=.+$/, "?t=not-the-nonce");
     const socket = new WebSocket(bad);
     harness.sockets.push(socket);
-    const code = await waitRejected(socket);
-    // 1008 (policy violation) is the server's "unauthorized" close code.
-    expect(code).toBe(1008);
+    const outcome = await waitRejected(socket);
+    // PRE-handshake reject: the client must NEVER open, and the upgrade fails
+    // with HTTP 401 (verifyClient). A regressed post-handshake gate would set
+    // `opened = true` and surface no 401, failing here.
+    expect(outcome.opened).toBe(false);
+    expect(outcome.statusCode).toBe(401);
     expect(connected).toBe(false);
   });
 
@@ -290,7 +400,10 @@ describe("transportServer_nonceGate_acceptsValidRejectsInvalid", () => {
     const noNonce = toWsUrl(info.url).replace(/\?t=.+$/, "");
     const socket = new WebSocket(noNonce);
     harness.sockets.push(socket);
-    await waitRejected(socket);
+    const outcome = await waitRejected(socket);
+    // Missing nonce is also refused PRE-handshake: no open, HTTP 401.
+    expect(outcome.opened).toBe(false);
+    expect(outcome.statusCode).toBe(401);
     expect(connected).toBe(false);
   });
 });
