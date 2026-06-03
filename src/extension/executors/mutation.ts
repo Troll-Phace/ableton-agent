@@ -609,10 +609,18 @@ function parseNotesArg(
         ),
       };
     }
-    const note: NoteDescription = { pitch, startTime, duration };
+    // The wire schema no longer carries numeric min/max bounds (strict tool use
+    // rejects `minimum`/`maximum` — §8). The executor is therefore the sole
+    // guard: clamp every bounded field here so an out-of-range value from the
+    // model is corrected, never passed raw to the SDK (§9 honesty contract).
+    const note: NoteDescription = {
+      pitch: clamp(Math.round(pitch), 0, 127),
+      startTime,
+      duration,
+    };
     const velocity = optNumber(n, "velocity");
     if (typeof velocity === "number") {
-      note.velocity = velocity;
+      note.velocity = clamp(Math.round(velocity), 0, 127);
     }
     const muted = optBoolean(n, "muted");
     if (typeof muted === "boolean") {
@@ -620,7 +628,7 @@ function parseNotesArg(
     }
     const probability = optNumber(n, "probability");
     if (typeof probability === "number") {
-      note.probability = probability;
+      note.probability = clamp(probability, 0, 1);
     }
     const velocityDeviation = optNumber(n, "velocityDeviation");
     if (typeof velocityDeviation === "number") {
@@ -628,7 +636,7 @@ function parseNotesArg(
     }
     const releaseVelocity = optNumber(n, "releaseVelocity");
     if (typeof releaseVelocity === "number") {
-      note.releaseVelocity = releaseVelocity;
+      note.releaseVelocity = clamp(Math.round(releaseVelocity), 0, 127);
     }
     notes.push(note);
   }

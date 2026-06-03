@@ -17,6 +17,13 @@
     "vite.config.ts",
     "vitest.config.ts",
     "build.ts",
-    "eslint.config.ts"
+    "eslint.config.ts",
+    "scripts/**/*.ts",
+    // Deliberate overlap: `src/shared/**` is also owned by tsconfig.shared.json. The editor's
+    // language server flags this as TS6307, but converting to project `references` requires the
+    // shared project to emit (a referenced project may not set noEmit -> TS6310, confirmed on
+    // TS 5.9.3), which the bundler-based build deliberately avoids. The overlap is benign under
+    // `noEmit`; `tsc -b` is authoritative and exits 0. Tools need shared's types directly.
+    "src/shared/**/*"
   ]
 }

@@ -2196,6 +2196,95 @@ describe("argument validation — per-field wrong-type rejection", () => {
     );
   });
 
+  it("executor_editMidiNotes_replace_clampsOutOfRangeNoteFields", async () => {
+    // The wire schema dropped numeric min/max bounds (strict tool use rejects
+    // them), so the executor MUST clamp the replace path. An out-of-range note
+    // is corrected, never passed raw to the SDK (§9 honesty contract).
+    const fake = tagged(
+      makeFakeContext({
+        tracks: [
+          {
+            className: "MidiTrack",
+            name: "Keys",
+            children: {
+              arrangementClips: [
+                { className: "MidiClip", name: "C", notes: [] },
+              ],
+            },
+            mixer: mixerSpec(),
+          },
+        ],
+      })
+    );
+    const r = await one(
+      fake,
+      call("live_edit_midi_notes", {
+        clip: "track:0:Keys/clip:0:C",
+        op: "replace",
+        notes: [
+          {
+            pitch: 200,
+            startTime: 0,
+            duration: 1,
+            velocity: -5,
+            probability: 1.7,
+            releaseVelocity: 999,
+          },
+        ],
+      })
+    );
+    expect(r.isError).toBeUndefined();
+    const written = fake.notesOf("tracks[0]/arrangementClips[0]")[0];
+    expect(written).toMatchObject({
+      pitch: 127,
+      velocity: 0,
+      probability: 1,
+      releaseVelocity: 127,
+    });
+  });
+
+  it("executor_editMidiNotes_replace_roundsFractionalPitchAndClampsLow", async () => {
+    const fake = tagged(
+      makeFakeContext({
+        tracks: [
+          {
+            className: "MidiTrack",
+            name: "Keys",
+            children: {
+              arrangementClips: [
+                { className: "MidiClip", name: "C", notes: [] },
+              ],
+            },
+            mixer: mixerSpec(),
+          },
+        ],
+      })
+    );
+    const r = await one(
+      fake,
+      call("live_edit_midi_notes", {
+        clip: "track:0:Keys/clip:0:C",
+        op: "replace",
+        notes: [
+          {
+            pitch: 60.7,
+            startTime: 0,
+            duration: 1,
+            velocity: 999,
+            probability: -0.2,
+          },
+        ],
+      })
+    );
+    expect(r.isError).toBeUndefined();
+    const written = fake.notesOf("tracks[0]/arrangementClips[0]")[0];
+    expect(written).toMatchObject({
+      pitch: 61,
+      velocity: 127,
+      probability: 0,
+    });
+  });
+
   it("executor_editMidiNotes_transposeMissingSemitones_invalidArgs", async () => {
     const fake = tagged(
       makeFakeContext({

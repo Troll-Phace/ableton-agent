@@ -521,14 +521,23 @@ const NOTE_DESCRIPTION_SCHEMA: Record<string, unknown> = {
   type: "object",
   description: "A single MIDI note. Times are in beats.",
   properties: {
-    pitch: { type: "integer", minimum: 0, maximum: 127 },
+    pitch: { type: "integer", description: "MIDI note number, integer 0-127." },
     startTime: { type: "number", description: "Start position, in beats." },
     duration: { type: "number", description: "Length, in beats." },
-    velocity: { type: "integer", minimum: 0, maximum: 127 },
+    velocity: { type: "integer", description: "MIDI velocity, integer 0-127." },
     muted: { type: "boolean" },
-    probability: { type: "number", minimum: 0, maximum: 1 },
-    velocityDeviation: { type: "number" },
-    releaseVelocity: { type: "integer", minimum: 0, maximum: 127 },
+    probability: {
+      type: "number",
+      description: "Trigger probability, 0.0-1.0.",
+    },
+    velocityDeviation: {
+      type: "number",
+      description: "Random velocity spread, in MIDI velocity units.",
+    },
+    releaseVelocity: {
+      type: "integer",
+      description: "MIDI release velocity, integer 0-127.",
+    },
     selected: { type: "boolean" },
   },
   required: ["pitch", "startTime", "duration"],
@@ -551,11 +560,19 @@ const CLIP_LOOP_SETTINGS_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
-/** The JSON-schema fragment for the mixer-param selector {@link MixerParamArg}. */
+/**
+ * The JSON-schema fragment for the mixer-param selector {@link MixerParamArg}.
+ *
+ * This is an `anyOf` **combinator node**. Anthropic's strict tool-use subset
+ * requires a combinator node to be "pure": it may carry ONLY `anyOf` (plus an
+ * optional `description`). Sibling `type` / `additionalProperties` / `properties`
+ * / `required` are rejected (`tools.N.custom: For 'anyOf', '… ' is not
+ * supported`). Each branch inside `anyOf` is a complete object node and carries
+ * its own `type:"object"` + `additionalProperties:false`.
+ */
 const MIXER_PARAM_SCHEMA: Record<string, unknown> = {
-  type: "object",
   description: "Which mixer parameter to target.",
-  oneOf: [
+  anyOf: [
     {
       type: "object",
       properties: { kind: { const: "volume" } },
@@ -572,7 +589,10 @@ const MIXER_PARAM_SCHEMA: Record<string, unknown> = {
       type: "object",
       properties: {
         kind: { const: "send" },
-        index: { type: "integer", minimum: 0 },
+        index: {
+          type: "integer",
+          description: "Send slot index, non-negative integer (0-based).",
+        },
       },
       required: ["kind", "index"],
       additionalProperties: false,
@@ -599,7 +619,12 @@ function readTool(
   const tool: Anthropic.Tool = {
     name,
     description,
-    input_schema: { type: "object", properties, required },
+    input_schema: {
+      type: "object",
+      properties,
+      required,
+      additionalProperties: false,
+    },
   };
   if (inputExamples !== undefined) {
     tool.input_examples = inputExamples;
@@ -607,20 +632,51 @@ function readTool(
   return tool;
 }
 
-/** Build a mutating tool definition (`strict: true`, per §8). */
+/**
+ * Build a mutating tool definition. Mutating tools default to `strict: true`
+ * (§8), but a few may opt out.
+ *
+ * ## Why some mutating tools are NOT strict — the optional-parameter budget
+ * Anthropic's strict tool-use compiles every `strict` schema into a grammar and
+ * caps the **combined** total across all strict schemas in one request at:
+ * **20 strict tools**, **24 optional parameters**, and **16 union-typed
+ * parameters** (platform.claude.com structured-outputs → "Schema complexity
+ * limits"; exceeding any cap returns a 400). Our op-/type-dispatched "bag" tools
+ * (`live_edit_midi_notes`, `live_update_clip`, `live_create_clip`) carry many
+ * fields that are conditionally relevant per `op`/`type` and so *cannot* be
+ * `required` — they alone contribute 28 optional params and blow the 24 cap.
+ * Making them non-strict drops them from the grammar/budget entirely while
+ * leaving every other strict tool (incl. `live_set_param`'s union `target`)
+ * strict and under budget.
+ *
+ * Honesty is **not** weakened: these executors already validate arguments at
+ * runtime and return structured `{error,…}` results (§code-style, §9), so strict
+ * mode added no guarantee they don't already enforce. Names, count, routing, and
+ * executor behavior are unchanged — only the `strict` validation hint differs.
+ *
+ * @param strict whether to set `strict: true` on the tool (default `true`).
+ */
 function mutationTool(
   name: ToolName,
   description: string,
   properties: Record<string, unknown>,
   required: string[],
-  inputExamples?: Array<Record<string, unknown>>
+  inputExamples?: Array<Record<string, unknown>>,
+  strict = true
 ): Anthropic.Tool {
   const tool: Anthropic.Tool = {
     name,
     description,
-    input_schema: { type: "object", properties, required },
-    strict: true,
+    input_schema: {
+      type: "object",
+      properties,
+      required,
+      additionalProperties: false,
+    },
   };
+  if (strict) {
+    tool.strict = true;
+  }
   if (inputExamples !== undefined) {
     tool.input_examples = inputExamples;
   }
@@ -705,7 +761,10 @@ const liveUpdateClip = mutationTool(
     },
   },
   ["clip"],
-  [{ clip: "track:2:Bass/clip:0:Verse", name: "Verse A", looping: true }]
+  [{ clip: "track:2:Bass/clip:0:Verse", name: "Verse A", looping: true }],
+  // Non-strict: all fields are optional partial-update flags (none can be
+  // required); keeps the strict grammar small. Executor validates at runtime.
+  false
 );
 
 const liveEditMidiNotes = mutationTool(
@@ -732,9 +791,7 @@ const liveEditMidiNotes = mutationTool(
     },
     strength: {
       type: "number",
-      minimum: 0,
-      maximum: 1,
-      description: "op='quantize': snap strength (1 = full snap).",
+      description: "op='quantize': snap strength 0.0-1.0 (1 = full snap).",
     },
     timingAmount: {
       type: "number",
@@ -748,10 +805,22 @@ const liveEditMidiNotes = mutationTool(
       type: "object",
       description: "op='filter': keep only notes within these ranges.",
       properties: {
-        pitchMin: { type: "integer", minimum: 0, maximum: 127 },
-        pitchMax: { type: "integer", minimum: 0, maximum: 127 },
-        velocityMin: { type: "integer", minimum: 0, maximum: 127 },
-        velocityMax: { type: "integer", minimum: 0, maximum: 127 },
+        pitchMin: {
+          type: "integer",
+          description: "Lowest pitch to keep, integer 0-127.",
+        },
+        pitchMax: {
+          type: "integer",
+          description: "Highest pitch to keep, integer 0-127.",
+        },
+        velocityMin: {
+          type: "integer",
+          description: "Lowest velocity to keep, integer 0-127.",
+        },
+        velocityMax: {
+          type: "integer",
+          description: "Highest velocity to keep, integer 0-127.",
+        },
       },
       additionalProperties: false,
     },
@@ -774,7 +843,10 @@ const liveEditMidiNotes = mutationTool(
       grid: 0.25,
       strength: 1,
     },
-  ]
+  ],
+  // Non-strict: op-conditional optional fields would blow the 24-optional-param
+  // strict budget; the executor validates per-op at runtime (see mutationTool).
+  false
 );
 
 const liveSetParam = mutationTool(
@@ -782,10 +854,12 @@ const liveSetParam = mutationTool(
   "Set a STATIC value on a device parameter or a mixer parameter (volume/pan/send). This is a single value, NOT automation — there is no automation API. The value is clamped/quantized to the parameter's range.",
   {
     target: {
-      type: "object",
+      // `anyOf` combinator node: must be PURE (only `anyOf` + `description`).
+      // Strict tool-use rejects sibling type/additionalProperties on it; each
+      // branch below is a complete object node instead.
       description:
         "What to set: a device parameter, or a track mixer parameter.",
-      oneOf: [
+      anyOf: [
         {
           type: "object",
           properties: {
@@ -841,9 +915,8 @@ const liveCreate = mutationTool(
     },
     index: {
       type: "integer",
-      minimum: 0,
       description:
-        "scene only: insertion index (-1 or omitted appends). Ignored for tracks/take lanes.",
+        "scene only: insertion index, non-negative integer (-1 or omitted appends). Ignored for tracks/take lanes.",
     },
     name: { type: "string" },
     takeLaneTrack: refProp("take_lane: the track the lane belongs to."),
@@ -895,7 +968,10 @@ const liveCreateClip = mutationTool(
         loopEnd: 4,
       },
     },
-  ]
+  ],
+  // Non-strict: type-conditional optional fields (audio vs midi) plus the nested
+  // loopSettings object inflate the strict grammar; executor validates per-type.
+  false
 );
 
 const liveInsertDevice = mutationTool(
@@ -907,7 +983,10 @@ const liveInsertDevice = mutationTool(
       type: "string",
       description: "A built-in Live device name (e.g. 'Reverb', 'EQ Eight').",
     },
-    index: { type: "integer", minimum: 0 },
+    index: {
+      type: "integer",
+      description: "Insertion index in the device chain, non-negative integer.",
+    },
   },
   ["location", "deviceName", "index"],
   [{ location: "track:2:Bass", deviceName: "EQ Eight", index: 0 }]
@@ -920,7 +999,11 @@ const liveModifyDeviceChain = mutationTool(
     location: refProp("The device or rack to modify."),
     op: { type: "string", enum: ["duplicate", "insert_chain"] },
     device: refProp("duplicate: the device to duplicate."),
-    index: { type: "integer", minimum: 0 },
+    index: {
+      type: "integer",
+      description:
+        "Insertion index for the new chain/device, non-negative integer.",
+    },
   },
   ["location", "op"],
   [
