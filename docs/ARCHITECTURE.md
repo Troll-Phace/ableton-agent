@@ -152,8 +152,8 @@ Primary journey — "user asks the agent to change something":
 ## 5. Activation, Context & Lifecycle
 
 - Entry: `export function activate(activation) { const ctx = initialize(activation, "1.0.0"); … }`.
-- A single command `live.launchAgent` is registered on multiple context-menu scopes; it branches on the argument type (`Handle` | `ArrangementSelection` | `ClipSlotSelection`) to seed the initial scoped context (§16 scopes).
-- The extension runs only while invoked — **no background mode**. In socket branches the modal is opened once per session and left open; the `showModalDialog` promise resolves only on close.
+- A single command `live.launchAgent` is registered on multiple context-menu scopes via `ctx.commands.registerContextMenuAction(scope, title, commandId): Promise<() => Promise<void>>` (Promise-based; the resolved value is an async unregister handle). It branches on the argument type (`Handle` | `ArrangementSelection` | `ClipSlotSelection`) to seed the initial scoped context (§16 scopes).
+- The extension runs only while invoked — **no background mode**. In socket branches the modal is opened once per session and left open; `ui.showModalDialog(url, w, h): Promise<string>` returns a Promise that resolves only on modal close.
 - `ctx` exposes `application.song`, `commands`, `ui`, `resources`, `environment`, `getObjectFromHandle`, `withinTransaction`.
 
 ---
@@ -204,7 +204,9 @@ scene:4:Chorus
 
 ## 8. Tool Surface
 
-~15 consolidated, namespaced, action-parameterized tools (Anthropic guidance: fewer capable tools beat many narrow ones). `Txn` = batched into the undo transaction. `D` = destructive (gated, §9/§12). Set `strict: true` on every mutating tool; mark `live_get_*` + system prompt cacheable.
+~15 consolidated, namespaced, action-parameterized tools (Anthropic guidance: fewer capable tools beat many narrow ones). `Txn` = batched into the undo transaction. `D` = destructive (gated, §9/§12). Set `strict: true` on mutating tools **except** the high-optional-param "bag" tools `live_edit_midi_notes`, `live_update_clip`, and `live_create_clip`, which are intentionally **non-strict**: Anthropic's strict tool-use enforces aggregate complexity caps across all strict tools in one request (≤20 strict tools, ≤24 optional params, ≤16 union params), and the full mutating set exceeds them. Those three executors still validate every argument at runtime and return structured errors on bad input, so honesty is preserved. Mark `live_get_*` + system prompt cacheable.
+
+Strict schemas must additionally conform to Anthropic's JSON-Schema **subset**: every object node sets `additionalProperties: false`; value constraints (`minimum`/`maximum`/`minLength`/`pattern`/etc.) are unsupported and must be **enforced in the executor and described in prose** instead; use `anyOf` (never `oneOf`); combinator nodes must be pure (no sibling keywords). These rules are enforced by the `npm run validate:tools` harness and `tests/tool-schemas.test.ts`.
 
 ### 8.1 Read / context tools
 | Tool | Params | Wraps (SDK) |
@@ -364,8 +366,10 @@ Key enums/types: `WarpMode` {Beats 0, Tones 1, Texture 2, Repitch 3, Complex 4, 
 
 Run before Phase 3. Throwaway probes; record the outcome (A/B/C/D) and R5 result in progress.md.
 
+> **SDK shape (installed):** the UI primitives are **Promise-based**, not callback-style. `ui.showModalDialog(url, w, h): Promise<string>` resolves on modal close, and `ctx.commands.registerContextMenuAction(scope, title, commandId): Promise<() => Promise<void>>` resolves to an async unregister handle. The probes below trigger the modal **fire-and-forget** (call without `await`ing its Promise) precisely so the event loop is free to keep running while it is open.
+
 ### Spike 3.1 — Event loop alive while a modal is open? (the gate)
-Start `setInterval(() => console.log("tick", Date.now()), 500)`, then open the modal **fire-and-forget** (not awaited). **Pass:** ticks continue at cadence while the modal is open. **Fail:** ticks stop → in-process side-channel impossible → outcome A.
+Start `setInterval(() => console.log("tick", Date.now()), 500)`, then open the modal **fire-and-forget** — invoke `ui.showModalDialog(...)` but do **not** `await` the returned Promise (it would only resolve on close). **Pass:** ticks continue at cadence while the modal is open. **Fail:** ticks stop → in-process side-channel impossible → outcome A.
 
 ### Spike 3.2 — Webview reaches a localhost socket?
 Start an HTTP+WS server on `127.0.0.1:<port>` before opening the modal. Test two variants: (a) `data:` URL page connecting cross-origin; (b) `showModalDialog('http://127.0.0.1:<port>/')` with a same-origin WS. **Pass (b):** cleanest — serve SPA + socket from one server. **Fail both:** outcome B (try optional probe 3.2b: does the host route a non-`close_and_send` webview message anywhere? — undocumented, low expectations).
