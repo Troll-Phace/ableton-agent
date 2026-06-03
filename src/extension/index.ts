@@ -1,3 +1,12 @@
+// MUST be first: Live's Extension Host runs the extension in a stripped V8 realm
+// that omits Node's web-global injections (`TextDecoder`, `Headers`, `URL`,
+// `crypto`, `ReadableStream`, … are all undefined). This side-effecting import
+// installs them — from `node:*` builtins, then undici (loaded LAZILY so its
+// factory does not hoist-eval before the globals exist) — before any dependency
+// (e.g. @anthropic-ai/sdk) initializes and touches one. ES import ordering runs
+// this import before the imports below. See runtime-shim.ts.
+import "./runtime-shim.js";
+
 import { initialize, type ActivationContext } from "@ableton-extensions/sdk";
 
 import { startLaunchWiring } from "./transport/launch.js";
