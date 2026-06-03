@@ -395,14 +395,30 @@ export interface LiveImportAudioArgs {
   source: string;
 }
 
+/**
+ * `report_limitation` — the honesty tool (§8.3, §9). NOT a Live operation: it
+ * records that a requested capability is unsupported and surfaces the closest
+ * supported alternative, so the agent never fakes success. Classified as a
+ * **read** ({@link classify}) so the loop runs it immediately and never queues
+ * it into a transaction.
+ */
+export interface ReportLimitationArgs {
+  /** What the user asked for that cannot be done. */
+  requested: string;
+  /** Why it is unsupported (the §9 reason). */
+  reason: string;
+  /** The closest supported alternative, if any. */
+  alternative?: string;
+}
+
 // ---------------------------------------------------------------------------
 // Tool names + classification
 // ---------------------------------------------------------------------------
 
 /**
  * Every tool name defined in this module, in §8 order (reads, then mutations,
- * then the side-effect tool). `report_limitation` is intentionally absent — it
- * is Phase 6's job.
+ * then the side-effect tools). `report_limitation` is the honesty tool (§8.3,
+ * §9): it runs immediately and never mutates, so it classifies as a **read**.
  */
 export const TOOL_NAMES = [
   // §8.1 read
@@ -424,6 +440,8 @@ export const TOOL_NAMES = [
   "live_delete",
   // §8.3 side-effect (classified as mutation)
   "live_import_audio",
+  // §8.3 honesty tool (classified as read — never queued into a transaction)
+  "report_limitation",
 ] as const;
 
 /** The union of all tool name string literals defined here. */
@@ -466,6 +484,8 @@ export const TOOL_CLASS: Record<ToolName, ToolClass> = {
   live_delete: "mutation",
   // §8.3 side-effect → mutation
   live_import_audio: "mutation",
+  // §8.3 honesty tool → read (immediate; NEVER queued into a transaction, §9)
+  report_limitation: "read",
 };
 
 /**
@@ -954,6 +974,37 @@ const liveImportAudio = mutationTool(
   [{ source: "https://example.com/loop.wav" }]
 );
 
+// ----- §8.3 honesty tool -----
+
+const reportLimitation = readTool(
+  "report_limitation",
+  "Honesty tool: record that a requested capability is unsupported and surface the closest supported alternative. This changes NOTHING in Live — call it instead of faking success or silently doing nothing when a request needs something you cannot do (see the 'You cannot' list in your instructions). Provide what was requested, why it is unsupported, and (when one exists) the closest supported alternative.",
+  {
+    requested: {
+      type: "string",
+      description: "What the user asked for that cannot be done.",
+    },
+    reason: {
+      type: "string",
+      description: "Why it is unsupported.",
+    },
+    alternative: {
+      type: "string",
+      description: "The closest supported alternative, if any.",
+    },
+  },
+  ["requested", "reason"],
+  [
+    {
+      requested: "automate the filter cutoff to sweep up over 4 bars",
+      reason:
+        "there is no automation/envelope API — live_set_param sets a single static value only",
+      alternative:
+        "set the cutoff to a fixed value, or split the change across a few static values on separate clips",
+    },
+  ]
+);
+
 // ---------------------------------------------------------------------------
 // Registry
 // ---------------------------------------------------------------------------
@@ -987,6 +1038,8 @@ export const TOOL_DEFINITIONS: readonly Anthropic.Tool[] = [
   liveDelete,
   // §8.3 side-effect
   liveImportAudio,
+  // §8.3 honesty tool (read-classified)
+  reportLimitation,
 ];
 
 /**

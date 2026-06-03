@@ -1740,6 +1740,112 @@ describe("mutation executors — audio tools are deferred (§9 honesty)", () => 
 });
 
 // ---------------------------------------------------------------------------
+// report_limitation — the honesty tool (§8.3, §9)
+//
+// Runs in the READ partition (executeRead), makes NO Live change, opens NO
+// transaction, and echoes the limitation back — so "I can't do that, but I can
+// do this" is a first-class, recorded outcome rather than a fake success.
+// ---------------------------------------------------------------------------
+
+describe("read executors — report_limitation (honesty tool, §8.3/§9)", () => {
+  // Each `requested` maps to one §9 cannot-category: automation, routing,
+  // third-party plugin, post-creation marker edit. None can be expressed as a
+  // real mutation tool, so report_limitation is the honest landing place.
+  const CASES: [requested: string, reason: string][] = [
+    [
+      "draw automation",
+      "live_set_param sets a static value only; there is no envelope API (§9)",
+    ],
+    [
+      "create a sidechain",
+      "the SDK exposes no signal routing or sidechain API (§9)",
+    ],
+    ["load Serum", "only built-in Live devices can be inserted (§9)"],
+    [
+      "move the loop markers",
+      "clip loop/start/end markers are set only at creation (§9)",
+    ],
+  ];
+
+  it.each(CASES)(
+    "executor_reportLimitation_%s_acknowledgesWithAlternative",
+    async (requested, reason) => {
+      const fake = makeFakeContext();
+      const alternative = "the closest supported thing I can do";
+      const p = await runtimeOf(fake).executeRead(
+        call("report_limitation", { requested, reason, alternative })
+      );
+      // Honest acknowledgment — NOT an error, NOT a fake success.
+      expect(p.isError).toBeUndefined();
+      const data = body(p);
+      expect(data.acknowledged).toBe(true);
+      expect(data.requested).toBe(requested);
+      expect(data.reason).toBe(reason);
+      expect(data.alternative).toBe(alternative);
+      // No Live change: no transaction opened, the Set is untouched.
+      expect(fake.transactions).toEqual([]);
+      expect(fake.application.song.tracks[0].name).toBe("Drums");
+    }
+  );
+
+  it("executor_reportLimitation_withoutAlternative_omitsAlternativeKey", async () => {
+    const fake = makeFakeContext();
+    const p = await runtimeOf(fake).executeRead(
+      call("report_limitation", {
+        requested: "apply groove",
+        reason: "only grid quantize is supported (§9)",
+      })
+    );
+    expect(p.isError).toBeUndefined();
+    const data = body(p);
+    expect(data.acknowledged).toBe(true);
+    // `alternative` is optional and only echoed when supplied.
+    expect("alternative" in data).toBe(false);
+    expect(fake.transactions).toEqual([]);
+  });
+
+  it("executor_reportLimitation_emptyRequested_returnsInvalidArgs", async () => {
+    const p = await runtimeOf(makeFakeContext()).executeRead(
+      call("report_limitation", { requested: "  ", reason: "some reason" })
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("invalid_args");
+  });
+
+  it("executor_reportLimitation_missingRequested_returnsInvalidArgs", async () => {
+    const p = await runtimeOf(makeFakeContext()).executeRead(
+      call("report_limitation", { reason: "some reason" })
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("invalid_args");
+  });
+
+  it("executor_reportLimitation_missingReason_returnsInvalidArgs", async () => {
+    const p = await runtimeOf(makeFakeContext()).executeRead(
+      call("report_limitation", { requested: "draw automation" })
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("invalid_args");
+  });
+
+  it("executor_reportLimitation_emptyReason_returnsInvalidArgs", async () => {
+    const p = await runtimeOf(makeFakeContext()).executeRead(
+      call("report_limitation", { requested: "draw automation", reason: "" })
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("invalid_args");
+  });
+
+  it("executor_reportLimitation_nonObjectInput_returnsInvalidArgs", async () => {
+    const p = await runtimeOf(makeFakeContext()).executeRead(
+      call("report_limitation", "not-an-object")
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("invalid_args");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Ref-error surfacing — resolver err returned verbatim (§6)
 // ---------------------------------------------------------------------------
 

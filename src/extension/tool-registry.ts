@@ -47,6 +47,7 @@ import {
   executeGetProject,
   executeGetTrack,
   executeRenderAudio,
+  executeReportLimitation,
 } from "./executors/read.js";
 import {
   prepareCreate,
@@ -117,6 +118,8 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
           return await executeGetDeviceParams(this.ctx, call);
         case "live_render_audio":
           return executeRenderAudio(call);
+        case "report_limitation":
+          return executeReportLimitation(call);
         default:
           return fail(call.id, {
             error: "unknown_tool",

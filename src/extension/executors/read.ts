@@ -27,6 +27,7 @@ import type {
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
   LiveGetTrackArgs,
+  ReportLimitationArgs,
 } from "../../shared/tools.js";
 import {
   deferred,
@@ -35,6 +36,7 @@ import {
   invalidArgs,
   isRecord,
   ok,
+  optString,
   readString,
   resolveOrFail,
   type Resolved,
@@ -377,10 +379,61 @@ export function executeRenderAudio(call: ToolCall): ToolResultPayload {
   return deferred(call.id, "live_render_audio");
 }
 
+// ---------------------------------------------------------------------------
+// report_limitation (honesty tool — §8.3, §9)
+// ---------------------------------------------------------------------------
+
+/**
+ * `report_limitation` — the honesty tool (§8.3, §9). It makes NO Live change and
+ * claims none: it simply acknowledges that a requested capability is unsupported
+ * and echoes back the reason + the closest supported alternative, so the agent's
+ * "I can't do that, but I can do this" is a first-class, recorded outcome rather
+ * than a fake success. Sync (no SDK call); runs immediately in the read partition
+ * so it is never queued into a transaction.
+ *
+ * Validates that `requested` and `reason` are non-empty strings (else
+ * `invalid_args`); `alternative` is optional and only echoed when present.
+ */
+export function executeReportLimitation(call: ToolCall): ToolResultPayload {
+  if (!isRecord(call.input)) {
+    return fail(
+      call.id,
+      invalidArgs("expected an object with 'requested' and 'reason'")
+    );
+  }
+  const requested = readString(call.input, "requested");
+  if (requested === null || requested.trim() === "") {
+    return fail(call.id, invalidArgs("'requested' must be a non-empty string"));
+  }
+  const reason = readString(call.input, "reason");
+  if (reason === null || reason.trim() === "") {
+    return fail(call.id, invalidArgs("'reason' must be a non-empty string"));
+  }
+  const alternativeRaw = optString(call.input, "alternative");
+  // `optString` returns `null` only when the key is present with a wrong type;
+  // treat that as "no alternative" rather than failing the honesty report.
+  const alternative =
+    typeof alternativeRaw === "string" && alternativeRaw.trim() !== ""
+      ? alternativeRaw
+      : undefined;
+
+  return ok(
+    call.id,
+    {
+      acknowledged: true,
+      requested,
+      reason,
+      ...(alternative !== undefined ? { alternative } : {}),
+    },
+    `limitation reported: ${requested}`
+  );
+}
+
 // Re-export arg types for callers/tests that want them adjacent to the executors.
 export type {
   LiveGetTrackArgs,
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
+  ReportLimitationArgs,
   Resolved,
 };

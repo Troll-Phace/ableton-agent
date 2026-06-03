@@ -256,6 +256,70 @@ describe("runAgentLoop — parallel tool_use blocks + mutation batching (§7)", 
   });
 });
 
+describe("runAgentLoop — report_limitation runs in the read phase (§8.3/§9)", () => {
+  it("agentLoop_reportLimitation_executesImmediatelyNotInFlush", async () => {
+    // The honesty tool classifies as "read" (shared TOOL_CLASS) so the loop runs
+    // it immediately in the read partition and NEVER queues it into a mutation
+    // flush. Mirrors the production wiring: a report_limitation tool_use followed
+    // by an end_turn must execute in place, append its tool_result, and terminate.
+    const runtime = new FakeToolRuntime({
+      // Faithful to the shared classify: report_limitation → read.
+      classifier: { report_limitation: "read" },
+      readResults: {
+        lim: {
+          content: JSON.stringify({
+            acknowledged: true,
+            requested: "draw automation",
+          }),
+        },
+      },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        {
+          id: "lim",
+          name: "report_limitation",
+          input: {
+            requested: "draw automation",
+            reason: "live_set_param sets a static value only (§9)",
+          },
+        },
+      ]),
+      textTurn("I can't draw automation, but I can set a static value."),
+    ];
+
+    const result = await runAgentLoop(makeLoopInput(turns, runtime, events));
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.stopReason).toBe("end_turn");
+    }
+    // It ran in the READ partition, in place — never through the mutation flush.
+    const readEntries = runtime.callLog.filter((c) => c.phase === "read");
+    expect(readEntries.map((e) => e.calls[0].id)).toEqual(["lim"]);
+    expect(runtime.flushCount).toBe(0);
+    // Its tool_result is appended with the matching id (transcript: user →
+    // assistant(tool_use) → user(tool_result) → assistant(text)).
+    if (result.ok) {
+      const toolResultMsg = result.messages[2];
+      expect(toolResultMsg.role).toBe("user");
+      const content = toolResultMsg.content;
+      if (Array.isArray(content)) {
+        const block = content[0] as Anthropic.ToolResultBlockParam;
+        expect(block.tool_use_id).toBe("lim");
+        // An honest acknowledgment is NOT an error.
+        expect(block.is_error).toBeUndefined();
+      }
+    }
+    // It was narrated as a successful tool activity (started → ok), not an error.
+    const statuses = events.activity
+      .filter((a) => a.tool === "report_limitation")
+      .map((a) => a.status);
+    expect(statuses).toEqual(["started", "ok"]);
+  });
+});
+
 describe("runAgentLoop — is_error framing", () => {
   it("agentLoop_readError_setsIsErrorAndEmitsErrorActivity", async () => {
     const runtime = new FakeToolRuntime({
