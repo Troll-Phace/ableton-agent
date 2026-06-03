@@ -1079,6 +1079,350 @@ describe("mutation executors — live_create", () => {
 });
 
 // ---------------------------------------------------------------------------
+// live_create — full-honor `name` via create-then-configure (§7)
+//
+// No SDK create method accepts a name at creation, so a named `live_create`
+// applies the name ITSELF in a SECOND shared transaction after the create
+// transaction settles. These tests pin: the name lands per kind, the ref's name
+// segment reflects it, the batch costs exactly TWO undo steps (one shared rename
+// txn no matter how many names), an unnamed create stays at ONE, mixed
+// async-create + sync-update batches distribute results correctly, and the
+// cancel/throw paths return an honest un-renamed SUCCESS with the right note.
+// ---------------------------------------------------------------------------
+
+describe("mutation executors — live_create honors `name` (create-then-configure §7)", () => {
+  /** The last segment of a `/`-joined ref (kind:index:name). */
+  function leafSegment(ref: unknown): string {
+    const s = String(ref);
+    const parts = s.split("/");
+    return parts[parts.length - 1];
+  }
+
+  // --- Item 1: named create applies the name — per kind ---
+
+  it("executor_create_audioTrack_named_appliesNameAndMintsNamedRef", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.tracks.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "Vox" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    const data = body(r);
+    expect(data.created).toBe("audio track");
+    // The live object carries the applied name.
+    expect(fake.application.song.tracks[before].name).toBe("Vox");
+    // The minted ref's name segment reflects the applied name (minted post-rename).
+    expect(data.ref).toBe(`track:${before}:Vox`);
+    // No "not applied" note when the name landed.
+    expect(data.note).toBeUndefined();
+  });
+
+  it("executor_create_midiTrack_named_appliesNameAndMintsNamedRef", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.tracks.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "midi_track", name: "Lead" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(fake.application.song.tracks[before].name).toBe("Lead");
+    expect(body(r).ref).toBe(`track:${before}:Lead`);
+  });
+
+  it("executor_create_scene_named_appliesNameAndMintsNamedRef", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.scenes.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "scene", name: "Bridge" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(fake.application.song.scenes[before].name).toBe("Bridge");
+    expect(body(r).ref).toBe(`scene:${before}:Bridge`);
+  });
+
+  it("executor_create_cuePoint_named_appliesNameAndMintsNamedRef", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.cuePoints.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "cue_point", time: 8, name: "Verse 2" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(fake.application.song.cuePoints[before].name).toBe("Verse 2");
+    expect(body(r).ref).toBe(`cuePoint:${before}:Verse 2`);
+  });
+
+  it("executor_create_takeLane_named_appliesNameAndMintsNamedChildRef", async () => {
+    const fake = tagged(makeFakeContext());
+    const beforeLanes = fake.application.song.tracks[0].takeLanes.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", {
+        kind: "take_lane",
+        takeLaneTrack: "track:0:Drums",
+        name: "Comp B",
+      }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    const data = body(r);
+    expect(data.created).toBe("take lane");
+    // The live take lane carries the applied name.
+    const lanes = fake.application.song.tracks[0].takeLanes;
+    expect(lanes.length).toBe(beforeLanes + 1);
+    expect(lanes[beforeLanes].name).toBe("Comp B");
+    // The child ref is anchored under the track and its leaf reflects the name.
+    expect(String(data.ref)).toBe(
+      `track:0:Drums/takeLane:${beforeLanes}:Comp B`
+    );
+  });
+
+  // --- Item 2: single named create ⇒ exactly TWO committed transactions ---
+
+  it("executor_create_named_opensExactlyTwoTransactions", async () => {
+    const fake = makeFakeContext();
+    await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "Vox" }),
+    ]);
+    // One create txn + one rename txn — both committed (create-then-configure §7).
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: true, rolledBack: false },
+    ]);
+    expect(fake.committedCount).toBe(2);
+  });
+
+  // --- Item 3: unnamed create ⇒ exactly ONE transaction (regression guard) ---
+
+  it("executor_create_unnamed_opensExactlyOneTransaction", async () => {
+    const fake = makeFakeContext();
+    await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "audio_track" }),
+    ]);
+    // No name ⇒ the rename transaction block is skipped entirely (one undo step).
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
+  });
+
+  // --- Item 4: multi-named-create batch ⇒ AT MOST TWO transactions total ---
+
+  it("executor_create_multipleNamed_shareOneRenameTransaction", async () => {
+    const fake = makeFakeContext();
+    const beforeTracks = fake.application.song.tracks.length;
+    const beforeScenes = fake.application.song.scenes.length;
+    const results = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "A1" }, "a"),
+      call("live_create", { kind: "midi_track", name: "A2" }, "b"),
+      call("live_create", { kind: "scene", name: "S1" }, "c"),
+    ]);
+    // Exactly TWO transactions: one shared create txn + one SHARED rename txn for
+    // all three names — NOT N+1.
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: true, rolledBack: false },
+    ]);
+    expect(fake.committedCount).toBe(2);
+    // All three names applied to the live objects.
+    const tracks = fake.application.song.tracks;
+    expect(tracks[beforeTracks].name).toBe("A1");
+    expect(tracks[beforeTracks + 1].name).toBe("A2");
+    expect(fake.application.song.scenes[beforeScenes].name).toBe("S1");
+    // Every returned ref is name-bearing (leaf segment ends with the applied name).
+    expect(results.every((r) => r.isError === undefined)).toBe(true);
+    expect(leafSegment(body(results[0]).ref).endsWith(":A1")).toBe(true);
+    expect(leafSegment(body(results[1]).ref).endsWith(":A2")).toBe(true);
+    expect(leafSegment(body(results[2]).ref).endsWith(":S1")).toBe(true);
+  });
+
+  // --- Item 5: P5-2 mixed batch (async create + sync update in one flush) ---
+
+  it("executor_create_mixedWithSyncUpdate_distributesResultsAndCountsTxns", async () => {
+    const fake = makeFakeContext();
+    const beforeTracks = fake.application.song.tracks.length;
+    // A sync update (slotToIndex negative-encoded) interleaved with an async named
+    // create (slotToIndex positive) — pins the registry's positive/negative slot
+    // distribution stays correct across the mixed batch.
+    const results = await runtimeOf(fake).flushMutations([
+      call(
+        "live_update_track",
+        { track: "track:0:Drums", name: "Kick" },
+        "upd"
+      ),
+      call("live_create", { kind: "audio_track", name: "New" }, "cre"),
+    ]);
+    expect(results.map((r) => r.toolUseId)).toEqual(["upd", "cre"]);
+    // The sync update landed on its own call id.
+    expect(results[0].isError).toBeUndefined();
+    expect(body(results[0]).updated).toEqual(["name"]);
+    expect(fake.application.song.tracks[0].name).toBe("Kick");
+    // The async create landed on its own call id, named, with a name-bearing ref.
+    expect(results[1].isError).toBeUndefined();
+    expect(body(results[1]).created).toBe("audio track");
+    expect(fake.application.song.tracks[beforeTracks].name).toBe("New");
+    expect(body(results[1]).ref).toBe(`track:${beforeTracks}:New`);
+    // 1 create+update txn + 1 rename txn = 2 committed.
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: true, rolledBack: false },
+    ]);
+    expect(fake.committedCount).toBe(2);
+  });
+
+  // --- Item 6: abort between create and rename ---
+
+  it("executor_create_named_abortedBetweenCreateAndRename_succeedsUnrenamed", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.tracks.length;
+    const controller = new AbortController();
+    // Abort AFTER the create transaction (#1) commits but BEFORE applyPendingRenames
+    // checks the signal — the registry then skips the rename transaction. We do NOT
+    // pre-abort (the defensive check before the CREATE txn would otherwise skip the
+    // create entirely).
+    fake.onCommit((committedCount) => {
+      if (committedCount === 1) {
+        controller.abort();
+      }
+    });
+    const [r] = await runtimeOf(
+      fake,
+      new ReferenceTable(),
+      controller.signal
+    ).flushMutations([
+      call("live_create", { kind: "audio_track", name: "Vox" }),
+    ]);
+    // Honest SUCCESS (NOT an error) — the object WAS created (txn #1 committed, R5).
+    expect(r.isError).toBeUndefined();
+    const data = body(r);
+    expect(data.created).toBe("audio track");
+    // Un-renamed ref (empty name segment) + the cancel-path note.
+    expect(data.ref).toBe(`track:${before}:`);
+    expect(data.note).toBe(
+      "created, but name not applied — cancelled before configure"
+    );
+    // The live object kept its default (un-renamed) name.
+    expect(fake.application.song.tracks[before].name).toBe("");
+    // Only the create transaction committed; the rename txn was skipped.
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
+  });
+
+  // --- Item 7: rename transaction throws (R5 rollback) ---
+
+  it("executor_create_named_renameTransactionThrows_succeedsUnrenamedWithFailureNote", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.tracks.length;
+    // Make the name setter throw INSIDE the rename transaction → R5 atomic rollback.
+    fake.failNameSets("name setter exploded");
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "Vox" }),
+    ]);
+    // Honest SUCCESS — NOT isError, NOT an sdk_error: the object was created; only
+    // the rename rolled back (a bare error would hide the created object, §9).
+    expect(r.isError).toBeUndefined();
+    const data = body(r);
+    expect(data.error).toBeUndefined();
+    expect(data.created).toBe("audio track");
+    // Un-renamed ref + a "naming failed: <message>" note carrying the thrown message.
+    expect(data.ref).toBe(`track:${before}:`);
+    expect(data.note).toBe(
+      "created, but name not applied — naming failed: name setter exploded"
+    );
+    // The object exists, un-renamed.
+    expect(fake.application.song.tracks.length).toBe(before + 1);
+    expect(fake.application.song.tracks[before].name).toBe("");
+    // The create txn committed; the rename txn rolled back atomically (R5).
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: false, rolledBack: true },
+    ]);
+    expect(fake.committedCount).toBe(1);
+  });
+
+  // --- Item 8: index-ignored note (tracks/take-lane) vs honored (scene) ---
+
+  it("executor_create_audioTrack_withIndex_reportsIndexIgnored", async () => {
+    const fake = makeFakeContext();
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "audio_track", index: 1 }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).note).toBe(
+      "index ignored — new tracks are appended after the selected track; the SDK has no positional insert"
+    );
+  });
+
+  it("executor_create_midiTrack_withIndex_reportsIndexIgnored", async () => {
+    const fake = makeFakeContext();
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "midi_track", index: 0 }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).note).toBe(
+      "index ignored — new tracks are appended after the selected track; the SDK has no positional insert"
+    );
+  });
+
+  it("executor_create_takeLane_withIndex_reportsIndexIgnored", async () => {
+    const fake = tagged(makeFakeContext());
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", {
+        kind: "take_lane",
+        takeLaneTrack: "track:0:Drums",
+        index: 3,
+      }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).note).toBe(
+      "index ignored — take lanes are appended to the end of the track's take lanes; the SDK has no positional insert"
+    );
+  });
+
+  it("executor_create_cuePoint_withIndex_reportsIndexIgnored", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.cuePoints.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      // A cue point is positioned by `time` (beats); a stray `index` is ignored.
+      call("live_create", { kind: "cue_point", time: 8, index: 2 }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).note).toBe(
+      "index ignored — a cue point is positioned by 'time' (beats), not index"
+    );
+    // The cue point is still created (the index note never blocks creation).
+    expect(fake.application.song.cuePoints.length).toBe(before + 1);
+  });
+
+  it("executor_create_scene_withIndex_honorsPositionAndAddsNoIgnoredNote", async () => {
+    const fake = makeFakeContext();
+    // Seed names so we can prove the new scene landed at the requested index.
+    const beforeNames = fake.application.song.scenes.map((s) => s.name);
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "scene", index: 1, name: "Inserted" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    const data = body(r);
+    // The index IS honored: the new scene is at position 1.
+    expect(data.ref).toBe("scene:1:Inserted");
+    expect(fake.application.song.scenes[1].name).toBe("Inserted");
+    // Earlier scenes shifted; the original scene[1] moved to scene[2].
+    expect(fake.application.song.scenes[0].name).toBe(beforeNames[0]);
+    expect(fake.application.song.scenes[2].name).toBe(beforeNames[1]);
+    // NO index-ignored note for scenes.
+    expect(data.note).toBeUndefined();
+  });
+
+  it("executor_create_scene_withNegativeIndex_appendsAndAddsNoIgnoredNote", async () => {
+    const fake = makeFakeContext();
+    const before = fake.application.song.scenes.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create", { kind: "scene", index: -1, name: "Appended" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    const data = body(r);
+    // -1 appends (SDK semantics).
+    expect(data.ref).toBe(`scene:${before}:Appended`);
+    expect(fake.application.song.scenes[before].name).toBe("Appended");
+    expect(data.note).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // live_create_clip — MIDI works; AUDIO is deferred
 // ---------------------------------------------------------------------------
 
@@ -1806,6 +2150,19 @@ describe("argument validation — per-field wrong-type rejection", () => {
     expect(
       body(await one(makeFakeContext(), call("live_create", 3))).error
     ).toBe("invalid_args");
+  });
+
+  it("executor_create_nameWrongType_invalidArgs", async () => {
+    // The `name` type guard rejects a non-string before any create runs (§9 — never
+    // a fake success, never a no-op). No transaction is opened.
+    const fake = makeFakeContext();
+    const r = await one(
+      fake,
+      call("live_create", { kind: "audio_track", name: 123 })
+    );
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("invalid_args");
+    expect(fake.transactions).toEqual([]);
   });
 
   it("executor_create_takeLaneMissingTrack_invalidArgs", async () => {

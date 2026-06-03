@@ -762,21 +762,78 @@ function seededJitter(seed: number): number {
 // ---------------------------------------------------------------------------
 
 /**
+ * A name-set deferred to the batch's SECOND transaction (create-then-configure,
+ * §7). The create transaction must settle before the new object can be located,
+ * so naming happens afterward: the create's `finalize` locates the object, mints a
+ * provisional ref, and queues this record; the registry then applies every queued
+ * name in ONE shared rename transaction and re-mints each ref to reflect the
+ * applied name (so the agent re-grounds, §6).
+ *
+ * `object` is the freshly-located created object from THIS call's finalize pass —
+ * never cached across calls (§6); the rename transaction runs in the same flush.
+ */
+export interface PendingRename {
+  /** The originating tool_use id (so the registry can replace its payload). */
+  callId: string;
+  /** The freshly-located created object whose `.name` will be set. */
+  object: { name: string };
+  /** The name the agent asked for. */
+  desiredName: string;
+  /**
+   * Build this call's final payload AFTER the rename transaction settles, minting
+   * a fresh ref from the object's current position/name.
+   *
+   * - `applied: true` → the name was set; the ref's name segment reflects it and
+   *   no "not applied" note is added.
+   * - `applied: false` → the rename was skipped (cancelled) or rolled back
+   *   (transaction threw). The object WAS still created (txn #1 committed
+   *   atomically, R5), so the payload is an honest SUCCESS carrying the un-renamed
+   *   ref plus the caller-supplied `notApplied` note. It is NEVER a pure error —
+   *   that would hide the created object and risk a duplicate re-create (§9).
+   *
+   * @param applied   Whether the name-set actually committed.
+   * @param notApplied The honest "name not applied" note (caller distinguishes
+   *                   "cancelled before configure" from "naming failed: …"); used
+   *                   only when `applied` is false.
+   */
+  buildResult(
+    this: void,
+    applied: boolean,
+    notApplied?: string
+  ): ToolResultPayload;
+}
+
+/**
  * `live_create` — create an audio/MIDI track, scene, cue point, or take lane
  * (§8.2). Async creation; the new object is minted into a FRESH canonical ref from
  * its actual resolved position AFTER the transaction settles and returned so the
- * agent re-grounds (§6). Naming/configuring the created object is a SEPARATE tool
- * call (create-then-configure spans ≥2 transactions, §7).
+ * agent re-grounds (§6).
+ *
+ * When `name` is supplied, `live_create` applies it ITSELF: no create method
+ * accepts a name at creation, so the name is set on the freshly-located object in
+ * a SECOND transaction the registry runs for the whole batch (create-then-configure,
+ * §7 — one logical action, ≥2 undo steps). The create's finalize queues a
+ * {@link PendingRename} into `pendingRenames` and the registry flushes them
+ * together; if no create in the batch is named, no second transaction is opened.
+ *
+ * `index` positions a SCENE only (`createScene(index)`; `-1` appends). For
+ * audio/MIDI tracks and take lanes the SDK has no positional insert — a supplied
+ * `index` is reported as ignored in the success payload (never silently dropped).
  */
 export function prepareCreate<V extends ApiVersion>(
   ctx: ExtensionContext<V>,
   call: ToolCall,
-  refs: ReferenceTable
+  refs: ReferenceTable,
+  pendingRenames: PendingRename[]
 ): Prepared {
   if (!isRecord(call.input)) {
     return err(call, invalidArgs("expected an object with a 'kind'"));
   }
   const kind = readString(call.input, "kind");
+  const name = optString(call.input, "name");
+  if (name === null) {
+    return err(call, invalidArgs("'name' is the wrong type"));
+  }
   const song = ctx.application.song;
 
   switch (kind) {
@@ -784,13 +841,31 @@ export function prepareCreate<V extends ApiVersion>(
       return asyncPlan(
         () => song.createAudioTrack(),
         (created) =>
-          finalizeCreatedTrack(call, refs, ctx, created, "audio track")
+          finalizeCreatedTrack(
+            call,
+            refs,
+            ctx,
+            created,
+            "audio track",
+            name,
+            pendingRenames,
+            indexIgnoredNote(call, "audio_track")
+          )
       );
     case "midi_track":
       return asyncPlan(
         () => song.createMidiTrack(),
         (created) =>
-          finalizeCreatedTrack(call, refs, ctx, created, "MIDI track")
+          finalizeCreatedTrack(
+            call,
+            refs,
+            ctx,
+            created,
+            "MIDI track",
+            name,
+            pendingRenames,
+            indexIgnoredNote(call, "midi_track")
+          )
       );
     case "scene": {
       const index = optNumber(call.input, "index");
@@ -802,7 +877,17 @@ export function prepareCreate<V extends ApiVersion>(
       return asyncPlan(
         () => song.createScene(at),
         (created) =>
-          finalizeCreatedNamed(call, refs, ctx, created, "scene", "scenes")
+          finalizeCreatedNamed(
+            call,
+            refs,
+            ctx,
+            created,
+            "scene",
+            "scenes",
+            "scene",
+            name,
+            pendingRenames
+          )
       );
     }
     case "cue_point": {
@@ -822,7 +907,11 @@ export function prepareCreate<V extends ApiVersion>(
             ctx,
             created,
             "cuePoint",
-            "cuePoints"
+            "cuePoints",
+            "cuePoint",
+            name,
+            pendingRenames,
+            indexIgnoredNote(call, "cue_point")
           )
       );
     }
@@ -860,7 +949,10 @@ export function prepareCreate<V extends ApiVersion>(
             parentRef,
             "takeLane",
             "takeLanes",
-            "take lane"
+            "take lane",
+            name,
+            pendingRenames,
+            indexIgnoredNote(call, "take_lane")
           )
       );
     }
@@ -874,13 +966,88 @@ export function prepareCreate<V extends ApiVersion>(
   }
 }
 
+/**
+ * If the agent passed an `index` for a kind that does NOT honor it, return the
+ * honest, kind-accurate "index ignored" note (§9 — never silently drop). Scenes
+ * honor `index` upstream, so this is never called for them; every other kind is
+ * positioned by appension or by `time`, not by index.
+ */
+function indexIgnoredNote(
+  call: ToolCall,
+  kind: "audio_track" | "midi_track" | "take_lane" | "cue_point"
+): string | undefined {
+  if (!isRecord(call.input) || optNumber(call.input, "index") === undefined) {
+    return undefined;
+  }
+  switch (kind) {
+    case "audio_track":
+    case "midi_track":
+      return "index ignored — new tracks are appended after the selected track; the SDK has no positional insert";
+    case "take_lane":
+      return "index ignored — take lanes are appended to the end of the track's take lanes; the SDK has no positional insert";
+    case "cue_point":
+      return "index ignored — a cue point is positioned by 'time' (beats), not index";
+  }
+}
+
+/**
+ * Queue a name-set for the batch's second transaction (§7) and return the
+ * PROVISIONAL success payload using `provisionalRef` (the object's current,
+ * un-renamed position). The registry replaces this payload after the rename
+ * transaction via {@link PendingRename.buildResult}. `mintFinalRef` re-mints the
+ * ref from the object's position once the name is applied (or the un-renamed
+ * position if the rename was skipped).
+ */
+function queueRename(
+  call: ToolCall,
+  pendingRenames: PendingRename[],
+  object: { name: string },
+  desiredName: string,
+  label: string,
+  provisionalRef: string,
+  mintFinalRef: (applied: boolean) => string,
+  indexNote: string | undefined
+): ToolResultPayload {
+  pendingRenames.push({
+    callId: call.id,
+    object,
+    desiredName,
+    buildResult: (applied, notApplied) => {
+      const ref = mintFinalRef(applied);
+      const data: Record<string, unknown> = { created: label, ref };
+      if (!applied) {
+        // The object WAS created; only the name didn't land. Honest success with
+        // the un-renamed ref + the caller's distinguishing note (§9).
+        data.note =
+          notApplied ??
+          "created, but name not applied — cancelled before configure";
+      } else if (indexNote !== undefined) {
+        data.note = indexNote;
+      }
+      return ok(call.id, data, `create ${label}`);
+    },
+  });
+  // Provisional payload (overwritten by the registry after the rename txn).
+  const data: Record<string, unknown> = {
+    created: label,
+    ref: provisionalRef,
+  };
+  if (indexNote !== undefined) {
+    data.note = indexNote;
+  }
+  return ok(call.id, data, `create ${label}`);
+}
+
 /** Mint a top-level track ref by locating the created object's live index. */
 function finalizeCreatedTrack<V extends ApiVersion>(
   call: ToolCall,
   refs: ReferenceTable,
   ctx: ExtensionContext<V>,
   created: unknown,
-  label: string
+  label: string,
+  name: string | undefined,
+  pendingRenames: PendingRename[],
+  indexNote: string | undefined
 ): ToolResultPayload {
   return finalizeCreatedNamed(
     call,
@@ -889,11 +1056,19 @@ function finalizeCreatedTrack<V extends ApiVersion>(
     created,
     "track",
     "tracks",
-    label
+    label,
+    name,
+    pendingRenames,
+    indexNote
   );
 }
 
-/** Mint a top-level named ref (track/scene/cuePoint) from its live position. */
+/**
+ * Mint a top-level named ref (track/scene/cuePoint) from its live position. When
+ * the agent supplied a `name`, queue it for the batch's second rename transaction
+ * (§7) and mint the ref to reflect the applied name once that settles; otherwise
+ * return the ref immediately.
+ */
 function finalizeCreatedNamed<V extends ApiVersion>(
   call: ToolCall,
   refs: ReferenceTable,
@@ -901,7 +1076,10 @@ function finalizeCreatedNamed<V extends ApiVersion>(
   created: unknown,
   segmentKind: "track" | "scene" | "cuePoint",
   collectionKey: "tracks" | "scenes" | "cuePoints",
-  label: string = segmentKind
+  label: string,
+  name: string | undefined,
+  pendingRenames: PendingRename[],
+  indexNote: string | undefined = undefined
 ): ToolResultPayload {
   const handleId = handleIdOf(created);
   if (handleId === null) {
@@ -916,12 +1094,40 @@ function finalizeCreatedNamed<V extends ApiVersion>(
   if (Array.isArray(collectionRaw)) {
     const collection = collectionRaw as unknown[];
     for (let i = 0; i < collection.length; i++) {
-      if (handleIdOf(collection[i]) === handleId) {
-        const name = nameOf(collection[i]);
-        const ref = refs.mint(
-          serializeRef([{ kind: segmentKind, index: i, name }])
-        );
-        return ok(call.id, { created: label, ref }, `create ${label}`);
+      const obj = collection[i];
+      if (handleIdOf(obj) === handleId) {
+        // Re-mint the ref from the object's current position; when a rename is
+        // pending, the name segment reflects the applied (or un-renamed) name.
+        const mintFinalRef = (applied: boolean): string =>
+          refs.mint(
+            serializeRef([
+              {
+                kind: segmentKind,
+                index: i,
+                name: applied && name !== undefined ? name : nameOf(obj),
+              },
+            ])
+          );
+        if (name !== undefined && isRecord(obj)) {
+          return queueRename(
+            call,
+            pendingRenames,
+            obj as unknown as { name: string },
+            name,
+            label,
+            mintFinalRef(false),
+            mintFinalRef,
+            indexNote
+          );
+        }
+        const data: Record<string, unknown> = {
+          created: label,
+          ref: mintFinalRef(false),
+        };
+        if (indexNote !== undefined) {
+          data.note = indexNote;
+        }
+        return ok(call.id, data, `create ${label}`);
       }
     }
   }
@@ -937,6 +1143,7 @@ function finalizeCreatedNamed<V extends ApiVersion>(
  * the created object's handle within the parent's child collection (§6). The
  * created object is not cached — we re-read the parent's live collection and match
  * by handle id, exactly like {@link finalizeCreatedNamed} does at the song level.
+ * When a `name` was supplied, queue it for the batch's second rename transaction.
  */
 function finalizeCreatedChild<V extends ApiVersion>(
   ctx: ExtensionContext<V>,
@@ -946,7 +1153,10 @@ function finalizeCreatedChild<V extends ApiVersion>(
   parentRef: string,
   segmentKind: "takeLane",
   collectionKey: "takeLanes",
-  label: string
+  label: string,
+  name: string | undefined,
+  pendingRenames: PendingRename[],
+  indexNote: string | undefined
 ): ToolResultPayload {
   const handleId = handleIdOf(created);
   const parent = resolveOrFail(ctx, parentRef);
@@ -958,16 +1168,41 @@ function finalizeCreatedChild<V extends ApiVersion>(
     const collectionRaw = parentObj[collectionKey];
     if (Array.isArray(collectionRaw)) {
       const collection = collectionRaw as unknown[];
+      const parentSegs = parseRef(parent.resolved.canonicalRef).segments;
       for (let i = 0; i < collection.length; i++) {
-        if (handleIdOf(collection[i]) === handleId) {
-          const parentSegs = parseRef(parent.resolved.canonicalRef).segments;
-          const ref = refs.mint(
-            serializeRef([
-              ...parentSegs,
-              { kind: segmentKind, index: i, name: nameOf(collection[i]) },
-            ])
-          );
-          return ok(call.id, { created: label, ref }, `create ${label}`);
+        const obj = collection[i];
+        if (handleIdOf(obj) === handleId) {
+          const mintFinalRef = (applied: boolean): string =>
+            refs.mint(
+              serializeRef([
+                ...parentSegs,
+                {
+                  kind: segmentKind,
+                  index: i,
+                  name: applied && name !== undefined ? name : nameOf(obj),
+                },
+              ])
+            );
+          if (name !== undefined && isRecord(obj)) {
+            return queueRename(
+              call,
+              pendingRenames,
+              obj as unknown as { name: string },
+              name,
+              label,
+              mintFinalRef(false),
+              mintFinalRef,
+              indexNote
+            );
+          }
+          const data: Record<string, unknown> = {
+            created: label,
+            ref: mintFinalRef(false),
+          };
+          if (indexNote !== undefined) {
+            data.note = indexNote;
+          }
+          return ok(call.id, data, `create ${label}`);
         }
       }
     }

@@ -160,6 +160,73 @@ describe("tool-registry — unknown-tool routing never throws", () => {
   });
 });
 
+describe("tool-registry — named live_create create-then-configure transaction count (§7)", () => {
+  it("toolRegistry_flushMutations_namedCreate_opensTwoTransactions", async () => {
+    // A single named create costs at most TWO undo steps: one create txn + one
+    // shared rename txn (create-then-configure, §7). The registry owns the second
+    // (rename) transaction.
+    const fake = makeFakeContext();
+    await makeRuntime(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "Vox" }),
+    ]);
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: true, rolledBack: false },
+    ]);
+    expect(fake.committedCount).toBe(2);
+  });
+
+  it("toolRegistry_flushMutations_unnamedCreate_opensOneTransaction", async () => {
+    // No name ⇒ the registry never opens the rename transaction (one undo step).
+    const fake = makeFakeContext();
+    await makeRuntime(fake).flushMutations([
+      call("live_create", { kind: "audio_track" }),
+    ]);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
+  });
+
+  it("toolRegistry_flushMutations_manyNamedCreates_shareOneRenameTransaction", async () => {
+    // N named creates in one flush ⇒ still exactly TWO transactions, NOT N+1: a
+    // single shared rename transaction applies every queued name.
+    const fake = makeFakeContext();
+    const results = await makeRuntime(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "A" }, "a"),
+      call("live_create", { kind: "midi_track", name: "B" }, "b"),
+      call("live_create", { kind: "scene", name: "C" }, "c"),
+    ]);
+    expect(fake.committedCount).toBe(2);
+    expect(fake.transactions).toHaveLength(2);
+    expect(results.every((r) => r.isError === undefined)).toBe(true);
+    // Every ref is name-bearing (ends with the applied name).
+    expect(String(body(results[0]).ref).endsWith(":A")).toBe(true);
+    expect(String(body(results[1]).ref).endsWith(":B")).toBe(true);
+    expect(String(body(results[2]).ref).endsWith(":C")).toBe(true);
+  });
+
+  it("toolRegistry_flushMutations_namedCreate_renameThrow_succeedsUnrenamed", async () => {
+    // The rename transaction throwing rolls back atomically (R5): the create txn
+    // stays committed, the rename is reported rolled back, and the call is an honest
+    // SUCCESS with the un-renamed ref + a "naming failed" note (never an sdk_error,
+    // which would hide the created object, §9).
+    const fake = makeFakeContext();
+    fake.failNameSets("boom");
+    const [r] = await makeRuntime(fake).flushMutations([
+      call("live_create", { kind: "audio_track", name: "Vox" }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).error).toBeUndefined();
+    expect(body(r).note).toBe(
+      "created, but name not applied — naming failed: boom"
+    );
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: false, rolledBack: true },
+    ]);
+    expect(fake.committedCount).toBe(1);
+  });
+});
+
 describe("tool-registry — transaction throw maps the batch to sdk_error (§7 / R5)", () => {
   it("toolRegistry_flushMutations_syncThrowInTransaction_rollsBackAndFailsBatch", async () => {
     // Make a track's `name` sync setter throw: it runs INSIDE the transaction, so

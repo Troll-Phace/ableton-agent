@@ -70,8 +70,17 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 
 #### Phase 5 follow-ups (non-blocking, tracked)
 - **P5-1 (verify @ Phase 11, first LIVE API call):** `live_set_param.target` and `live_create_clip` use JSON-Schema `oneOf`/`const` under `strict:true`. Anthropic strict mode is a JSON-Schema subset — confirm the wire accepts `oneOf`/`const` at first live call. If rejected: flatten to a single object with an explicit discriminator enum + conditionally-required fields in prose (executor narrows by discriminant either way, so only the schema shape changes). No wrong-target/honesty risk — a rejection surfaces as a loud API error, never silent mis-execution.
-- **P5-2 (MINOR, add @ Phase 12/13):** no single `flushMutations` test mixes an async `live_create` with a sync `live_update_*` in one batch (the only shape interleaving positive/negative `slotToIndex` markers). Logic traced-correct; add a mixed-batch test when create+configure batches become common.
+- **P5-2 (RESOLVED 2026-06-02, audit-fix pass):** the mixed async-`live_create` + sync-`live_update_*` batch (interleaved positive/negative `slotToIndex` markers) now has a dedicated test in `tests/executors.test.ts` (slot distribution + 2-txn count asserted). Closed.
 - **P5-3 (MINOR, in-Live @ Phase 12/19):** `live_insert_device` keeps no built-in allowlist (relies on SDK to reject third-party names → structured `sdk_error`). Sound, but the §9 "no plugins" guard is only enforced at the live boundary; add an in-Live third-party-rejection check in the limitation-honesty pass.
+
+#### Phase 1-5 audit-fix pass ✅ COMPLETE (2026-06-02) — pre-Phase-6, code-reviewer PASS (0 CRIT/0 MAJOR)
+Ran a full audit of Phases 1-5 (`/phase-review`), then fixed the actionable findings before starting Phase 6. Final state: **323 tests pass**, `tsc -b` 0, `eslint src/ tests/` 0. Coverage held ≥90% (mutation.ts 91.14%, tool-registry.ts 92.89%).
+- **MAJOR — `live_create` silently dropped `name` (§9 honesty gap) → RESOLVED via full-honor create-then-configure.** `live_create` now applies `name` for ALL kinds (track/scene/cue_point/take_lane). Creates run in the batch txn (#1); ALL queued name-sets run in ONE shared SECOND txn (#2) via `applyPendingRenames` — named create = 2 undo steps (in-spec §7), unnamed = 1 (rename block skipped). No-`await`-in-callback + abort re-checked before the rename txn preserved. Honest non-applied paths (both SUCCESS, never phantom-name): abort-between → `"created, but name not applied — cancelled before configure"`; rename-txn-throw (R5 rollback) → `"created, but name not applied — naming failed: <msg>"` (un-renamed ref surfaced so the agent doesn't duplicate-create). Returned ref minted AFTER rename so its name segment reflects the applied name.
+- **⚠️ AUDIT CORRECTION (record so it isn't re-introduced):** the `/phase-review` report claimed `Scene.name`/`CuePoint.name` are getter-only and scene/cue-point naming was "SDK-impossible." That is **WRONG** — verified in `node_modules/@ableton-extensions/sdk/dist/index.d.mts`: `Scene.name` (631-632), `CuePoint.name` (612-613), `Track.name` (504-505), `TakeLane.name` (471-472) ALL have setters. All four created kinds are nameable.
+- **`index` honesty:** only `createScene(index)` accepts a position (`-1` appends); `createAudioTrack()`/`createMidiTrack()`/`createTakeLane()` take no position arg, `createCuePoint(time)` uses time. Schema/description scoped `index` to "scene only"; a stray `index` on any other kind now returns a kind-accurate `note` (track / take_lane / cue_point variants) instead of being silently dropped.
+- **MINOR — `pause_turn` comment-vs-behavior lie (agent-loop.ts) → FIXED (comment only).** The loop has always treated any non-`tool_use` stop (incl. `pause_turn`) as terminal; the stale comment now matches (note: resuming `pause_turn` would only matter if server tools are added). No behavior change.
+- **Coverage added:** named-create-per-kind (name applied + name-bearing ref), 2-txn named / 1-txn unnamed / N-named=2-txn, the P5-2 mixed batch, abort-before-rename, rename-throw-rollback, index-ignored notes (all kinds), and `name:123` wrong-type → `invalid_args`. Two opt-in fake hooks added (`onCommit`, `failNameSets`, default OFF).
+- **Carried forward (unchanged):** P5-1 (strict-mode `oneOf`/`const` at first live API call), P5-3 (in-Live plugin-rejection check). The TS hint 80006 "may be converted to an async function" at tool-registry.ts:205 + several fake-context lines is the INTENTIONAL §7 sync-callback-returns-`.then()` pattern — accepted, do not "fix".
 
 ## Session Log
 (no sessions yet)
@@ -96,3 +105,9 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - 2026-06-02 21:11: Session ended
 - 2026-06-02 21:28: Session ended
 - 2026-06-02 22:11: Session ended
+- 2026-06-02 22:14: Session ended
+- 2026-06-02 22:40: Session ended
+- 2026-06-02 22:52: Session ended
+- 2026-06-02 22:53: Session ended
+- 2026-06-02 22:57: Session ended
+- 2026-06-02 22:59: Session ended

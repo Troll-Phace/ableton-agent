@@ -475,6 +475,27 @@ export interface FakeExtensionContext {
   ): Handle;
   /** Returns the live handle for an addressed node (for raw-handle anchoring tests). */
   handleOf(ref: string): Handle;
+
+  // --- opt-in test hooks (NOT part of the SDK; default OFF so existing tests are
+  //     unaffected). Used by the create-then-configure (named `live_create`) suite
+  //     to drive the abort-between-transactions and rename-rollback paths.
+
+  /**
+   * Register a callback fired AFTER each `withinTransaction` commits, receiving the
+   * 1-based count of committed transactions so far. Lets a test abort the signal
+   * precisely between the create transaction (#1) and the rename transaction (#2)
+   * of a named `live_create` batch — the registry's abort check then skips the
+   * rename. Off unless a callback is registered. Returns nothing.
+   */
+  onCommit(cb: (committedCount: number) => void): void;
+
+  /**
+   * Opt-in: make EVERY name setter (track/scene/cuePoint/takeLane/clip) throw an
+   * `Error(message)` when invoked. Used to drive the rename-transaction-throws
+   * (R5 rollback) path of named `live_create` without touching production code.
+   * Off by default; once set it stays on for the context's lifetime.
+   */
+  failNameSets(message: string): void;
 }
 // #endregion
 
@@ -596,6 +617,10 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
    * `{ committed: false, rolledBack: true }`. Tests read this via `transactions`.
    */
   const txLog: { committed: boolean; rolledBack: boolean }[] = [];
+  /** Opt-in callbacks fired after each commit (see {@link onCommit}). Empty ⇒ off. */
+  const commitHooks: ((committedCount: number) => void)[] = [];
+  /** Opt-in: when set, every name setter throws `Error(this)` (see {@link failNameSets}). */
+  let nameSetterError: string | null = null;
   /**
    * While a transaction is open, every SYNC mutation pushes an undo thunk here so a
    * sync throw can roll back in reverse order (R5 = atomic). `null` ⇒ no open
@@ -607,6 +632,16 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
   function record(undo: () => void): void {
     if (journal !== null) {
       journal.push(undo);
+    }
+  }
+  /**
+   * Opt-in name-setter throw (see {@link failNameSets}). Called at the TOP of every
+   * name setter — before any state mutation — so a throw inside the rename
+   * transaction rolls back cleanly (the offending setter recorded no undo thunk).
+   */
+  function guardNameSet(): void {
+    if (nameSetterError !== null) {
+      throw new Error(nameSetterError);
     }
   }
   /** Nested transactions auto-collapse (SDK semantics): only the outermost logs/rolls back. */
@@ -621,6 +656,10 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       const result = fn();
       txLog.push({ committed: true, rolledBack: false });
       journal = null;
+      const committedCount = txLog.filter((t) => t.committed).length;
+      for (const hook of commitHooks) {
+        hook(committedCount);
+      }
       return result;
     } catch (err) {
       // R5 atomic rollback: undo every sync mutation in reverse order, log no commit.
@@ -787,6 +826,7 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         return node.name;
       },
       set name(value: string) {
+        guardNameSet();
         const prev = node.name;
         record(() => {
           node.name = prev;
@@ -1025,6 +1065,7 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         return node.name;
       },
       set name(value: string) {
+        guardNameSet();
         const prev = node.name;
         record(() => {
           node.name = prev;
@@ -1056,6 +1097,7 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         return node.name;
       },
       set name(value: string) {
+        guardNameSet();
         const prev = node.name;
         record(() => {
           node.name = prev;
@@ -1157,6 +1199,7 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         return node.name;
       },
       set name(value: string) {
+        guardNameSet();
         const prev = node.name;
         record(() => {
           node.name = prev;
@@ -1173,6 +1216,7 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         return node.name;
       },
       set name(value: string) {
+        guardNameSet();
         const prev = node.name;
         record(() => {
           node.name = prev;
@@ -1513,6 +1557,12 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
     remove,
     insert,
     handleOf,
+    onCommit(cb: (committedCount: number) => void): void {
+      commitHooks.push(cb);
+    },
+    failNameSets(message: string): void {
+      nameSetterError = message;
+    },
   };
 }
 

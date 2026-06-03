@@ -16,6 +16,18 @@
  *    §7), the transaction is awaited, and each call's `finalize()` builds its
  *    `tool_result` — in the SAME order as `calls`.
  *
+ * ## Create-then-configure (named `live_create`, §7)
+ * No SDK create method accepts a name at creation, so a named `live_create` finalize
+ * locates the new object and queues a {@link PendingRename} instead of naming it
+ * inline. After the create transaction settles, the registry applies EVERY queued
+ * name in ONE shared second `withinTransaction` (so a batch with named creates costs
+ * at most TWO undo steps, never one per name; a batch with no named creates stays at
+ * exactly one — the rename transaction is skipped). The rename callbacks are
+ * synchronous (`obj.name = ...`); the transaction itself is awaited (never `await`
+ * inside, §7). The abort signal is re-checked BEFORE opening the rename transaction
+ * — if cancelled between create and rename, every pending name is skipped and the
+ * created object's ref is returned un-renamed with an honest note (§9).
+ *
  * The runtime NEVER throws to the loop: a per-call failure becomes that call's
  * structured-error payload, and an unexpected transaction-level throw maps every
  * pending call to an `sdk_error` payload (R5: the transaction rolled back atomically,
@@ -49,6 +61,7 @@ import {
   prepareUpdateClip,
   prepareUpdateTrack,
   type MutationPlan,
+  type PendingRename,
   type Prepared,
 } from "./executors/mutation.js";
 import { errorMessage, fail, sdkError } from "./executors/shared.js";
@@ -140,8 +153,13 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
    * Returns one payload per call, in the SAME order as `calls`. Never throws.
    */
   async flushMutations(calls: ToolCall[]): Promise<ToolResultPayload[]> {
+    // Collects name-sets for named `live_create`s (applied in a SECOND txn, §7).
+    const pendingRenames: PendingRename[] = [];
+
     // 1. Prepare every call outside the transaction.
-    const prepared: Prepared[] = calls.map((call) => this.prepare(call));
+    const prepared: Prepared[] = calls.map((call) =>
+      this.prepare(call, pendingRenames)
+    );
 
     // 2. Abort check BEFORE opening the transaction (§7 / R5).
     if (this.signal?.aborted) {
@@ -229,8 +247,9 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
       });
     }
 
-    // 4. Finalize in `calls` order.
-    return calls.map((call, i) => {
+    // 4. Finalize in `calls` order. A named `live_create`'s finalize queues a
+    //    PendingRename and returns a PROVISIONAL payload (overwritten in step 5).
+    const payloads: ToolResultPayload[] = calls.map((call, i) => {
       const p = prepared[i];
       if (p.kind === "error") {
         return p.payload;
@@ -248,10 +267,80 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
         );
       }
     });
+
+    // 5. Apply queued names in ONE shared SECOND transaction (create-then-configure,
+    //    §7). A batch with no named creates skips this entirely (stays one undo step).
+    if (pendingRenames.length > 0) {
+      this.applyPendingRenames(pendingRenames, calls, payloads);
+    }
+
+    return payloads;
+  }
+
+  /**
+   * Apply every queued name-set in ONE second `withinTransaction` (§7), then
+   * replace each create's provisional payload with its final one (fresh ref
+   * reflecting the applied name). Re-checks the abort signal BEFORE opening the
+   * transaction — if cancelled, no name is applied and each created object's ref is
+   * returned un-renamed with an honest note (§9). The rename callbacks are
+   * synchronous and so is `withinTransaction` (it returns the callback's `void`
+   * result), so this method needs no `await` — it never `await`s inside the
+   * transaction (§7).
+   */
+  private applyPendingRenames(
+    pendingRenames: PendingRename[],
+    calls: ToolCall[],
+    payloads: ToolResultPayload[]
+  ): void {
+    // Abort BETWEEN create and rename → skip the rename, report honestly (§9).
+    if (this.signal?.aborted) {
+      this.replaceRenamePayloads(pendingRenames, calls, payloads, false);
+      return;
+    }
+    try {
+      // Synchronous setters only; await the transaction itself, not inside it (§7).
+      this.ctx.withinTransaction(() => {
+        for (const rename of pendingRenames) {
+          rename.object.name = rename.desiredName;
+        }
+      });
+      this.replaceRenamePayloads(pendingRenames, calls, payloads, true);
+    } catch (e) {
+      // The rename transaction rolled back: names were NOT applied — but the
+      // objects WERE created (txn #1 committed atomically, R5). Report each as an
+      // honest SUCCESS with the un-renamed ref + a "naming failed" note, NOT a pure
+      // error: a bare error would hide the created object and risk a duplicate
+      // re-create (the inverse §9 violation — claiming failure for a change that
+      // did happen).
+      const note = `created, but name not applied — naming failed: ${errorMessage(
+        e
+      )}`;
+      this.replaceRenamePayloads(pendingRenames, calls, payloads, false, note);
+    }
+  }
+
+  /**
+   * Replace each pending-rename call's payload with its final result. When
+   * `applied` is false, `notApplied` is the honest "name not applied" note
+   * distinguishing the cancel path (default note) from the throw path.
+   */
+  private replaceRenamePayloads(
+    pendingRenames: PendingRename[],
+    calls: ToolCall[],
+    payloads: ToolResultPayload[],
+    applied: boolean,
+    notApplied?: string
+  ): void {
+    for (const rename of pendingRenames) {
+      const i = calls.findIndex((c) => c.id === rename.callId);
+      if (i >= 0) {
+        payloads[i] = rename.buildResult(applied, notApplied);
+      }
+    }
   }
 
   /** Dispatch one mutation tool to its prepare function (resolve/validate only). */
-  private prepare(call: ToolCall): Prepared {
+  private prepare(call: ToolCall, pendingRenames: PendingRename[]): Prepared {
     switch (call.name) {
       case "live_update_track":
         return prepareUpdateTrack(this.ctx, call);
@@ -262,7 +351,7 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
       case "live_edit_midi_notes":
         return prepareEditMidiNotes(this.ctx, call);
       case "live_create":
-        return prepareCreate(this.ctx, call, this.refs);
+        return prepareCreate(this.ctx, call, this.refs, pendingRenames);
       case "live_create_clip":
         return prepareCreateClip(this.ctx, call);
       case "live_insert_device":

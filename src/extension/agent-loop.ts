@@ -12,8 +12,10 @@
  *  - append `tool_result` blocks in the SAME order and with the SAME
  *    `tool_use_id`s as the requested blocks (success payload, or `is_error` for a
  *    structured error);
- *  - exit on a terminal stop (`end_turn` / `max_tokens` / `stop_sequence` /
- *    `refusal`), passing `pause_turn` through to the next iteration;
+ *  - exit on ANY non-`tool_use` stop — `end_turn` / `max_tokens` / `stop_sequence`
+ *    / `refusal`, and also `pause_turn` — treating it as terminal. (This is a pure
+ *    client-tool-use loop with no server tools, so `pause_turn` does not occur in
+ *    practice; resuming it would only be needed if server tools are added later.)
  *  - enforce an iteration cap so a misbehaving model can never spin forever.
  *
  * Abort discipline (§7 / R5): the loop checks the `AbortSignal` BEFORE asking the

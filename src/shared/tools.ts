@@ -285,15 +285,20 @@ export type CreateKind =
 
 /**
  * `live_create` — create a track / scene / cue point / take lane (§8.2). Fields
- * apply per `kind`; `index` positions the new object where the SDK supports it,
- * `name` names it, `takeLaneTrack` anchors a take lane to its track.
+ * apply per `kind`; `name` names any kind (applied right after creation via a
+ * second transaction, create-then-configure §7), `index` positions a SCENE only,
+ * `takeLaneTrack` anchors a take lane to its track.
  */
 export interface LiveCreateArgs {
   /** What to create. */
   kind: CreateKind;
-  /** Optional insertion index (where the SDK accepts one). */
+  /**
+   * Insertion index — **scene only** (`-1`/omitted appends). The SDK has no
+   * positional insert for tracks or take lanes; an `index` supplied for those is
+   * ignored (reported as an honest note in the result, never silently dropped).
+   */
   index?: number;
-  /** Optional name for the created object. */
+  /** Optional name for the created object (applied right after creation). */
   name?: string;
   /** `kind:"take_lane"` — ref to the track the lane belongs to. */
   takeLaneTrack?: string;
@@ -808,21 +813,26 @@ const liveSetParam = mutationTool(
 
 const liveCreate = mutationTool(
   "live_create",
-  "Create a new object: an audio track, MIDI track, scene, cue point, or take lane. Fields apply per kind: 'index' positions it where supported, 'name' names it, 'takeLaneTrack' anchors a take lane to its track, 'time' (beats) positions a cue point.",
+  "Create a new object: an audio track, MIDI track, scene, cue point, or take lane. 'name' names any kind (applied right after creation). 'index' positions a SCENE only (the SDK has no positional insert for tracks/take lanes — new tracks are appended, so 'index' is ignored for them). 'takeLaneTrack' anchors a take lane to its track; 'time' (beats) positions a cue point.",
   {
     kind: {
       type: "string",
       enum: ["audio_track", "midi_track", "scene", "cue_point", "take_lane"],
     },
-    index: { type: "integer", minimum: 0 },
+    index: {
+      type: "integer",
+      minimum: 0,
+      description:
+        "scene only: insertion index (-1 or omitted appends). Ignored for tracks/take lanes.",
+    },
     name: { type: "string" },
     takeLaneTrack: refProp("take_lane: the track the lane belongs to."),
     time: { type: "number", description: "cue_point: position in beats." },
   },
   ["kind"],
   [
-    { kind: "midi_track", name: "Lead", index: 3 },
-    { kind: "scene", name: "Drop" },
+    { kind: "midi_track", name: "Lead" },
+    { kind: "scene", name: "Drop", index: 2 },
     { kind: "take_lane", takeLaneTrack: "track:2:Bass", name: "Comp" },
   ]
 );
