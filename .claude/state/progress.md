@@ -1,11 +1,11 @@
 # Project Progress — Ableton Claude Agent
 
 ## Current Phase
-Phase: 5
-Title: Tool Registry & Executors
+Phase: 6
+Title: Capability Guardrails & System Prompt (R2)
 Status: NOT STARTED
 Started: 2026-06-02
-> Next: Phase 4 COMPLETE. Phase 5 (tool schemas in `src/shared/tools.ts` + executors) depends on Phases 3+4 — it implements the `ToolRuntime` seam (`toolDefinitions`/`classify`/`executeRead`/`flushMutations`) defined in `src/extension/agent-loop.ts`, wrapping `flushMutations` in a single `withinTransaction` (§7). Phase 6 fills the real system prompt + cannot-list. Phases 7/8/9/13 target the **D** task sets.
+> Next: Phase 5 COMPLETE. Phase 6 authors the cacheable system prompt + verbatim "You cannot…" contract (§9) and adds the `report_limitation` tool (deliberately omitted from Phase 5's registry — wire it into `src/shared/tools.ts` + the registry now) so unsupported requests route to a limitation/structured error, never a fake success. The §9 guard surface already exists at the executor layer (loud structured errors, no phantom success) — Phase 6 adds the model-facing contract + the honesty tool on top. Phases 7/8/9/13 target the **D** task sets.
 
 ## Architecture Decision (Spike R3)
 Outcome: **D** — all three probes passed. Localhost WS full-duplex; persistent streaming chat; in-chat confirm cards; **act-in-place** mutations.
@@ -60,6 +60,19 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - QA gate (code-reviewer): **PASS, 0 CRITICAL, 0 MAJOR, 2 MINOR (bookkeeping only).** Verified: manual-loop, mutation-batch boundary, abort-before-flush, cache_control placement, structured-error contract (never throws/no-ops), no API key in any source/test, strict TS no `any`, no phase bleed (no real schemas/system-prompt/snapshot/transport — only seams). `tsc -b` 0 / `npm test` 180 / `npm run lint` 0.
 - Decisions: **stub-only tests** (no live API call this phase); key via **constructor arg + `process.env.ANTHROPIC_API_KEY` fallback** (Phase 10 supplies from config.json). Model **sonnet 4.6** (`claude-sonnet-4-6`, confirmed valid `Model` literal in installed SDK).
 
+### Phase 5 — Tool Registry & Executors ✅ COMPLETE (2026-06-02) — outcome-independent
+- [x] 5.1 Shared schemas + arg types `src/shared/tools.ts` (PURE; type-only `@anthropic-ai/sdk` + `./refs.js`, no Extensions SDK/DOM). All 15 §8 tools (`report_limitation` deliberately deferred to Phase 6). Exports `TOOL_DEFINITIONS`/`TOOL_BY_NAME`/`TOOL_NAMES`/`TOOL_NAME_SET`/`isToolName`, `classify`/`TOOL_CLASS` (unknown→`"mutation"` safe side), per-tool arg types, `WARP_MODE_VALUE`/`NoteDescriptionArg`/`ClipLoopSettingsArg`. **`strict:true` on every mutating tool + `input_examples` natively typed in installed `@anthropic-ai/sdk` v0.100.1** (`messages.d.ts:1199/1205`) — NO deviation, no `any`, no beta type. No `cache_control` in defs (client stamps last tool).
+- [x] 5.2 Registry + `ToolRuntime` impl `src/extension/tool-registry.ts` (`LiveToolRuntime<V>(ctx, refs=new ReferenceTable(), signal?)` — one per turn, ReferenceTable turn-scoped §6) + executors `src/extension/executors/{read,mutation,shared}.ts`. Read: `live_get_project/track/clip/device_params` (lazy `getValue` on-demand only, §15); mutation: update_track/clip, set_param (clamp+quantize, mixer vol/pan/send), edit_midi_notes (replace/transpose/quantize/humanize; `filter`→`destructive:true`), create, create_clip (MIDI), insert_device, modify_device_chain (duplicate/insert_chain), delete (type-routed). **Audio tools deferred to Phase 14** — `live_render_audio`/`live_replace_sample`/`live_import_audio`/audio-branch `live_create_clip` return honest `{error:"deferred",isError:true}`, never fake success.
+- [x] **Transaction discipline (§7/R5) verified by reviewer trace, not comments:** exactly ONE `withinTransaction` per `flushMutations` batch; two-phase prepare(async, outside)→run(sync-launch, inside) with callback `return Promise.all([...]).then(...)` — **NO `await` inside the callback**, txn awaited outside; abort re-checked BEFORE opening txn (defense-in-depth w/ loop's own check); sync-throw → whole batch `sdk_error` (atomic rollback). Creates mint fresh ref by re-reading parent collection + matching handle id; deletes use `ReferenceTable.invalidateAndShift` → return affected refs. Create-then-configure = ≥2 transactions by design.
+- [x] 5.5 Extended `tests/fixtures/fake-extension-context.ts` with mutation/create/transaction surface pinned to SDK `.d.mts` sync/async split + observability hooks: `ctx.transactions[]`/`committedCount` (prove one-txn-per-batch), `ctx.paramValueOf(ref)`/`ctx.notesOf(ref)`, seed-spec fields (`mute/solo/arm/color/looping/muted/warping/warpMode/notes/param{min,max,isQuantized,value}`), `FakeWarpMode`/`FakeNoteDescription`. R5 sync-throw rollback modeled via reverse-order undo journal.
+- [x] 5.6 Tests `tests/executors.test.ts` (109) + `tests/tool-registry.test.ts` (12) = **121 new; 301 total pass.** Coverage (lines): tool-registry 91.01%, mutation 90.15%, read 90.65%, shared 100%, tools.ts 100% — all ≥90%.
+- QA gate (code-reviewer): **PASS, 0 CRITICAL, 0 MAJOR, 2 MINOR (forward-looking coverage only).** Reviewer hand-traced `flushMutations` (single-txn boundary, no-await-in-callback, slotToIndex distribution), handle discipline (no caching across calls/within batch; ReferenceTable holds strings only), honesty (4 audio deferrals + unsupported branches, `report_limitation` correctly absent), schema correctness, shared purity. `tsc -b` 0 / `npm run lint` 0 / `npm test` 301.
+
+#### Phase 5 follow-ups (non-blocking, tracked)
+- **P5-1 (verify @ Phase 11, first LIVE API call):** `live_set_param.target` and `live_create_clip` use JSON-Schema `oneOf`/`const` under `strict:true`. Anthropic strict mode is a JSON-Schema subset — confirm the wire accepts `oneOf`/`const` at first live call. If rejected: flatten to a single object with an explicit discriminator enum + conditionally-required fields in prose (executor narrows by discriminant either way, so only the schema shape changes). No wrong-target/honesty risk — a rejection surfaces as a loud API error, never silent mis-execution.
+- **P5-2 (MINOR, add @ Phase 12/13):** no single `flushMutations` test mixes an async `live_create` with a sync `live_update_*` in one batch (the only shape interleaving positive/negative `slotToIndex` markers). Logic traced-correct; add a mixed-batch test when create+configure batches become common.
+- **P5-3 (MINOR, in-Live @ Phase 12/19):** `live_insert_device` keeps no built-in allowlist (relies on SDK to reject third-party names → structured `sdk_error`). Sound, but the §9 "no plugins" guard is only enforced at the live boundary; add an in-Live third-party-rejection check in the limitation-honesty pass.
+
 ## Session Log
 (no sessions yet)
 - 2026-06-02 16:10: Session ended
@@ -81,3 +94,5 @@ R5 transaction rollback: **YES (atomic)** — throwing inside `withinTransaction
 - 2026-06-02 21:07: Session ended
 - 2026-06-02 21:11: Session ended
 - 2026-06-02 21:11: Session ended
+- 2026-06-02 21:28: Session ended
+- 2026-06-02 22:11: Session ended

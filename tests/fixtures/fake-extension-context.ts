@@ -56,8 +56,51 @@ export interface FakeObject {
   readonly handle: Handle;
 }
 
+/**
+ * Mirror of SDK `WarpMode`. Duplicated locally (not imported) to keep the fixture
+ * decoupled from the SDK package, matching the existing decoupling policy. Values
+ * are pinned to the SDK enum (docs/ARCHITECTURE.md §14).
+ */
+export const FakeWarpMode = {
+  Beats: 0,
+  Tones: 1,
+  Texture: 2,
+  Repitch: 3,
+  Complex: 4,
+  ComplexPro: 6,
+} as const;
+
+/**
+ * Mirror of SDK `NoteDescription` (extensions-sdk `index.d.mts`). `live_edit_midi_notes`
+ * replaces the whole array; the getter returns a fresh COPY so callers cannot mutate
+ * backing state without going through the setter.
+ */
+export interface FakeNoteDescription {
+  pitch: number;
+  startTime: number;
+  duration: number;
+  velocity?: number;
+  muted?: boolean;
+  probability?: number;
+  velocityDeviation?: number;
+  releaseVelocity?: number;
+  selected?: boolean;
+}
+
+/**
+ * DeviceParameter mirror. `getValue()`/`setValue()` are ASYNC (return a Promise) per
+ * the SDK; `min`/`max`/`isQuantized`/`valueItems`/`name` are sync getters. `setValue`
+ * CLAMPS to `[min, max]`; when `isQuantized`, it ROUNDS to the nearest integer index
+ * (then clamps), matching a quantized parameter's discrete value-item domain.
+ */
 export interface FakeDeviceParameter extends FakeObject {
   readonly name: string;
+  readonly min: number;
+  readonly max: number;
+  readonly isQuantized: boolean;
+  readonly valueItems: { name: string; shortName: string }[];
+  getValue(): Promise<number>;
+  setValue(value: number): Promise<void>;
 }
 
 export interface FakeTrackMixer extends FakeObject {
@@ -77,43 +120,75 @@ export interface FakeDevice extends FakeObject {
   readonly parameters: FakeDeviceParameter[];
   /** Present only on RackDevice/DrumRack nodes. */
   readonly chains?: FakeChain[];
+  /** Present only on RackDevice/DrumRack nodes; async (returns the new chain). */
+  insertChain?(index: number): Promise<FakeChain>;
+  /** Present only on Simpler nodes; async (returns the new sample's managed path). */
+  replaceSample?(filePath: string): Promise<{ filePath: string }>;
 }
 
 export interface FakeChain extends FakeObject {
   readonly name: string;
   readonly devices: FakeDevice[];
   readonly mixer: FakeChainMixer;
+  insertDevice(deviceName: string, index: number): Promise<FakeDevice>;
+  duplicateDevice(device: FakeDevice): Promise<FakeDevice>;
+  deleteDevice(device: FakeDevice): Promise<void>;
 }
 
 export interface FakeClip extends FakeObject {
-  readonly name: string;
+  name: string;
+  color: number;
+  looping: boolean;
+  muted: boolean;
+  /** AudioClip only (undefined on MIDI clips). */
+  warping?: boolean;
+  /** AudioClip only (undefined on MIDI clips). */
+  warpMode?: number;
+  /** MidiClip only (undefined on audio clips); getter returns a fresh copy. */
+  notes?: FakeNoteDescription[];
 }
 
 export interface FakeClipSlot extends FakeObject {
   /** ClipSlot has NO name (SDK fidelity). */
   readonly clip: FakeClip | null;
+  createMidiClip(length: number): Promise<FakeClip>;
+  deleteClip(): Promise<void>;
 }
 
 export interface FakeTakeLane extends FakeObject {
-  readonly name: string;
+  name: string;
   readonly clips: FakeClip[];
+  createMidiClip(startTime: number, duration: number): Promise<FakeClip>;
 }
 
 export interface FakeTrack extends FakeObject {
-  readonly name: string;
+  name: string;
+  mute: boolean;
+  solo: boolean;
+  arm: boolean;
   readonly devices: FakeDevice[];
   readonly clipSlots: FakeClipSlot[];
   readonly takeLanes: FakeTakeLane[];
   readonly arrangementClips: FakeClip[];
   readonly mixer: FakeTrackMixer;
+  createTakeLane(): Promise<FakeTakeLane>;
+  insertDevice(deviceName: string, index: number): Promise<FakeDevice>;
+  duplicateDevice(device: FakeDevice): Promise<FakeDevice>;
+  deleteDevice(device: FakeDevice): Promise<void>;
+  deleteClip(clip: FakeClip): Promise<void>;
+}
+
+/** MidiTrack adds the arrangement createMidiClip(startTime, duration). */
+export interface FakeMidiTrack extends FakeTrack {
+  createMidiClip(startTime: number, duration: number): Promise<FakeClip>;
 }
 
 export interface FakeScene extends FakeObject {
-  readonly name: string;
+  name: string;
 }
 
 export interface FakeCuePoint extends FakeObject {
-  readonly name: string;
+  name: string;
 }
 
 export interface FakeSong extends FakeObject {
@@ -122,7 +197,16 @@ export interface FakeSong extends FakeObject {
   readonly mainTrack: FakeTrack;
   readonly scenes: FakeScene[];
   readonly cuePoints: FakeCuePoint[];
-  readonly tempo: number;
+  tempo: number;
+  createAudioTrack(): Promise<FakeTrack>;
+  createMidiTrack(): Promise<FakeMidiTrack>;
+  createScene(index: number): Promise<FakeScene>;
+  createCuePoint(time: number): Promise<FakeCuePoint>;
+  deleteTrack(track: FakeTrack): Promise<void>;
+  deleteScene(scene: FakeScene): Promise<void>;
+  deleteCuePoint(cuePoint: FakeCuePoint): Promise<void>;
+  duplicateTrack(track: FakeTrack): Promise<FakeTrack>;
+  duplicateScene(scene: FakeScene): Promise<FakeScene>;
 }
 // #endregion
 
@@ -145,6 +229,29 @@ interface FakeNode {
   clip?: FakeNode | null;
   /** For a track/chain: its mixer node. */
   mixer?: FakeNode;
+
+  // --- mutable state seeded by NodeSpec / set by mutation tools ---
+  /** Track flags (Track nodes only). */
+  mute: boolean;
+  solo: boolean;
+  arm: boolean;
+  /** Clip flags (Clip nodes only). */
+  color: number;
+  looping: boolean;
+  muted: boolean;
+  /** AudioClip-only warp state. `undefined` ⇒ not an audio clip. */
+  warping?: boolean;
+  warpMode?: number;
+  /** MidiClip-only note buffer. `undefined` ⇒ not a midi clip. */
+  notes?: FakeNoteDescription[];
+  /** DeviceParameter spec/state. `undefined` ⇒ not a parameter. */
+  param?: {
+    min: number;
+    max: number;
+    isQuantized: boolean;
+    value: number;
+    valueItems: { name: string; shortName: string }[];
+  };
 }
 
 /**
@@ -250,6 +357,29 @@ export interface NodeSpec {
   clip?: NodeSpec | null;
   /** For a track/chain spec: its mixer node spec. */
   mixer?: NodeSpec;
+
+  // --- seed values for the mutable surface (all optional; sensible defaults) ---
+  /** Track flags (default false). */
+  mute?: boolean;
+  solo?: boolean;
+  arm?: boolean;
+  /** Clip flags. color default 0; looping/muted default false. */
+  color?: number;
+  looping?: boolean;
+  muted?: boolean;
+  /** AudioClip warp seed; presence marks the clip as audio. */
+  warping?: boolean;
+  warpMode?: number;
+  /** MidiClip note seed; presence marks the clip as midi. */
+  notes?: FakeNoteDescription[];
+  /** DeviceParameter seed; presence required for getValue/setValue to behave. */
+  param?: {
+    min?: number;
+    max?: number;
+    isQuantized?: boolean;
+    value?: number;
+    valueItems?: { name: string; shortName: string }[];
+  };
 }
 
 /** Spec for the whole Set passed to {@link makeFakeContext}. */
@@ -286,6 +416,44 @@ export interface FakeExtensionContext {
 
   /** Synchronous; throws a single generic `Error` for deleted/wrong-type/unknown — never returns null. */
   getObjectFromHandle<T>(handle: Handle, type: AbstractCtor<T>): T;
+
+  /**
+   * SYNCHRONOUS transaction boundary mirroring the SDK
+   * (`withinTransaction<T>(fn: () => T): T`). Runs `fn()` and returns its result
+   * verbatim — if `fn` returns a `Promise` (e.g. `Promise.all([...])` of async
+   * creates), the fake returns that same Promise for the CALLER to await; the fake
+   * never awaits inside the callback (docs/ARCHITECTURE.md §7).
+   *
+   * **R5 atomic rollback (recorded outcome = atomic):** if `fn()` THROWS
+   * synchronously, every sync mutation applied during the callback is rolled back in
+   * reverse order and NO committed undo boundary is recorded (the attempt is logged
+   * as `rolledBack: true`). Async rejections that settle AFTER the callback returns
+   * are the caller's concern and are not rolled back here — matching what Spike R5
+   * actually validated (the sync-throw path).
+   */
+  withinTransaction<T>(fn: () => T): T;
+
+  /**
+   * Observability for tests (NOT part of the SDK). `transactions` lists every
+   * `withinTransaction` attempt in order, each marked committed or rolled back, so a
+   * test can assert "exactly one transaction per flushMutations batch" and that a
+   * throwing batch rolled back. `committedCount` is the number that committed.
+   */
+  readonly transactions: ReadonlyArray<{
+    committed: boolean;
+    rolledBack: boolean;
+  }>;
+  readonly committedCount: number;
+
+  /**
+   * Reads the current backing value of a parameter addressed by the internal address
+   * scheme (e.g. `"tracks[0]/mixer/volume"`, `"tracks[1]/devices[0]/parameters[0]"`).
+   * Lets a test assert clamping/quantization outcomes without the async getter.
+   */
+  paramValueOf(ref: string): number;
+
+  /** Reads the live note buffer of a midi clip addressed internally (fresh copy). */
+  notesOf(ref: string): FakeNoteDescription[];
 
   /** Moves a child within a collection (live reorder). */
   reorder(
@@ -330,7 +498,36 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       name: s.name ?? "",
       deleted: false,
       children: new Map<string, FakeNode[]>(),
+      mute: s.mute ?? false,
+      solo: s.solo ?? false,
+      arm: s.arm ?? false,
+      color: s.color ?? 0,
+      looping: s.looping ?? false,
+      muted: s.muted ?? false,
     };
+    // AudioClip warp state: present iff a warp seed was given OR the class is AudioClip.
+    if (s.warping !== undefined || s.warpMode !== undefined) {
+      node.warping = s.warping ?? false;
+      node.warpMode = s.warpMode ?? FakeWarpMode.Beats;
+    }
+    // MidiClip notes: present iff a notes seed was given OR the class is MidiClip.
+    if (s.notes !== undefined) {
+      node.notes = s.notes.map((n) => ({ ...n }));
+    } else if (s.className === "MidiClip") {
+      node.notes = [];
+    }
+    // DeviceParameter state.
+    if (s.className === "DeviceParameter") {
+      const min = s.param?.min ?? 0;
+      const max = s.param?.max ?? 1;
+      node.param = {
+        min,
+        max,
+        isQuantized: s.param?.isQuantized ?? false,
+        value: s.param?.value ?? min,
+        valueItems: s.param?.valueItems ?? [],
+      };
+    }
     byId.set(node.id, node);
 
     if (s.children) {
@@ -357,6 +554,12 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
     name: "",
     deleted: false,
     children: new Map<string, FakeNode[]>(),
+    mute: false,
+    solo: false,
+    arm: false,
+    color: 0,
+    looping: false,
+    muted: false,
   };
   byId.set(songNode.id, songNode);
   songNode.children.set("tracks", (filled.tracks ?? []).map(buildNode));
@@ -369,18 +572,188 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
   const mainTrackNode = buildNode(
     filled.mainTrack ?? { className: "AudioTrack", name: "Main" }
   );
-  const tempo = filled.tempo ?? 120;
+  /** Mutable tempo box so the `song.tempo` setter can journal/restore it. */
+  const tempoState = { value: filled.tempo ?? 120 };
+
+  /** Default track mixer spec for newly created tracks (volume/pan, no sends). */
+  const trackMixerSpec = (): NodeSpec => ({
+    className: "MixerDevice",
+    children: {
+      volume: [{ className: "DeviceParameter", name: "Volume" }],
+      panning: [{ className: "DeviceParameter", name: "Pan" }],
+      sends: [],
+    },
+  });
 
   // --- live array helper: fresh array of non-deleted children on each access ---
   const liveChildren = (node: FakeNode, key: string): FakeNode[] =>
     (node.children.get(key) ?? []).filter((c) => !c.deleted);
 
+  // --- transaction machinery (sync boundary + R5 atomic rollback) ---
+  /**
+   * Each `withinTransaction` attempt is logged here in order. A successful run is
+   * `{ committed: true, rolledBack: false }`; a sync throw is rolled back and logged
+   * `{ committed: false, rolledBack: true }`. Tests read this via `transactions`.
+   */
+  const txLog: { committed: boolean; rolledBack: boolean }[] = [];
+  /**
+   * While a transaction is open, every SYNC mutation pushes an undo thunk here so a
+   * sync throw can roll back in reverse order (R5 = atomic). `null` ⇒ no open
+   * transaction, so mutations outside a transaction are applied without journaling
+   * (they cannot be rolled back — matching "the caller owns un-transacted writes").
+   */
+  let journal: (() => void)[] | null = null;
+  /** Records an undo thunk if a transaction is currently open. */
+  function record(undo: () => void): void {
+    if (journal !== null) {
+      journal.push(undo);
+    }
+  }
+  /** Nested transactions auto-collapse (SDK semantics): only the outermost logs/rolls back. */
+  function withinTransaction<T>(fn: () => T): T {
+    if (journal !== null) {
+      // Already inside a transaction — collapse into it, no new boundary.
+      return fn();
+    }
+    const undoThunks: (() => void)[] = [];
+    journal = undoThunks;
+    try {
+      const result = fn();
+      txLog.push({ committed: true, rolledBack: false });
+      journal = null;
+      return result;
+    } catch (err) {
+      // R5 atomic rollback: undo every sync mutation in reverse order, log no commit.
+      journal = null;
+      for (let i = undoThunks.length - 1; i >= 0; i--) {
+        undoThunks[i]();
+      }
+      txLog.push({ committed: false, rolledBack: true });
+      throw err;
+    }
+  }
+
+  // --- structural mutation helpers (async creates/deletes operate on the tree) ---
+  /**
+   * Appends a freshly built node into `parent.children[key]` and returns it. The
+   * mutation runs synchronously when called; async creators invoke this from inside
+   * the returned Promise body so it lands AFTER the transaction callback returns
+   * (hence not subject to sync-throw rollback — matching the R5 scope).
+   */
+  function appendChild(
+    parent: FakeNode,
+    key: string,
+    spec: NodeSpec,
+    atIndex?: number
+  ): FakeNode {
+    const arr = parent.children.get(key) ?? [];
+    parent.children.set(key, arr);
+    const live = arr.filter((c) => !c.deleted);
+    const fresh = buildNode(spec);
+    if (atIndex === undefined || atIndex >= live.length) {
+      arr.push(fresh);
+    } else {
+      // Insert before the live node currently at atIndex (preserving tombstones).
+      const target = live[Math.max(0, atIndex)];
+      const realIndex = arr.indexOf(target);
+      arr.splice(realIndex, 0, fresh);
+    }
+    return fresh;
+  }
+
+  /** Deep-clones a spec from a live node (for duplicate*). */
+  function specOf(node: FakeNode): NodeSpec {
+    const children: Record<string, NodeSpec[]> = {};
+    for (const [key, arr] of node.children) {
+      children[key] = arr.filter((c) => !c.deleted).map(specOf);
+    }
+    const spec: NodeSpec = { className: node.className, name: node.name };
+    if (Object.keys(children).length > 0) {
+      spec.children = children;
+    }
+    if (node.mixer) {
+      spec.mixer = specOf(node.mixer);
+    }
+    if (node.clip !== undefined) {
+      spec.clip = node.clip ? specOf(node.clip) : null;
+    }
+    spec.mute = node.mute;
+    spec.solo = node.solo;
+    spec.arm = node.arm;
+    spec.color = node.color;
+    spec.looping = node.looping;
+    spec.muted = node.muted;
+    if (node.warping !== undefined) {
+      spec.warping = node.warping;
+      spec.warpMode = node.warpMode;
+    }
+    if (node.notes !== undefined) {
+      spec.notes = node.notes.map((n) => ({ ...n }));
+    }
+    if (node.param) {
+      spec.param = {
+        ...node.param,
+        valueItems: node.param.valueItems.map((v) => ({ ...v })),
+      };
+    }
+    return spec;
+  }
+
+  /** Finds the (live) sibling node of `parent.children[key]` whose handle matches. */
+  function childByHandle(
+    parent: FakeNode,
+    key: string,
+    handle: Handle
+  ): FakeNode {
+    const found = liveChildren(parent, key).find((c) => c.id === handle.id);
+    if (!found) {
+      throw new Error(`fake: no live '${key}' child with handle ${handle.id}`);
+    }
+    return found;
+  }
+
   // --- getter-proxy builders (each reads its backing node live) ---
   function makeParam(node: FakeNode): FakeDeviceParameter {
+    const spec = (): NonNullable<FakeNode["param"]> => {
+      if (!node.param) {
+        throw new Error("fake: node is not a DeviceParameter");
+      }
+      return node.param;
+    };
     return {
       handle: { id: node.id },
       get name() {
         return node.name;
+      },
+      get min() {
+        return spec().min;
+      },
+      get max() {
+        return spec().max;
+      },
+      get isQuantized() {
+        return spec().isQuantized;
+      },
+      get valueItems() {
+        return spec().valueItems.map((v) => ({ ...v }));
+      },
+      getValue(): Promise<number> {
+        return Promise.resolve(spec().value);
+      },
+      setValue(value: number): Promise<void> {
+        const p = spec();
+        let next = value;
+        if (p.isQuantized) {
+          next = Math.round(next);
+        }
+        // Clamp to [min, max].
+        next = Math.max(p.min, Math.min(p.max, next));
+        const prev = p.value;
+        record(() => {
+          p.value = prev;
+        });
+        p.value = next;
+        return Promise.resolve();
       },
     };
   }
@@ -408,12 +781,95 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
   }
 
   function makeClip(node: FakeNode): FakeClip {
-    return {
+    const clip: FakeClip = {
       handle: { id: node.id },
       get name() {
         return node.name;
       },
+      set name(value: string) {
+        const prev = node.name;
+        record(() => {
+          node.name = prev;
+        });
+        node.name = value;
+      },
+      get color() {
+        return node.color;
+      },
+      set color(value: number) {
+        const prev = node.color;
+        record(() => {
+          node.color = prev;
+        });
+        node.color = value;
+      },
+      get looping() {
+        return node.looping;
+      },
+      set looping(value: boolean) {
+        const prev = node.looping;
+        record(() => {
+          node.looping = prev;
+        });
+        node.looping = value;
+      },
+      get muted() {
+        return node.muted;
+      },
+      set muted(value: boolean) {
+        const prev = node.muted;
+        record(() => {
+          node.muted = prev;
+        });
+        node.muted = value;
+      },
     };
+    // AudioClip-only warp accessors.
+    if (node.warping !== undefined) {
+      Object.defineProperty(clip, "warping", {
+        enumerable: true,
+        get() {
+          return node.warping;
+        },
+        set(value: boolean) {
+          const prev = node.warping;
+          record(() => {
+            node.warping = prev;
+          });
+          node.warping = value;
+        },
+      });
+      Object.defineProperty(clip, "warpMode", {
+        enumerable: true,
+        get() {
+          return node.warpMode;
+        },
+        set(value: number) {
+          const prev = node.warpMode;
+          record(() => {
+            node.warpMode = prev;
+          });
+          node.warpMode = value;
+        },
+      });
+    }
+    // MidiClip-only notes accessor (full-array replace; getter returns a fresh copy).
+    if (node.notes !== undefined) {
+      Object.defineProperty(clip, "notes", {
+        enumerable: true,
+        get() {
+          return (node.notes ?? []).map((n) => ({ ...n }));
+        },
+        set(value: FakeNoteDescription[]) {
+          const prev = node.notes ?? [];
+          record(() => {
+            node.notes = prev;
+          });
+          node.notes = value.map((n) => ({ ...n }));
+        },
+      });
+    }
+    return clip;
   }
 
   function makeDevice(node: FakeNode): FakeDevice {
@@ -426,16 +882,83 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         return liveChildren(node, "parameters").map(makeParam);
       },
     };
-    // RackDevice / DrumRack expose `chains`.
-    if (node.children.has("chains")) {
+    // RackDevice / DrumRack expose `chains` + insertChain.
+    if (assignableIncludes(node.className, "RackDevice")) {
+      const isDrum = assignableIncludes(node.className, "DrumRackDevice");
       return {
         ...base,
         get chains() {
           return liveChildren(node, "chains").map(makeChain);
         },
+        insertChain(index: number): Promise<FakeChain> {
+          return Promise.resolve().then(() => {
+            const fresh = appendChild(
+              node,
+              "chains",
+              {
+                className: isDrum ? "DrumChain" : "Chain",
+                name: "",
+                mixer: {
+                  className: "ChainMixerDevice",
+                  children: {
+                    volume: [{ className: "DeviceParameter", name: "Volume" }],
+                    panning: [{ className: "DeviceParameter", name: "Pan" }],
+                    sends: [],
+                  },
+                },
+              },
+              index
+            );
+            return makeChain(fresh);
+          });
+        },
+      };
+    }
+    // Simpler exposes replaceSample.
+    if (node.className === "Simpler") {
+      return {
+        ...base,
+        replaceSample(filePath: string): Promise<{ filePath: string }> {
+          return Promise.resolve({ filePath });
+        },
       };
     }
     return base;
+  }
+
+  // Shared device-chain mutators used by both Track and Chain (identical SDK shape).
+  function insertDeviceInto(
+    owner: FakeNode,
+    deviceName: string,
+    index: number
+  ): Promise<FakeDevice> {
+    return Promise.resolve().then(() => {
+      const fresh = appendChild(
+        owner,
+        "devices",
+        { className: deviceName, name: deviceName },
+        index
+      );
+      return makeDevice(fresh);
+    });
+  }
+  function duplicateDeviceIn(
+    owner: FakeNode,
+    device: FakeDevice
+  ): Promise<FakeDevice> {
+    return Promise.resolve().then(() => {
+      const original = childByHandle(owner, "devices", device.handle);
+      const live = liveChildren(owner, "devices");
+      const at = live.indexOf(original) + 1; // inserted directly after original
+      const fresh = appendChild(owner, "devices", specOf(original), at);
+      return makeDevice(fresh);
+    });
+  }
+  function deleteDeviceIn(owner: FakeNode, device: FakeDevice): Promise<void> {
+    return Promise.resolve().then(() => {
+      const target = childByHandle(owner, "devices", device.handle);
+      markDeleted(target);
+    });
   }
 
   function makeChain(node: FakeNode): FakeChain {
@@ -453,6 +976,15 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         }
         return makeMixer(node.mixer);
       },
+      insertDevice(deviceName: string, index: number): Promise<FakeDevice> {
+        return insertDeviceInto(node, deviceName, index);
+      },
+      duplicateDevice(device: FakeDevice): Promise<FakeDevice> {
+        return duplicateDeviceIn(node, device);
+      },
+      deleteDevice(device: FakeDevice): Promise<void> {
+        return deleteDeviceIn(node, device);
+      },
     };
   }
 
@@ -461,6 +993,27 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       handle: { id: node.id },
       get clip() {
         return node.clip && !node.clip.deleted ? makeClip(node.clip) : null;
+      },
+      createMidiClip(length: number): Promise<FakeClip> {
+        return Promise.resolve().then(() => {
+          const fresh = buildNode({
+            className: "MidiClip",
+            name: "",
+            notes: [],
+          });
+          // Length seeded onto the node for tests that care (kept on param-less node).
+          void length;
+          node.clip = fresh;
+          return makeClip(fresh);
+        });
+      },
+      deleteClip(): Promise<void> {
+        return Promise.resolve().then(() => {
+          if (node.clip) {
+            markDeleted(node.clip);
+            node.clip = null;
+          }
+        });
       },
     };
   }
@@ -471,17 +1024,73 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       get name() {
         return node.name;
       },
+      set name(value: string) {
+        const prev = node.name;
+        record(() => {
+          node.name = prev;
+        });
+        node.name = value;
+      },
       get clips() {
         return liveChildren(node, "clips").map(makeClip);
+      },
+      createMidiClip(startTime: number, duration: number): Promise<FakeClip> {
+        return Promise.resolve().then(() => {
+          void startTime;
+          void duration;
+          const fresh = appendChild(node, "clips", {
+            className: "MidiClip",
+            name: "",
+            notes: [],
+          });
+          return makeClip(fresh);
+        });
       },
     };
   }
 
-  function makeTrack(node: FakeNode): FakeTrack {
-    return {
+  function makeTrack(node: FakeNode): FakeTrack & FakeMidiTrack {
+    const track: FakeTrack & FakeMidiTrack = {
       handle: { id: node.id },
       get name() {
         return node.name;
+      },
+      set name(value: string) {
+        const prev = node.name;
+        record(() => {
+          node.name = prev;
+        });
+        node.name = value;
+      },
+      get mute() {
+        return node.mute;
+      },
+      set mute(value: boolean) {
+        const prev = node.mute;
+        record(() => {
+          node.mute = prev;
+        });
+        node.mute = value;
+      },
+      get solo() {
+        return node.solo;
+      },
+      set solo(value: boolean) {
+        const prev = node.solo;
+        record(() => {
+          node.solo = prev;
+        });
+        node.solo = value;
+      },
+      get arm() {
+        return node.arm;
+      },
+      set arm(value: boolean) {
+        const prev = node.arm;
+        record(() => {
+          node.arm = prev;
+        });
+        node.arm = value;
       },
       get devices() {
         return liveChildren(node, "devices").map(makeDevice);
@@ -501,7 +1110,44 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         }
         return makeMixer(node.mixer);
       },
+      createTakeLane(): Promise<FakeTakeLane> {
+        return Promise.resolve().then(() => {
+          const fresh = appendChild(node, "takeLanes", {
+            className: "TakeLane",
+            name: "",
+          });
+          return makeTakeLane(fresh);
+        });
+      },
+      insertDevice(deviceName: string, index: number): Promise<FakeDevice> {
+        return insertDeviceInto(node, deviceName, index);
+      },
+      duplicateDevice(device: FakeDevice): Promise<FakeDevice> {
+        return duplicateDeviceIn(node, device);
+      },
+      deleteDevice(device: FakeDevice): Promise<void> {
+        return deleteDeviceIn(node, device);
+      },
+      deleteClip(clip: FakeClip): Promise<void> {
+        return Promise.resolve().then(() => {
+          const target = childByHandle(node, "arrangementClips", clip.handle);
+          markDeleted(target);
+        });
+      },
+      createMidiClip(startTime: number, duration: number): Promise<FakeClip> {
+        return Promise.resolve().then(() => {
+          void startTime;
+          void duration;
+          const fresh = appendChild(node, "arrangementClips", {
+            className: "MidiClip",
+            name: "",
+            notes: [],
+          });
+          return makeClip(fresh);
+        });
+      },
     };
+    return track;
   }
 
   function makeScene(node: FakeNode): FakeScene {
@@ -509,6 +1155,13 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       handle: { id: node.id },
       get name() {
         return node.name;
+      },
+      set name(value: string) {
+        const prev = node.name;
+        record(() => {
+          node.name = prev;
+        });
+        node.name = value;
       },
     };
   }
@@ -518,6 +1171,13 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       handle: { id: node.id },
       get name() {
         return node.name;
+      },
+      set name(value: string) {
+        const prev = node.name;
+        record(() => {
+          node.name = prev;
+        });
+        node.name = value;
       },
     };
   }
@@ -540,7 +1200,90 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       return liveChildren(songNode, "cuePoints").map(makeCuePoint);
     },
     get tempo() {
-      return tempo;
+      return tempoState.value;
+    },
+    set tempo(value: number) {
+      const prev = tempoState.value;
+      record(() => {
+        tempoState.value = prev;
+      });
+      tempoState.value = value;
+    },
+    createAudioTrack(): Promise<FakeTrack> {
+      return Promise.resolve().then(() =>
+        makeTrack(
+          appendChild(songNode, "tracks", {
+            className: "AudioTrack",
+            name: "",
+            mixer: trackMixerSpec(),
+          })
+        )
+      );
+    },
+    createMidiTrack(): Promise<FakeMidiTrack> {
+      return Promise.resolve().then(() =>
+        makeTrack(
+          appendChild(songNode, "tracks", {
+            className: "MidiTrack",
+            name: "",
+            mixer: trackMixerSpec(),
+          })
+        )
+      );
+    },
+    createScene(index: number): Promise<FakeScene> {
+      return Promise.resolve().then(() =>
+        makeScene(
+          appendChild(
+            songNode,
+            "scenes",
+            { className: "Scene", name: "" },
+            index < 0 ? undefined : index
+          )
+        )
+      );
+    },
+    createCuePoint(time: number): Promise<FakeCuePoint> {
+      return Promise.resolve().then(() => {
+        void time;
+        return makeCuePoint(
+          appendChild(songNode, "cuePoints", {
+            className: "CuePoint",
+            name: "",
+          })
+        );
+      });
+    },
+    deleteTrack(track: FakeTrack): Promise<void> {
+      return Promise.resolve().then(() => {
+        markDeleted(childByHandle(songNode, "tracks", track.handle));
+      });
+    },
+    deleteScene(scene: FakeScene): Promise<void> {
+      return Promise.resolve().then(() => {
+        markDeleted(childByHandle(songNode, "scenes", scene.handle));
+      });
+    },
+    deleteCuePoint(cuePoint: FakeCuePoint): Promise<void> {
+      return Promise.resolve().then(() => {
+        markDeleted(childByHandle(songNode, "cuePoints", cuePoint.handle));
+      });
+    },
+    duplicateTrack(track: FakeTrack): Promise<FakeTrack> {
+      return Promise.resolve().then(() => {
+        const original = childByHandle(songNode, "tracks", track.handle);
+        const live = liveChildren(songNode, "tracks");
+        const at = live.indexOf(original) + 1;
+        return makeTrack(appendChild(songNode, "tracks", specOf(original), at));
+      });
+    },
+    duplicateScene(scene: FakeScene): Promise<FakeScene> {
+      return Promise.resolve().then(() => {
+        const original = childByHandle(songNode, "scenes", scene.handle);
+        const live = liveChildren(songNode, "scenes");
+        const at = live.indexOf(original) + 1;
+        return makeScene(appendChild(songNode, "scenes", specOf(original), at));
+      });
     },
   };
 
@@ -737,9 +1480,34 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
     return { id: nodeAt(ref).id };
   }
 
+  function paramValueOf(ref: string): number {
+    const node = nodeAt(ref);
+    if (!node.param) {
+      throw new Error(`fake: '${ref}' is not a DeviceParameter`);
+    }
+    return node.param.value;
+  }
+
+  function notesOf(ref: string): FakeNoteDescription[] {
+    const node = nodeAt(ref);
+    if (node.notes === undefined) {
+      throw new Error(`fake: '${ref}' is not a MidiClip`);
+    }
+    return node.notes.map((n) => ({ ...n }));
+  }
+
   return {
     application: { song },
     getObjectFromHandle,
+    withinTransaction,
+    get transactions() {
+      return txLog.map((t) => ({ ...t }));
+    },
+    get committedCount() {
+      return txLog.filter((t) => t.committed).length;
+    },
+    paramValueOf,
+    notesOf,
     reorder,
     rename,
     remove,
