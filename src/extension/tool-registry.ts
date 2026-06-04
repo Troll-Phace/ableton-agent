@@ -117,7 +117,7 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
         case "live_get_device_params":
           return await executeGetDeviceParams(this.ctx, call);
         case "live_render_audio":
-          return executeRenderAudio(call);
+          return await executeRenderAudio(this.ctx, call);
         case "report_limitation":
           return executeReportLimitation(call);
         default:
@@ -362,11 +362,11 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
       case "live_modify_device_chain":
         return prepareModifyDeviceChain(this.ctx, call);
       case "live_replace_sample":
-        return prepareReplaceSample(call);
+        return prepareReplaceSample(this.ctx, call);
       case "live_delete":
         return prepareDelete(this.ctx, call, this.refs);
       case "live_import_audio":
-        return prepareImportAudio(call);
+        return prepareImportAudio(this.ctx, call);
       default:
         return {
           kind: "error",

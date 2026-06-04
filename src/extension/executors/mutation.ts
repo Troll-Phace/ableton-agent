@@ -23,9 +23,13 @@
  *
  * ## Honesty (§9)
  * Unsupported requests fail loudly (never a fake success): automation has no API
- * (`live_set_param` is a STATIC value), markers are create-time only, audio tools
- * are deferred to Phase 14, and the SDK rejects unknown (third-party) device names.
+ * (`live_set_param` is a STATIC value), markers are create-time only, a non-Simpler
+ * device cannot have its sample replaced, and the SDK rejects unknown
+ * (third-party) device names.
  */
+
+import { mkdirSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 import {
   AudioClip,
@@ -40,6 +44,7 @@ import {
   MidiTrack,
   RackDevice,
   Scene,
+  Simpler,
   TakeLane,
   Track,
   WarpMode,
@@ -58,7 +63,6 @@ import {
 } from "../../shared/tools.js";
 import {
   clamp,
-  deferred,
   errorMessage,
   fail,
   invalidArgs,
@@ -110,11 +114,6 @@ export type Prepared =
 /** Helper: an early-error {@link Prepared} from a {@link RefError}/{@link ExecutorError}. */
 function err(call: ToolCall, e: RefError | ExecutorError): Prepared {
   return { kind: "error", payload: fail(call.id, e) };
-}
-
-/** Helper: an early deferred {@link Prepared} (audio tools, Phase 14). */
-function deferPrepared(call: ToolCall, what: string): Prepared {
-  return { kind: "error", payload: deferred(call.id, what) };
 }
 
 /** A sync-only plan: applies `apply()` then finalizes with `result`. */
@@ -1247,15 +1246,137 @@ function nameOf(obj: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
+// live_create_clip — audio loopSettings parsing/validation
+// ---------------------------------------------------------------------------
+
+/**
+ * The SDK `createAudioClip` loop/region arg (§14). Structurally identical to the
+ * shared {@link ClipLoopSettingsArg}; defined locally so the executor never
+ * imports the SDK `ClipLoopSettings` type for a plain value bag.
+ */
+interface ParsedLoopSettings {
+  looping: boolean;
+  startMarker: number;
+  endMarker: number;
+  loopStart: number;
+  loopEnd: number;
+}
+
+/** The smallest allowed loop region, in beats (§14). */
+const MIN_LOOP_BEATS = 0.25;
+
+/**
+ * Parse + validate `loopSettings` for `live_create_clip` (audio). The schema is
+ * non-strict (§8) so EVERY constraint is enforced here and reported as a precise
+ * `invalid_args` (never a fake success, §9):
+ *  - all five fields present and finite (the SDK requires every field);
+ *  - `startMarker ≤ endMarker`;
+ *  - loop region length (`loopEnd - loopStart`) ≥ {@link MIN_LOOP_BEATS};
+ *  - `looping:false` ⇒ the loop braces collapse onto the markers
+ *    (`loopStart===startMarker && loopEnd===endMarker`);
+ *  - `isWarped:false` ⇒ all positions ≥ 0 and `looping:false`.
+ *
+ * Returns `{ ok:true, settings }` when valid, or `{ ok:false, err }`.
+ */
+function parseLoopSettings(
+  raw: unknown,
+  isWarped: boolean
+):
+  | { ok: true; settings: ParsedLoopSettings }
+  | { ok: false; err: ExecutorError } {
+  if (!isRecord(raw)) {
+    return {
+      ok: false,
+      err: invalidArgs(
+        "'loopSettings' must be an object with five beat fields"
+      ),
+    };
+  }
+  const looping = optBoolean(raw, "looping");
+  if (typeof looping !== "boolean") {
+    return {
+      ok: false,
+      err: invalidArgs("loopSettings.looping must be a boolean"),
+    };
+  }
+  const startMarker = readNumber(raw, "startMarker");
+  const endMarker = readNumber(raw, "endMarker");
+  const loopStart = readNumber(raw, "loopStart");
+  const loopEnd = readNumber(raw, "loopEnd");
+  if (
+    startMarker === null ||
+    endMarker === null ||
+    loopStart === null ||
+    loopEnd === null
+  ) {
+    return {
+      ok: false,
+      err: invalidArgs(
+        "loopSettings needs finite numeric startMarker, endMarker, loopStart, loopEnd (beats)"
+      ),
+    };
+  }
+  if (startMarker > endMarker) {
+    return {
+      ok: false,
+      err: invalidArgs("loopSettings.startMarker must be ≤ endMarker"),
+    };
+  }
+  if (loopEnd - loopStart < MIN_LOOP_BEATS) {
+    return {
+      ok: false,
+      err: invalidArgs(
+        `loopSettings loop region (loopEnd - loopStart) must be ≥ ${MIN_LOOP_BEATS} beats`
+      ),
+    };
+  }
+  if (!looping && (loopStart !== startMarker || loopEnd !== endMarker)) {
+    return {
+      ok: false,
+      err: invalidArgs(
+        "when looping is false, loopStart/loopEnd must equal startMarker/endMarker"
+      ),
+    };
+  }
+  if (!isWarped) {
+    if (startMarker < 0 || endMarker < 0 || loopStart < 0 || loopEnd < 0) {
+      return {
+        ok: false,
+        err: invalidArgs("unwarped clip loopSettings positions must be ≥ 0"),
+      };
+    }
+    if (looping) {
+      return {
+        ok: false,
+        err: invalidArgs(
+          "an unwarped clip cannot loop (set isWarped:true to loop)"
+        ),
+      };
+    }
+  }
+  return {
+    ok: true,
+    settings: { looping, startMarker, endMarker, loopStart, loopEnd },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // live_create_clip
 // ---------------------------------------------------------------------------
 
 /**
- * `live_create_clip` — create a MIDI clip at a track/clipSlot/takeLane (§8.2).
- * The AUDIO path is DEFERRED to Phase 14 (returns the deferred payload, never a
- * fake success, §9). Markers are set ONLY here via `loopSettings` (read-only
- * afterward, §9) — but for MIDI the SDK create takes only a length/duration, so
- * marker settings on a MIDI clip are rejected as unsupported.
+ * `live_create_clip` — create a MIDI or audio clip at a track/clipSlot/takeLane
+ * (§8.2). Routes by media `type` then by the resolved object's `className`:
+ *  - MIDI: `ClipSlot.createMidiClip(length)` or
+ *    `(MidiTrack|TakeLane).createMidiClip(startTime, duration)`.
+ *  - AUDIO: `ClipSlot.createAudioClip({filePath, isWarped?, loopSettings?})` (no
+ *    time args) or `(AudioTrack|TakeLane).createAudioClip({filePath, startTime,
+ *    duration?, isWarped?, loopSettings?})`.
+ * Markers are set ONLY here via `loopSettings` (read-only afterward, §9). For
+ * MIDI the SDK create takes only a length/duration, so marker settings on a MIDI
+ * clip are rejected as unsupported. Audio `loopSettings`/`isWarped` are validated
+ * by {@link parseLoopSettings} before the call; bad input → structured
+ * `invalid_args`, never a fake success (§9).
  */
 export function prepareCreateClip<V extends ApiVersion>(
   ctx: ExtensionContext<V>,
@@ -1273,7 +1394,7 @@ export function prepareCreateClip<V extends ApiVersion>(
   }
   const type = readString(call.input, "type");
   if (type === "audio") {
-    return deferPrepared(call, "live_create_clip (audio)");
+    return prepareCreateAudioClip(ctx, call, location);
   }
   if (type !== "midi") {
     return err(call, invalidArgs("'type' must be 'midi' or 'audio'"));
@@ -1358,6 +1479,172 @@ export function prepareCreateClip<V extends ApiVersion>(
           hint: "re-read the location to ground the new clip ref",
         },
         "create MIDI clip"
+      )
+  );
+}
+
+/**
+ * The AUDIO branch of {@link prepareCreateClip} (§8.2, §14). Re-resolves
+ * `location` FRESH (§6) and routes by the resolved `className`:
+ *  - **ClipSlot** → `createAudioClip({filePath, isWarped?, loopSettings?})` (no
+ *    `startTime`/`duration` — session slots have no arrangement position).
+ *  - **AudioTrack / TakeLane** → require numeric `startTime` →
+ *    `createAudioClip({filePath, startTime, duration?, isWarped?, loopSettings?})`.
+ *
+ * `filePath` (the managed path returned by `live_import_audio`) is required.
+ * `isWarped`/`loopSettings` are validated by {@link parseLoopSettings} BEFORE the
+ * call (the schema is non-strict, §8); when `loopSettings` is given, `isWarped`
+ * must be defined (the SDK requires it). Bad input → structured `invalid_args`,
+ * never a fake success (§9). Launches the create via {@link asyncPlan} — exactly
+ * one transaction, no `await` inside the callback (§7).
+ */
+function prepareCreateAudioClip<V extends ApiVersion>(
+  ctx: ExtensionContext<V>,
+  call: ToolCall,
+  location: string
+): Prepared {
+  if (!isRecord(call.input)) {
+    return err(
+      call,
+      invalidArgs("expected an object with 'location' and 'type'")
+    );
+  }
+  const filePath = readString(call.input, "filePath");
+  if (filePath === null || filePath.trim() === "") {
+    return err(
+      call,
+      invalidArgs(
+        "audio clip needs a 'filePath' (the managed path from live_import_audio)"
+      )
+    );
+  }
+
+  // isWarped: optBoolean → undefined (absent), null (wrong type), or boolean.
+  const isWarpedRaw = optBoolean(call.input, "isWarped");
+  if (isWarpedRaw === null) {
+    return err(call, invalidArgs("'isWarped' must be a boolean when provided"));
+  }
+
+  // loopSettings is optional; when present, isWarped MUST be defined (SDK rule).
+  let loopSettings: ParsedLoopSettings | undefined;
+  if (
+    "loopSettings" in call.input &&
+    call.input["loopSettings"] !== undefined
+  ) {
+    if (isWarpedRaw === undefined) {
+      return err(
+        call,
+        invalidArgs("'isWarped' must be provided when 'loopSettings' is set")
+      );
+    }
+    const parsed = parseLoopSettings(call.input["loopSettings"], isWarpedRaw);
+    if (!parsed.ok) {
+      return err(call, parsed.err);
+    }
+    loopSettings = parsed.settings;
+  }
+  const isWarped = isWarpedRaw;
+
+  const resolved = resolveOrFail(ctx, location);
+  if (!resolved.ok) {
+    return err(call, resolved.err);
+  }
+  const className = resolved.resolved.className;
+  const obj = resolved.resolved.object as unknown as Record<string, unknown>;
+  const canonicalRef = resolved.resolved.canonicalRef;
+
+  if (typeof obj["createAudioClip"] !== "function") {
+    return err(
+      call,
+      unsupported(
+        `"${location}" (${className}) cannot create an audio clip`,
+        "target an audio track, a clip slot, or a take lane"
+      )
+    );
+  }
+
+  // Session slot: no time args (the slot defines the position).
+  if (className === "ClipSlot") {
+    const args: {
+      filePath: string;
+      isWarped?: boolean;
+      loopSettings?: ParsedLoopSettings;
+    } = { filePath };
+    if (isWarped !== undefined) {
+      args.isWarped = isWarped;
+    }
+    if (loopSettings !== undefined) {
+      args.loopSettings = loopSettings;
+    }
+    return asyncPlan(
+      () =>
+        (
+          obj as unknown as {
+            createAudioClip(a: typeof args): Promise<unknown>;
+          }
+        ).createAudioClip(args),
+      () =>
+        ok(
+          call.id,
+          {
+            created: "audio clip",
+            location: canonicalRef,
+            filePath,
+            hint: "re-read the clip slot to ground the new clip ref",
+          },
+          "create audio clip"
+        )
+    );
+  }
+
+  // Arrangement audio clip on an audio track or take lane: needs startTime.
+  const startTime = readNumber(call.input, "startTime");
+  if (startTime === null) {
+    return err(
+      call,
+      invalidArgs("arrangement audio clip needs numeric 'startTime' (beats)")
+    );
+  }
+  const duration = optNumber(call.input, "duration");
+  if (duration === null || (duration !== undefined && duration <= 0)) {
+    return err(
+      call,
+      invalidArgs("'duration' must be a positive number (beats) when provided")
+    );
+  }
+  const args: {
+    filePath: string;
+    startTime: number;
+    duration?: number;
+    isWarped?: boolean;
+    loopSettings?: ParsedLoopSettings;
+  } = { filePath, startTime };
+  if (duration !== undefined) {
+    args.duration = duration;
+  }
+  if (isWarped !== undefined) {
+    args.isWarped = isWarped;
+  }
+  if (loopSettings !== undefined) {
+    args.loopSettings = loopSettings;
+  }
+  return asyncPlan(
+    () =>
+      (
+        obj as unknown as {
+          createAudioClip(a: typeof args): Promise<unknown>;
+        }
+      ).createAudioClip(args),
+    () =>
+      ok(
+        call.id,
+        {
+          created: "audio clip",
+          location: canonicalRef,
+          filePath,
+          hint: "re-read the location to ground the new clip ref",
+        },
+        "create audio clip"
       )
   );
 }
@@ -1539,15 +1826,79 @@ export function prepareModifyDeviceChain<V extends ApiVersion>(
 }
 
 // ---------------------------------------------------------------------------
-// live_replace_sample (deferred to Phase 14)
+// live_replace_sample (§8.2, §14)
 // ---------------------------------------------------------------------------
 
 /**
- * `live_replace_sample` — DEFERRED to Phase 14 (audio tooling, §8.2/§14). Returns
- * the honest deferred payload (`isError: true`); never a fake success (§9).
+ * `live_replace_sample` — swap the sample loaded in a Simpler device (§8.2, §14).
+ * Re-resolves the `simpler` ref FRESH (§6); the resolved object MUST be a
+ * `Simpler` (`className === "Simpler"`) — any other device is refused with a
+ * structured `unsupported`, never a fake success (§9). `filePath` (a managed
+ * path) is required. Launches `Simpler.replaceSample(filePath)` via
+ * {@link asyncPlan} — exactly one transaction, no `await` inside the callback
+ * (§7).
  */
-export function prepareReplaceSample(call: ToolCall): Prepared {
-  return deferPrepared(call, "live_replace_sample");
+export function prepareReplaceSample<V extends ApiVersion>(
+  ctx: ExtensionContext<V>,
+  call: ToolCall
+): Prepared {
+  if (!isRecord(call.input)) {
+    return err(
+      call,
+      invalidArgs("expected an object with 'simpler' and 'filePath'")
+    );
+  }
+  const ref = readString(call.input, "simpler");
+  if (ref === null) {
+    return err(call, invalidArgs("'simpler' must be a ref string"));
+  }
+  const filePath = readString(call.input, "filePath");
+  if (filePath === null || filePath.trim() === "") {
+    return err(call, invalidArgs("'filePath' must be a non-empty string"));
+  }
+  const resolved = resolveOrFail(ctx, ref);
+  if (!resolved.ok) {
+    return err(call, resolved.err);
+  }
+  if (resolved.resolved.className !== Simpler.className) {
+    return err(
+      call,
+      unsupported(
+        `"${ref}" (${resolved.resolved.className}) is not a Simpler device`,
+        "target a Simpler device to replace its sample"
+      )
+    );
+  }
+  const canonicalRef = resolved.resolved.canonicalRef;
+  const simpler = resolved.resolved.object as unknown as Simpler<V>;
+  // `replaceSample` can only swap an ALREADY-loaded sample; the SDK has no way to
+  // load one into an empty Simpler (`insertDevice("Simpler")` yields `sample === null`).
+  // `get sample()` is a sync getter (no Promise / getValue fan-out), so reading it
+  // here in the prepare phase matches the existing sync-validation style. Fail loudly
+  // up front (§9) rather than opening a transaction that the SDK will roll back.
+  if (simpler.sample === null) {
+    return err(
+      call,
+      unsupported(
+        "this Simpler has no sample loaded; the SDK's replaceSample can only replace an already-loaded sample, it cannot load a sample into an empty Simpler",
+        "place the audio as a clip with live_create_clip, or ask the user to drag the imported file onto the Simpler in Live"
+      )
+    );
+  }
+  return asyncPlan(
+    () => simpler.replaceSample(filePath),
+    () =>
+      ok(
+        call.id,
+        {
+          replaced: "sample",
+          device: canonicalRef,
+          filePath,
+          hint: "re-read the device to ground the new sample",
+        },
+        "replace sample"
+      )
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1775,15 +2126,228 @@ function topTrackRefOf(ref: string): string | null {
 }
 
 // ---------------------------------------------------------------------------
-// live_import_audio (deferred to Phase 14)
+// live_import_audio (§8.3, §10, §14)
 // ---------------------------------------------------------------------------
 
+/** Discriminated outcome of the import side-effect (never throws to the batch). */
+type ImportOutcome =
+  | { ok: true; managedPath: string }
+  | { ok: false; err: ExecutorError };
+
+/** True for an `http(s)` URL source (everything else is treated as a local path). */
+function isHttpUrl(source: string): boolean {
+  return /^https?:\/\//i.test(source);
+}
+
 /**
- * `live_import_audio` — DEFERRED to Phase 14 (audio tooling, §8.3/§14). Returns
- * the honest deferred payload; never a fake success/path (§9).
+ * Derive a safe temp filename for a downloaded URL: the URL path's basename when
+ * it has one, else a timestamped fallback. Only the basename is used so the write
+ * stays inside `tempDirectory` (§10 — never write outside temp/storage).
  */
-export function prepareImportAudio(call: ToolCall): Prepared {
-  return deferPrepared(call, "live_import_audio");
+function tempFileNameForUrl(source: string): string {
+  try {
+    const parsed = new URL(source);
+    const base = basename(parsed.pathname);
+    if (base && base !== "/" && base.trim() !== "") {
+      return base;
+    }
+  } catch {
+    // fall through to the timestamped fallback
+  }
+  return `import-${Date.now()}.audio`;
+}
+
+/**
+ * Negative non-audio guard for the URL branch (§9 honesty): reject responses that
+ * are CLEARLY not audio so a landing/anti-bot HTML page can't be written to a
+ * `.wav` and silently "imported". This is intentionally a NEGATIVE check — it
+ * never allowlists audio magic, so valid formats Live supports are not rejected.
+ *
+ * Two signals:
+ *  1. content-type contains `html`/`xml`/`json` or starts with `text/` (lowercased).
+ *  2. the first non-whitespace body byte is `<` (HTML/XML markup) or `{` (a JSON
+ *     error body) — more robust when a server sends the wrong content-type.
+ *
+ * @returns a human-readable reason when the response looks non-audio, else `null`.
+ */
+function looksLikeNonAudio(
+  contentType: string | null,
+  bytes: Buffer
+): string | null {
+  if (contentType !== null) {
+    const ct = contentType.toLowerCase();
+    if (
+      ct.startsWith("text/") ||
+      ct.includes("html") ||
+      ct.includes("xml") ||
+      ct.includes("json")
+    ) {
+      return `content-type "${contentType}"`;
+    }
+  }
+  for (const byte of bytes) {
+    // Skip leading ASCII whitespace: space, tab, LF, CR, FF, VT.
+    if (
+      byte === 0x20 ||
+      byte === 0x09 ||
+      byte === 0x0a ||
+      byte === 0x0d ||
+      byte === 0x0c ||
+      byte === 0x0b
+    ) {
+      continue;
+    }
+    if (byte === 0x3c /* `<` */ || byte === 0x7b /* `{` */) {
+      return "body begins with markup";
+    }
+    break;
+  }
+  return null;
+}
+
+/**
+ * `live_import_audio` — import a local path or an `http(s)` URL into the project,
+ * returning the SDK-managed path (§8.3). Classified as a **mutation** (it changes
+ * project state), but `importIntoProject` is a file-copy side effect, not an
+ * undoable model edit, so its `asyncPlan` transaction batches no model change —
+ * that is expected and honest (the finalize hint says the agent then passes the
+ * returned managed path to `live_create_clip`).
+ *
+ * Routing:
+ *  - **URL** (`http(s)`): requires `environment.tempDirectory` (else an honest
+ *    `no_temp_dir` error). Inside the launched async op: `fetch` the URL, check
+ *    `res.ok` (else `network_error`), write the bytes ONLY under `tempDirectory`
+ *    (§10), then `importIntoProject(tempPath)`.
+ *  - **local path**: `importIntoProject(source)` directly (the SDK reads the file).
+ *
+ * Error discipline (§9): the launched op NEVER throws — it catches fetch/fs/SDK
+ * failures and RESOLVES to a discriminated {@link ImportOutcome}, which `finalize`
+ * maps to `ok()`/`fail()`. So a network failure yields a precise structured error
+ * and does NOT fail sibling mutations in the same batch.
+ */
+export function prepareImportAudio<V extends ApiVersion>(
+  ctx: ExtensionContext<V>,
+  call: ToolCall
+): Prepared {
+  if (!isRecord(call.input)) {
+    return err(call, invalidArgs("expected an object with a 'source'"));
+  }
+  const source = readString(call.input, "source");
+  if (source === null || source.trim() === "") {
+    return err(call, invalidArgs("'source' must be a non-empty path or URL"));
+  }
+
+  const finalize = (resolved: unknown): ToolResultPayload => {
+    const outcome = resolved as ImportOutcome;
+    if (!outcome.ok) {
+      return fail(call.id, outcome.err, "import audio");
+    }
+    return ok(
+      call.id,
+      {
+        managedPath: outcome.managedPath,
+        source,
+        hint: "pass managedPath as live_create_clip's filePath to place the audio",
+      },
+      "import audio"
+    );
+  };
+
+  if (isHttpUrl(source)) {
+    const tempDirectory = ctx.environment.tempDirectory;
+    if (tempDirectory === undefined) {
+      return err(call, {
+        error: "no_temp_dir",
+        detail: "no temp directory is available to download the URL into",
+        hint: "import a local file path instead, or run with a storage/temp dir configured",
+      });
+    }
+    const launch = async (): Promise<ImportOutcome> => {
+      try {
+        const res = await fetch(source);
+        if (!res.ok) {
+          return {
+            ok: false,
+            err: {
+              error: "network_error",
+              detail: `download failed: HTTP ${res.status} ${res.statusText}`,
+              hint: "check the URL is a reachable, public audio file",
+            },
+          };
+        }
+        const bytes = Buffer.from(await res.arrayBuffer());
+        const nonAudio = looksLikeNonAudio(
+          res.headers.get("content-type"),
+          bytes
+        );
+        if (nonAudio !== null) {
+          return {
+            ok: false,
+            err: {
+              error: "not_audio",
+              detail: `the URL returned a non-audio response (${nonAudio}), not an audio file`,
+              hint: "check the link is a DIRECT download to an audio file — its URL usually ends in .wav/.aif/.mp3 and downloads immediately in a browser (landing/anti-bot pages return HTML)",
+            },
+          };
+        }
+        const tempPath = join(tempDirectory, tempFileNameForUrl(source));
+        // `tempDirectory` is only a path STRING from `--temp-directory`; nothing
+        // physically creates it, so ensure the parent exists before writing (the
+        // established `mkdirSync(dir, { recursive: true })` pattern — see
+        // config-store.ts / transport/transcript-store.ts) or `writeFileSync`
+        // throws ENOENT. mkdir of the temp dir itself stays within §10.
+        try {
+          mkdirSync(tempDirectory, { recursive: true });
+          writeFileSync(tempPath, bytes);
+        } catch (e) {
+          return {
+            ok: false,
+            err: {
+              error: "write_failed",
+              detail: `writing the downloaded file to the temp directory failed: ${errorMessage(e)}`,
+              hint: "check the temp directory is writable",
+            },
+          };
+        }
+        const managedPath = await ctx.resources.importIntoProject(tempPath);
+        return { ok: true, managedPath };
+      } catch (e) {
+        return {
+          ok: false,
+          err: sdkError(`import from URL failed: ${errorMessage(e)}`),
+        };
+      }
+    };
+    return {
+      kind: "plan",
+      plan: {
+        run() {
+          return { promise: launch(), finalize };
+        },
+      },
+    };
+  }
+
+  // Local path: hand the path to the SDK (it reads the file; §8.3/§10).
+  const launchLocal = async (): Promise<ImportOutcome> => {
+    try {
+      const managedPath = await ctx.resources.importIntoProject(source);
+      return { ok: true, managedPath };
+    } catch (e) {
+      return {
+        ok: false,
+        err: sdkError(`import of "${source}" failed: ${errorMessage(e)}`),
+      };
+    }
+  };
+  return {
+    kind: "plan",
+    plan: {
+      run() {
+        return { promise: launchLocal(), finalize };
+      },
+    },
+  };
 }
 
 // Keep the SDK class imports referenced for the type-narrowing casts above so the

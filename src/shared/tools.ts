@@ -154,8 +154,10 @@ export interface LiveGetDeviceParamsArgs {
 
 /**
  * `live_render_audio` — pre-FX render of an AudioTrack region to a temp WAV
- * (§8.1, §14). `startTime`/`endTime` are in **beats** (§16); the executor
- * converts to the seconds the render API needs.
+ * (§8.1, §14). `startTime`/`endTime` are in **beats** (§16) and are passed
+ * STRAIGHT THROUGH to the render API, which is itself beats-native — no
+ * seconds conversion happens at the SDK boundary. (The executor reports a
+ * convenience `durationSeconds` derived from the span and tempo.)
  */
 export interface LiveRenderAudioArgs {
   /** Ref to the audio track to render. */

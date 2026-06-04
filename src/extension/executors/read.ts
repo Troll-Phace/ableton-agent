@@ -20,25 +20,33 @@
  * eagerly across the whole Set.
  */
 
-import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
+import type {
+  ApiVersion,
+  AudioTrack,
+  ExtensionContext,
+} from "@ableton-extensions/sdk";
 
 import type { ToolCall, ToolResultPayload } from "../agent-loop.js";
 import type {
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
   LiveGetTrackArgs,
+  LiveRenderAudioArgs,
   ReportLimitationArgs,
 } from "../../shared/tools.js";
 import {
-  deferred,
+  beatsToSeconds,
   errorMessage,
   fail,
   invalidArgs,
   isRecord,
   ok,
   optString,
+  readNumber,
   readString,
   resolveOrFail,
+  sdkError,
+  unsupported,
   type Resolved,
 } from "./shared.js";
 
@@ -441,16 +449,105 @@ export async function executeGetDeviceParams<V extends ApiVersion>(
 }
 
 // ---------------------------------------------------------------------------
-// live_render_audio (deferred to Phase 14)
+// live_render_audio (§8.1, §14, §16)
 // ---------------------------------------------------------------------------
 
 /**
- * `live_render_audio` — schema is registered but the body is DEFERRED to Phase 14
- * (§8.1, §14). Returns the honest deferred payload (`isError: true`); never a fake
- * success or a fake WAV path (§9).
+ * True if a resolver `className` denotes an **audio** track. Render is
+ * AudioTrack-only (the SDK's `renderPreFxAudio` takes an `AudioTrack`), so a
+ * `MidiTrack` — or the base `"Track"` fallback the test fake reports for
+ * generic tracks — is refused. The real SDK reports the concrete subtype.
  */
-export function executeRenderAudio(call: ToolCall): ToolResultPayload {
-  return deferred(call.id, "live_render_audio");
+function isAudioTrackClass(className: string): boolean {
+  return className === "AudioTrack";
+}
+
+/**
+ * `live_render_audio` — render a region of an AudioTrack to a temporary pre-FX
+ * WAV and return its path (§8.1, §14). A READ tool: it runs immediately in the
+ * read partition and opens NO transaction (the render is a side-effecting read,
+ * not an undoable model edit).
+ *
+ * The `track` ref is re-resolved FRESH (§6); it must resolve to an `AudioTrack`
+ * (a `MidiTrack` is refused with a structured `unsupported`, never a fake path,
+ * §9). `startTime`/`endTime` cross the boundary in **beats** (§16) and are passed
+ * STRAIGHT THROUGH to `renderPreFxAudio` (which is itself beats-native) — no
+ * seconds conversion happens at the SDK boundary. The reported `durationSeconds`
+ * is a convenience derived from the rendered span and the song tempo (§16). The
+ * SDK call is wrapped in try/catch → structured `sdk_error`; it never throws (§9).
+ */
+export async function executeRenderAudio<V extends ApiVersion>(
+  ctx: ExtensionContext<V>,
+  call: ToolCall
+): Promise<ToolResultPayload> {
+  if (!isRecord(call.input)) {
+    return fail(
+      call.id,
+      invalidArgs("expected an object with 'track', 'startTime', 'endTime'")
+    );
+  }
+  const ref = readString(call.input, "track");
+  if (ref === null) {
+    return fail(call.id, invalidArgs("'track' must be a ref string"));
+  }
+  const startTime = readNumber(call.input, "startTime");
+  if (startTime === null) {
+    return fail(
+      call.id,
+      invalidArgs("'startTime' must be a finite number (beats)")
+    );
+  }
+  const endTime = readNumber(call.input, "endTime");
+  if (endTime === null) {
+    return fail(
+      call.id,
+      invalidArgs("'endTime' must be a finite number (beats)")
+    );
+  }
+  if (endTime <= startTime) {
+    return fail(
+      call.id,
+      invalidArgs("'endTime' must be greater than 'startTime' (beats)")
+    );
+  }
+  const resolved = resolveOrFail(ctx, ref);
+  if (!resolved.ok) {
+    return fail(call.id, resolved.err);
+  }
+  if (!isAudioTrackClass(resolved.resolved.className)) {
+    return fail(
+      call.id,
+      unsupported(
+        `render needs an audio track; "${ref}" resolved to ${resolved.resolved.className}`,
+        "target an AudioTrack; MIDI tracks carry no renderable pre-FX audio"
+      )
+    );
+  }
+  try {
+    // Pass beats straight through — `renderPreFxAudio` is beats-native (§16).
+    const path = await ctx.resources.renderPreFxAudio(
+      resolved.resolved.object as unknown as AudioTrack<V>,
+      startTime,
+      endTime
+    );
+    const tempo = getNumber(ctx.application.song, "tempo") ?? 120;
+    return ok(
+      call.id,
+      {
+        path,
+        track: resolved.resolved.canonicalRef,
+        startBeats: startTime,
+        endBeats: endTime,
+        durationSeconds: beatsToSeconds(endTime - startTime, tempo),
+      },
+      "render audio"
+    );
+  } catch (e) {
+    return fail(
+      call.id,
+      sdkError(`render of "${ref}" failed: ${errorMessage(e)}`)
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -508,6 +605,7 @@ export type {
   LiveGetTrackArgs,
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
+  LiveRenderAudioArgs,
   ReportLimitationArgs,
   Resolved,
 };
