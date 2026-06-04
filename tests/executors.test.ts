@@ -14,7 +14,9 @@ import type {
 } from "../src/extension/agent-loop.js";
 import {
   makeFakeContext,
+  type AbstractCtor,
   type FakeExtensionContext,
+  type Handle,
   type NodeSpec,
   type SetSpec,
   type FakeNoteDescription,
@@ -132,6 +134,23 @@ function call(name: string, input: unknown, id = `id_${name}`): ToolCall {
 /** Parse a payload's JSON content. */
 function body(p: ToolResultPayload): Record<string, unknown> {
   return JSON.parse(p.content as string) as Record<string, unknown>;
+}
+
+/**
+ * Pin the resolver seam so the handle with `id` always re-resolves to `instance`.
+ * The runtime re-resolves a fresh object every call (§6), so to spy on the exact
+ * SDK method an executor invokes we route that handle to a captured, spied
+ * instance; every other handle falls through to the real factory. Type-safe (no
+ * `any`): matches the fake's `getObjectFromHandle<T>(handle, type)` signature.
+ */
+function routeHandleTo(
+  fake: FakeExtensionContext,
+  id: bigint,
+  instance: unknown
+): void {
+  const raw = fake.getObjectFromHandle.bind(fake);
+  fake.getObjectFromHandle = <T>(handle: Handle, type: AbstractCtor<T>): T =>
+    handle.id === id ? (instance as T) : raw(handle, type);
 }
 
 /** A MixerDevice spec with named volume/pan and the given send names. */
@@ -1566,9 +1585,18 @@ describe("mutation executors — live_insert_device", () => {
 });
 
 describe("mutation executors — live_modify_device_chain", () => {
-  it("executor_modifyChain_duplicate_copiesDevice", async () => {
+  // op=duplicate, TRACK host: Track.duplicateDevice is the SDK method, the copy
+  // lands in the TRACK's device list (additive — no deletion), exactly ONE undo
+  // step, and the result carries the additive shape + the re-read/fresh-ref hint.
+  it("executor_modifyChain_duplicateOnTrackHost_callsTrackDuplicateDevice", async () => {
     const fake = tagged(makeFakeContext());
-    const before = fake.application.song.tracks[1].devices.length;
+    const track = fake.application.song.tracks[1];
+    const before = track.devices.length;
+    const spy = vi.spyOn(track, "duplicateDevice");
+    // Re-resolution mints a fresh host object per call (§6), so pin the resolver
+    // seam to route the Bass-track handle to OUR spied instance.
+    routeHandleTo(fake, track.handle.id, track);
+
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_modify_device_chain", {
         location: "track:1:Bass",
@@ -1576,15 +1604,82 @@ describe("mutation executors — live_modify_device_chain", () => {
         device: "track:1:Bass/device:0:Reverb",
       }),
     ]);
+
     expect(r.isError).toBeUndefined();
-    expect(body(r).duplicated).toContain("device:0:Reverb");
+    // The exact SDK method ran, on the right host, with the resolved device.
+    expect(spy).toHaveBeenCalledTimes(1);
+    // Additive result shape: a `duplicated`/`host` pair, NO `deleted`/`destructive`.
+    const data = body(r);
+    expect(data.duplicated).toContain("device:0:Reverb");
+    expect(data.host).toBe("track:1:Bass");
+    expect(data.deleted).toBeUndefined();
+    expect(data.destructive).toBeUndefined();
+    // Fresh-ref hint present so the agent re-grounds (§6).
+    expect(String(data.hint)).toMatch(/re-read|ground/i);
+    // Live: the copy landed on the TRACK, not elsewhere; exactly one undo step.
     expect(fake.application.song.tracks[1].devices.length).toBe(before + 1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
   });
 
-  it("executor_modifyChain_insertChain_addsChainToRack", async () => {
+  // op=duplicate, CHAIN host (a device inside a rack's chain): Chain.duplicateDevice
+  // is the SDK method, and the copy lands in the CHAIN's device list — NOT the
+  // track's — proving the host is resolved to the chain, not the owning track.
+  it("executor_modifyChain_duplicateOnChainHost_callsChainDuplicateDevice", async () => {
+    const fake = tagged(makeFakeContext());
+    const chainRef = "track:1:Bass/device:1:Rack/chain:0:Chain A";
+    const deviceRef = `${chainRef}/device:0:AutoFilter`;
+    const chain = fake.application.song.tracks[1].devices[1].chains![0];
+    const beforeChainDevices = chain.devices.length;
+    const beforeTrackDevices = fake.application.song.tracks[1].devices.length;
+    const spy = vi.spyOn(chain, "duplicateDevice");
+    // Route the chain handle to OUR spied instance through the resolver seam.
+    routeHandleTo(fake, chain.handle.id, chain);
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_modify_device_chain", {
+        location: chainRef,
+        op: "duplicate",
+        device: deviceRef,
+      }),
+    ]);
+
+    expect(r.isError).toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(1);
+    const data = body(r);
+    expect(data.duplicated).toContain("device:0:AutoFilter");
+    expect(data.host).toBe(chainRef);
+    expect(String(data.hint)).toMatch(/re-read|ground/i);
+    // The copy went into the CHAIN's device list; the track's own list is untouched.
+    const chainAfter =
+      fake.application.song.tracks[1].devices[1].chains![0].devices.length;
+    expect(chainAfter).toBe(beforeChainDevices + 1);
+    expect(fake.application.song.tracks[1].devices.length).toBe(
+      beforeTrackDevices
+    );
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
+  });
+
+  // op=insert_chain on a RackDevice: RackDevice.insertChain(index) is the SDK
+  // method, exactly ONE undo step, additive result + fresh-ref hint.
+  it("executor_modifyChain_insertChainOnRack_callsRackInsertChain", async () => {
     const fake = tagged(makeFakeContext());
     const rack = fake.application.song.tracks[1].devices[1];
     const before = rack.chains?.length ?? 0;
+    // `insertChain` is present only on rack nodes (optional on the device type);
+    // assert it exists before spying so the spy target is non-optional.
+    if (rack.insertChain === undefined) {
+      throw new Error(
+        "fixture invariant: device:1:Rack must expose insertChain"
+      );
+    }
+    const spy = vi.spyOn(
+      rack as Required<Pick<typeof rack, "insertChain">> & typeof rack,
+      "insertChain"
+    );
+    routeHandleTo(fake, rack.handle.id, rack);
+
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_modify_device_chain", {
         location: "track:1:Bass/device:1:Rack",
@@ -1592,15 +1687,30 @@ describe("mutation executors — live_modify_device_chain", () => {
         index: 0,
       }),
     ]);
+
     expect(r.isError).toBeUndefined();
-    expect(body(r).insertedChainInto).toContain("device:1:Rack");
+    // insertChain was called with the requested index.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(0);
+    const data = body(r);
+    expect(data.insertedChainInto).toContain("device:1:Rack");
+    expect(data.index).toBe(0);
+    expect(data.deleted).toBeUndefined();
+    expect(data.destructive).toBeUndefined();
+    expect(String(data.hint)).toMatch(/re-read|ground/i);
     const after =
       fake.application.song.tracks[1].devices[1].chains?.length ?? 0;
     expect(after).toBe(before + 1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
   });
 
-  it("executor_modifyChain_insertChainOnNonRack_returnsUnsupported", async () => {
+  // Honesty path: insert_chain on a NON-rack device must be a structured
+  // `unsupported` error — never a fake success — and must open NO transaction.
+  it("executor_modifyChain_insertChainOnNonRack_returnsUnsupportedNoTxn", async () => {
     const fake = tagged(makeFakeContext());
+    const reverb = fake.application.song.tracks[1].devices[0];
+    expect(reverb.chains).toBeUndefined(); // pre-state: not a rack.
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_modify_device_chain", {
         location: "track:1:Bass/device:0:Reverb",
@@ -1610,6 +1720,11 @@ describe("mutation executors — live_modify_device_chain", () => {
     ]);
     expect(r.isError).toBe(true);
     expect(body(r).error).toBe("unsupported");
+    // No transaction was opened for a rejected op (§7 — validate before commit).
+    expect(fake.transactions).toEqual([]);
+    expect(fake.committedCount).toBe(0);
+    // The non-rack device is unchanged.
+    expect(fake.application.song.tracks[1].devices[0].chains).toBeUndefined();
   });
 
   it("executor_modifyChain_badOp_returnsInvalidArgs", async () => {
@@ -1622,6 +1737,7 @@ describe("mutation executors — live_modify_device_chain", () => {
     ]);
     expect(r.isError).toBe(true);
     expect(body(r).error).toBe("invalid_args");
+    expect(fake.transactions).toEqual([]);
   });
 });
 
