@@ -198,6 +198,16 @@ export interface FakeSong extends FakeObject {
   readonly scenes: FakeScene[];
   readonly cuePoints: FakeCuePoint[];
   tempo: number;
+  /**
+   * Project-header scale/grid getters read by `live_get_project` (§8.1). Each is
+   * `null` unless explicitly seeded via {@link SetSpec}, mirroring the executor's
+   * "unseeded getter reads as null" contract and keeping existing tests green.
+   */
+  readonly scaleName: string | null;
+  readonly scaleMode: boolean | null;
+  readonly rootNote: number | null;
+  readonly gridQuantization: number | null;
+  readonly gridIsTriplet: boolean | null;
   createAudioTrack(): Promise<FakeTrack>;
   createMidiTrack(): Promise<FakeMidiTrack>;
   createScene(index: number): Promise<FakeScene>;
@@ -385,6 +395,17 @@ export interface NodeSpec {
 /** Spec for the whole Set passed to {@link makeFakeContext}. */
 export interface SetSpec {
   tempo?: number;
+  /**
+   * Project-header scale/grid fields read by `live_get_project` (§8.1). All are
+   * optional and, when omitted, the fake `song` getter reads as `null` (the
+   * executor's unseeded-getter contract) — so leaving them unset never changes a
+   * current assertion. Seed any of them to make `live_get_project` return it.
+   */
+  scaleName?: string;
+  scaleMode?: boolean;
+  rootNote?: number;
+  gridQuantization?: number;
+  gridIsTriplet?: boolean;
   tracks?: NodeSpec[];
   returnTracks?: NodeSpec[];
   mainTrack?: NodeSpec;
@@ -1279,6 +1300,23 @@ export function makeFakeContext(
         tempoState.value = prev;
       });
       tempoState.value = value;
+    },
+    // Project-header scale/grid getters: return the seeded value or `null` when
+    // unseeded (matching the executor's unseeded-getter contract; §8.1).
+    get scaleName() {
+      return filled.scaleName ?? null;
+    },
+    get scaleMode() {
+      return filled.scaleMode ?? null;
+    },
+    get rootNote() {
+      return filled.rootNote ?? null;
+    },
+    get gridQuantization() {
+      return filled.gridQuantization ?? null;
+    },
+    get gridIsTriplet() {
+      return filled.gridIsTriplet ?? null;
     },
     createAudioTrack(): Promise<FakeTrack> {
       return Promise.resolve().then(() =>

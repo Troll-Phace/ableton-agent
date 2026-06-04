@@ -53,8 +53,21 @@ import {
   TransportServer,
   type TransportStartInfo,
 } from "../src/extension/transport/server.js";
+import { buildSnapshot } from "../src/extension/snapshot.js";
+import {
+  refFromHandle,
+  type ClassTokens,
+} from "../src/extension/references.js";
 
-import { makeFakeContext } from "./fixtures/fake-extension-context.js";
+import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
+
+import type Anthropic from "@anthropic-ai/sdk";
+
+import {
+  FakeClass,
+  makeFakeContext,
+  type FakeExtensionContext,
+} from "./fixtures/fake-extension-context.js";
 
 /** Absolute path to the served SPA fixture (passed as `webviewPath`). */
 const WEBVIEW_FIXTURE = new URL("./fixtures/webview-stub.html", import.meta.url)
@@ -1334,6 +1347,414 @@ describe("chatSession_confirmation_roundTrip", () => {
 });
 
 /* -------------------------------------------------------------------------- */
+/* 10b. Session glue — "New chat" / clear-conversation (new_chat, §13)          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Typed view of the session's private conversation state. `transcript` and
+ * `sessionId` are private fields; reading them through this narrow accessor (no
+ * `any`) is the least-invasive seam to assert the in-memory reset that
+ * `handleNewChat` performs — exactly as §10's confirmation tests reach
+ * `buildRequestConfirmation` through a typed view of the same instance.
+ */
+interface SessionStateAccess {
+  transcript: Anthropic.MessageParam[];
+  sessionId: string;
+}
+
+/** Read the session's private `transcript` (in-memory, the array the loop grows). */
+function transcriptOf(session: unknown): Anthropic.MessageParam[] {
+  return (session as SessionStateAccess).transcript;
+}
+
+/** Read the session's private `sessionId` (the persisted file stem). */
+function sessionIdOf(session: unknown): string {
+  return (session as SessionStateAccess).sessionId;
+}
+
+/**
+ * Drives the REAL `handleNewChat` path over the `ws` client against a
+ * `ChatSession`. Proves the §13 `new_chat` contract end-to-end:
+ *  - the in-memory transcript is reset to empty (the NEXT turn starts fresh);
+ *  - `sessionId` is re-minted, and the prior conversation's `sessions/<oldId>.json`
+ *    file still EXISTS on disk afterward (the old thread is left untouched);
+ *  - an in-flight turn's AbortSignal trips (same as `cancel`);
+ *  - a pending confirmation settles false (no hang, no extra frames);
+ *  - NO outbound frame is emitted, and the key never leaks (over every frame).
+ *
+ * `new_chat` carries an empty payload (like `cancel`/`ready`), so the round-trip
+ * itself is covered by `protocol.test.ts`; here we exercise the session handler.
+ */
+describe("chatSession_newChat_clearsConversation", () => {
+  /** Per-test temp storage dir for the session's transcript files. */
+  let storageDir: string;
+
+  beforeEach(() => {
+    storageDir = mkdtempSync(join(tmpdir(), "abl-newchat-"));
+  });
+
+  afterEach(() => {
+    rmSync(storageDir, { recursive: true, force: true });
+  });
+
+  /** A fake context with a real temp `storageDirectory` wired into env. */
+  function fakeCtxWithStorage(
+    dir: string | undefined
+  ): ConstructorParameters<typeof ChatSession>[0] {
+    return makeFakeContext(undefined, {
+      storageDirectory: dir,
+    }) as unknown as ConstructorParameters<typeof ChatSession>[0];
+  }
+
+  /** A fake context with no storage dir (transcript persistence no-ops). */
+  function fakeCtx(): ConstructorParameters<typeof ChatSession>[0] {
+    return makeFakeContext() as unknown as ConstructorParameters<
+      typeof ChatSession
+    >[0];
+  }
+
+  /**
+   * A scripted runner that appends one user + one assistant message and returns
+   * the grown transcript — so a completed turn leaves a non-empty transcript the
+   * `new_chat` handler can then reset.
+   */
+  const growTurn = (args: TurnRunArgs): Promise<TurnRunResult> => {
+    const grown: typeof args.transcript = [
+      ...args.transcript,
+      { role: "user", content: args.text },
+      { role: "assistant", content: "a-reply" },
+    ];
+    args.events.assistantDone("end_turn");
+    return Promise.resolve({ ok: true, messages: grown, refs: [] });
+  };
+
+  it("chatSession_newChat_resetsTranscriptSoNextTurnStartsEmpty", async () => {
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn: growTurn });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    // Run one turn → the transcript now carries the user + assistant messages.
+    socket.send(
+      serialize(message("user_message", { text: "hello" }, "id-nc1"))
+    );
+    await collector.until((f) => f.some((m) => m.type === "refs_updated"));
+    expect(transcriptOf(session)).toHaveLength(2);
+
+    // New chat → the in-memory transcript resets to empty.
+    socket.send(serialize(message("new_chat", {}, "id-nc2")));
+    await waitFor(() => transcriptOf(session).length === 0);
+    expect(transcriptOf(session)).toEqual([]);
+
+    // The FOLLOWING turn starts from that empty transcript: the runner grows it
+    // from zero, so it ends with exactly the new turn's 2 messages (no carryover).
+    socket.send(
+      serialize(message("user_message", { text: "fresh" }, "id-nc3"))
+    );
+    await collector.until(
+      (f) => f.filter((m) => m.type === "refs_updated").length >= 2
+    );
+    const after = transcriptOf(session);
+    expect(after).toHaveLength(2);
+    const firstUser = after[0];
+    if (typeof firstUser.content === "string") {
+      // The new turn's first message is "fresh" — the prior "hello" is gone.
+      expect(firstUser.content).toBe("fresh");
+    }
+  });
+
+  it("chatSession_newChat_mintsNewSessionIdOldFilePersistsNewTurnWritesNewFile", async () => {
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtxWithStorage(storageDir), server, {
+      runTurn: growTurn,
+    });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    // Turn 1 persists the transcript under the ORIGINAL sessionId.
+    const oldId = sessionIdOf(session);
+    socket.send(serialize(message("user_message", { text: "one" }, "id-o1")));
+    await collector.until((f) => f.some((m) => m.type === "refs_updated"));
+    const oldFile = join(storageDir, "sessions", `${oldId}.json`);
+    await waitFor(() => existsSync(oldFile));
+    expect(existsSync(oldFile)).toBe(true);
+
+    // New chat → sessionId is re-minted (different from the old one).
+    socket.send(serialize(message("new_chat", {}, "id-o2")));
+    await waitFor(() => sessionIdOf(session) !== oldId);
+    const newId = sessionIdOf(session);
+    expect(newId).not.toBe(oldId);
+
+    // A turn on the new session writes a NEW file under the new id…
+    socket.send(serialize(message("user_message", { text: "two" }, "id-o3")));
+    await collector.until(
+      (f) => f.filter((m) => m.type === "refs_updated").length >= 2
+    );
+    const newFile = join(storageDir, "sessions", `${newId}.json`);
+    await waitFor(() => existsSync(newFile));
+
+    // …and the OLD conversation's file is STILL on disk (left untouched). The two
+    // files are distinct, so the prior thread is recoverable until superseded.
+    expect(existsSync(oldFile)).toBe(true);
+    expect(existsSync(newFile)).toBe(true);
+    expect(newFile).not.toBe(oldFile);
+
+    // The old file still holds the original turn's 2 messages (not overwritten).
+    const oldBody: unknown = JSON.parse(readFileSync(oldFile, "utf8"));
+    expect(Array.isArray(oldBody)).toBe(true);
+    expect(oldBody as unknown[]).toHaveLength(2);
+  });
+
+  it("chatSession_newChatWhileTurnInFlight_tripsSignalAbortedLikeCancel", async () => {
+    const started = deferred<void>();
+    const finished = deferred<void>();
+    let sawAborted = false;
+    // By-reference runner (mirrors how the real loop aliases `args.transcript`):
+    // it grows the SAME array the session holds, then parks on the signal. After
+    // new_chat trips the signal it returns that same (grown) array — the session
+    // MUST discard it (epoch guard) and leave `transcript` reset to `[]`.
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      args.transcript.push({ role: "user", content: args.text });
+      args.transcript.push({ role: "assistant", content: "in-progress" });
+      started.resolve();
+      // Park on the signal the session owns; resume ONLY once new_chat trips it.
+      await onceAborted(args.signal);
+      sawAborted = args.signal.aborted;
+      finished.resolve();
+      return {
+        ok: true,
+        messages: args.transcript,
+        refs: [],
+        // ran:false → short-circuits before refs_updated; no further frames.
+        ran: false,
+      };
+    };
+
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-nf1")));
+    await started.promise; // runner parked, activeTurn set, transcript grown
+
+    // new_chat mid-turn aborts the in-flight turn exactly like cancel.
+    socket.send(serialize(message("new_chat", {}, "id-nf2")));
+    await finished.promise;
+    expect(sawAborted).toBe(true);
+
+    await settle();
+    // ran:false → no refs_updated; new_chat itself sends no frame.
+    expect(collector.frames).toHaveLength(0);
+    // Strengthened: the reset SURVIVES the superseded turn's completion — the
+    // session discarded the stale (grown) result rather than reinstating it.
+    expect(transcriptOf(session)).toEqual([]);
+  });
+
+  it("chatSession_newChatMidTurn_discardsStaleResultTranscriptStaysEmpty", async () => {
+    // C1 regression (the CRITICAL the shipped in-flight test missed). The runner
+    // mutates AND returns the SAME `args.transcript` array BY REFERENCE — exactly
+    // how `defaultRunTurn`/`runAgentLoop` alias the session's array. Pre-fix, the
+    // session's post-await `this.transcript = result.messages` + `persistTranscript`
+    // ran UNCONDITIONALLY, reinstating that grown array under the NEW sessionId.
+    // The epoch guard now discards a superseded turn's result, so `transcript`
+    // stays `[]`. This assertion FAILS against the pre-fix code and passes now.
+    const gate = deferred<void>();
+    const settledTranscript = deferred<void>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      // Grow the SAME array the session holds (by reference), as the real loop does.
+      args.transcript.push({ role: "user", content: args.text });
+      args.transcript.push({
+        role: "assistant",
+        content: [{ type: "text", text: "old" }],
+      });
+      // Park mid-flight until the test has sent `new_chat`.
+      await gate.promise;
+      settledTranscript.resolve();
+      return { ok: true, messages: args.transcript, refs: [], ran: true };
+    };
+
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    // Turn starts and grows the (by-reference) transcript to 2 messages…
+    socket.send(
+      serialize(message("user_message", { text: "hello" }, "id-c1a"))
+    );
+    await waitFor(() => transcriptOf(session).length === 2);
+
+    // …while the runner is parked, new_chat resets the conversation + bumps epoch.
+    socket.send(serialize(message("new_chat", {}, "id-c1b")));
+    await waitFor(() => transcriptOf(session).length === 0);
+
+    // Release the runner → it returns the SAME grown array. The session must
+    // DISCARD it (superseded), NOT reinstate it.
+    gate.resolve();
+    await settledTranscript.promise;
+    await settle();
+
+    // The reset stands: the stale grown array was discarded, transcript is empty.
+    expect(transcriptOf(session)).toEqual([]);
+    // The superseded turn emits no trailing refs_updated (sendRefs=false).
+    expect(collector.ofType("refs_updated")).toHaveLength(0);
+    assertNoKeyLeak(collector.frames);
+  });
+
+  it("chatSession_newChatMidTurn_noPollutedNewSessionFileWritten", async () => {
+    // Companion to C1 with a real storageDir: a mid-turn new_chat must NOT persist
+    // the discarded turn's old content under the NEW sessionId. After the reset,
+    // nothing is persisted, so `sessions/<newId>.json` does not exist yet.
+    const gate = deferred<void>();
+    const settledTranscript = deferred<void>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      args.transcript.push({ role: "user", content: args.text });
+      args.transcript.push({ role: "assistant", content: "old-content" });
+      await gate.promise;
+      settledTranscript.resolve();
+      return { ok: true, messages: args.transcript, refs: [], ran: true };
+    };
+
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtxWithStorage(storageDir), server, {
+      runTurn,
+    });
+
+    const socket = await connect(toWsUrl(info.url));
+
+    socket.send(serialize(message("user_message", { text: "hi" }, "id-pf1")));
+    await waitFor(() => transcriptOf(session).length === 2);
+
+    // new_chat mid-turn → reset + new sessionId (captured AFTER the bump).
+    socket.send(serialize(message("new_chat", {}, "id-pf2")));
+    await waitFor(() => transcriptOf(session).length === 0);
+    const newId = sessionIdOf(session);
+
+    // Release the discarded turn → it must NOT persist under the new id.
+    gate.resolve();
+    await settledTranscript.promise;
+    await settle();
+
+    // No file under the NEW sessionId exists yet — nothing was persisted post-reset,
+    // so the fresh session is not polluted with the old (discarded) content.
+    const newFile = join(storageDir, "sessions", `${newId}.json`);
+    expect(existsSync(newFile)).toBe(false);
+  });
+
+  it("chatSession_cancelMidTurn_adoptsPartialTranscriptNotSuperseded", async () => {
+    // Contrast guard against over-fixing: `cancel` (unlike `new_chat`) does NOT
+    // bump the epoch, so a cancelled turn still ADOPTS its partial transcript.
+    // A by-reference runner grows the array, then resolves on cancel. The session
+    // must reflect that partial progress (non-empty) — proving the epoch guard
+    // discriminates cancel from new_chat.
+    const started = deferred<void>();
+    const finished = deferred<void>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      args.transcript.push({ role: "user", content: args.text });
+      args.transcript.push({ role: "assistant", content: "partial-progress" });
+      started.resolve();
+      await onceAborted(args.signal);
+      finished.resolve();
+      // A cancelled turn returns the partial transcript it built so far.
+      return { ok: true, messages: args.transcript, refs: [], ran: true };
+    };
+
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+
+    const socket = await connect(toWsUrl(info.url));
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-cm1")));
+    await started.promise;
+
+    // cancel (NOT new_chat) mid-turn: trips the signal, leaves the epoch intact.
+    socket.send(serialize(message("cancel", {}, "id-cm2")));
+    await finished.promise;
+    await settle();
+
+    // The partial transcript was ADOPTED (cancel is not a supersession).
+    const after = transcriptOf(session);
+    expect(after).toHaveLength(2);
+    const assistantMsg = after[1];
+    if (typeof assistantMsg.content === "string") {
+      expect(assistantMsg.content).toBe("partial-progress");
+    }
+  });
+
+  it("chatSession_newChatWhileConfirmPending_settlesFalseNoHangNoExtraFrames", async () => {
+    const done = deferred<{ resolved: boolean; aborted: boolean }>();
+    const runTurn = async (args: TurnRunArgs): Promise<TurnRunResult> => {
+      const resolved = await confirmGateOf(
+        session,
+        args.signal
+      )({
+        summary: "This deletes 1 thing.",
+        actions: ["Delete track:1:Bass"],
+        calls: [],
+      });
+      done.resolve({ resolved, aborted: args.signal.aborted });
+      return { ok: true, messages: [], refs: [], ran: false };
+    };
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn });
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    socket.send(serialize(message("user_message", { text: "go" }, "id-np1")));
+    await collector.until((f) => f.some((m) => m.type === "confirm_request"));
+    const beforeNewChat = collector.frames.length;
+
+    // new_chat with a pending confirm → the handler drains it with settle(false),
+    // which (via the gate's abort listener path) also trips the signal. Mirrors
+    // the dispose-drain test, but driven by new_chat.
+    socket.send(serialize(message("new_chat", {}, "id-np2")));
+    const outcome = await done.promise;
+
+    expect(outcome.resolved).toBe(false);
+    expect(outcome.aborted).toBe(true);
+    // No extra frames beyond the confirm_request (new_chat sends none; ran:false).
+    await settle();
+    expect(collector.frames.length).toBe(beforeNewChat);
+  });
+
+  it("chatSession_newChat_emitsNoOutboundFrameAndNoKeyLeak", async () => {
+    const { server, info } = await startServer();
+    const session = new ChatSession(fakeCtx(), server, { runTurn: growTurn });
+
+    const socket = await connect(toWsUrl(info.url));
+    const collector = new FrameCollector(socket);
+
+    // Run one turn so there is a non-empty transcript + a settled session to clear.
+    socket.send(serialize(message("user_message", { text: "hi" }, "id-nq1")));
+    await collector.until((f) => f.some((m) => m.type === "refs_updated"));
+    const beforeNewChat = collector.frames.length;
+
+    // new_chat must produce NO outbound frame at all (the webview clears its own
+    // DOM; the handler sends nothing).
+    socket.send(serialize(message("new_chat", {}, "id-nq2")));
+    await waitFor(() => transcriptOf(session).length === 0);
+    await settle(); // give any (erroneous) frame a chance to land before counting
+
+    // Zero new frames since the turn's refs_updated — new_chat sends nothing.
+    expect(collector.frames.length).toBe(beforeNewChat);
+    // Specifically: no NEW error/assistant_* frame followed the new_chat (the
+    // prior turn's own assistant_done legitimately precedes `beforeNewChat`).
+    const afterNewChat = collector.frames.slice(beforeNewChat);
+    expect(afterNewChat).toHaveLength(0);
+    expect(afterNewChat.some((f) => f.type === "error")).toBe(false);
+    expect(afterNewChat.some((f) => f.type === "assistant_delta")).toBe(false);
+    expect(afterNewChat.some((f) => f.type === "assistant_done")).toBe(false);
+    // The key never crosses the wire on any frame across the whole exchange.
+    assertNoKeyLeak(collector.frames);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
 /* 11. Session glue — set_config persistence + no-key-leak (Phase 10, §10)      */
 /* -------------------------------------------------------------------------- */
 
@@ -1824,3 +2245,151 @@ function assertNoKeyLeak(frames: ProtocolMessage[]): void {
     expect(wire).not.toMatch(/"key"\s*:/);
   }
 }
+
+/* -------------------------------------------------------------------------- */
+/* 13. Phase 11 — launch-scope flow: scopeRef → buildSnapshot → loop          */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Phase 11 Task 3c — the scope-flow wiring that feeds the per-turn snapshot.
+ *
+ * `ChatSession.defaultRunTurn` calls `buildSnapshot(this.ctx, this.scopeRef)`
+ * every turn (verified by reading `session.ts`), and the launch routine
+ * (`launch.ts`) converts the clicked Handle into that `scopeRef` via
+ * `refFromHandle` (ok → scoped session, ResolveErr → header-only). These tests
+ * exercise the SAME two production functions the runtime uses — the least-
+ * invasive seam, adding NO new production hooks:
+ *  - `buildSnapshot(ctx, scopeRef)` carries the scoped track into the block the
+ *    loop receives (the `defaultRunTurn` `snapshot` argument);
+ *  - the snapshot is re-derived (fresh re-resolution, §6) on each call, so two
+ *    sequential turns reflect intervening drift;
+ *  - `refFromHandle` makes the launch decision: a top-level track Handle →
+ *    `{ ok:true, ref }` (flows as `scopeRef`); a dead handle → ResolveErr →
+ *    header-only (no `scopeRef`).
+ *
+ * The `runTurn` injection seam used by §9 bypasses `buildSnapshot`, so proving
+ * the wiring at the `buildSnapshot`/`refFromHandle` boundary is the faithful way
+ * to assert it without a fabricated runner that never touches the real path.
+ */
+describe("chatSession_scopeFlow_scopeRefFeedsPerTurnSnapshot", () => {
+  /**
+   * The fake's class tokens, threaded into `refFromHandle` exactly as
+   * `references.test.ts` does (the fake's class identities are not the SDK's, so
+   * `refFromHandle`'s default SDK tokens do not recognize the fake's nodes).
+   * `buildSnapshot` needs no tokens — its forward walk reads each token's
+   * `className` tag, which the real SDK `Track` token carries.
+   */
+  const TOKENS = {
+    probe: FakeClass.DataModelObject,
+    track: FakeClass.Track,
+    clip: FakeClass.Clip,
+    clipSlot: FakeClass.ClipSlot,
+    takeLane: FakeClass.TakeLane,
+    scene: FakeClass.Scene,
+    cuePoint: FakeClass.CuePoint,
+    device: FakeClass.Device,
+    chain: FakeClass.Chain,
+    trackMixer: FakeClass.TrackMixer,
+    chainMixer: FakeClass.ChainMixer,
+    param: FakeClass.DeviceParameter,
+  } as unknown as ClassTokens;
+
+  /** Cast a fake to the SDK context type at the documented seam (no `any`). */
+  function scopeCtx(fake: FakeExtensionContext): ExtensionContext<ApiVersion> {
+    return fake as unknown as ExtensionContext<ApiVersion>;
+  }
+
+  /** Parse a snapshot string to a record (the loop receives this string). */
+  function parse(json: string): Record<string, unknown> {
+    return JSON.parse(json) as Record<string, unknown>;
+  }
+
+  it("scopeFlow_scopeRefReachesSnapshot_expandsScopedTrack", () => {
+    // The string `defaultRunTurn` would pass as `this.scopeRef` (from launch).
+    const fake = makeFakeContext();
+    const snapshot = parse(buildSnapshot(scopeCtx(fake), "track:0:Drums"));
+    // The loop's snapshot block reflects the scoped track (not header-only).
+    const scoped = snapshot.scopedTrack as Record<string, unknown> | undefined;
+    expect(scoped).toBeDefined();
+    expect(scoped?.ref).toBe("track:0:Drums");
+    expect(scoped?.name).toBe("Drums");
+    expect(snapshot.scopeNote).toBeUndefined();
+  });
+
+  it("scopeFlow_noScopeRef_loopReceivesHeaderOnlySnapshot", () => {
+    // `scopeRef: undefined` (header-only launch) → no scoped track in the block.
+    const fake = makeFakeContext();
+    const snapshot = parse(buildSnapshot(scopeCtx(fake), undefined));
+    expect(snapshot.scopedTrack).toBeUndefined();
+    expect(snapshot.scopeNote).toBeUndefined();
+    expect((snapshot.header as { tempo: number }).tempo).toBe(120);
+  });
+
+  it("scopeFlow_rebuiltPerTurn_reResolvesAgainstLiveModel", () => {
+    // §6: the snapshot is re-derived from the SAME scopeRef each turn. Turn 1
+    // resolves the scoped track; deleting it between turns makes Turn 2 fall
+    // back honestly — proving fresh re-resolution, not a cached handle.
+    const fake = makeFakeContext();
+    const turn1 = parse(buildSnapshot(scopeCtx(fake), "track:0:Drums"));
+    expect(turn1.scopedTrack).toBeDefined();
+
+    fake.remove("tracks[0]"); // the launch-scoped track is deleted mid-session.
+
+    const turn2 = parse(buildSnapshot(scopeCtx(fake), "track:0:Drums"));
+    expect(turn2.scopedTrack).toBeUndefined();
+    expect(turn2.scopeNote).toContain("ref_unresolved");
+    // The header is re-read fresh too (Drums no longer listed).
+    expect((turn2.header as { tracks: unknown[] }).tracks).toHaveLength(4);
+  });
+
+  it("scopeFlow_rebuiltPerTurn_reflectsRenameAcrossTurns", () => {
+    // A rename of a DIFFERENT track between turns must be reflected in the header
+    // of the second turn's snapshot (no stale cache across turns).
+    const fake = makeFakeContext();
+    const t1 = parse(buildSnapshot(scopeCtx(fake), "track:0:Drums"));
+    expect((t1.header as { tracks: { name: string }[] }).tracks[1].name).toBe(
+      "Bass"
+    );
+
+    fake.rename("tracks[1]", "Sub");
+
+    const t2 = parse(buildSnapshot(scopeCtx(fake), "track:0:Drums"));
+    expect((t2.header as { tracks: { name: string }[] }).tracks[1].name).toBe(
+      "Sub"
+    );
+    // The scope (Drums) is unaffected and still expands.
+    expect(t2.scopedTrack).toBeDefined();
+  });
+
+  it("scopeFlow_launchConversion_topLevelTrackHandleYieldsScopeRef", () => {
+    // launch.ts: a top-level track Handle → refFromHandle ok → that ref becomes
+    // the session's scopeRef. Use the real SDK tokens (refFromHandle's default),
+    // which the fake recognizes via the Track token's `className` tag.
+    const fake = makeFakeContext();
+    const handle = fake.handleOf("tracks[1]"); // Bass
+    const r = refFromHandle(scopeCtx(fake), handle, TOKENS);
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.ref).toBe("track:1:Bass");
+      // And that minted ref flows straight into a scoped snapshot.
+      const snapshot = parse(buildSnapshot(scopeCtx(fake), r.ref));
+      expect((snapshot.scopedTrack as { name: string }).name).toBe("Bass");
+    }
+  });
+
+  it("scopeFlow_launchConversion_deadHandleYieldsHeaderOnly", () => {
+    // launch.ts: a dead/non-anchorable handle → ResolveErr → no scopeRef →
+    // header-only session. Prove the conversion fails, then the header-only
+    // snapshot is what the loop would receive.
+    const fake = makeFakeContext();
+    const handle = fake.handleOf("tracks[0]");
+    fake.remove("tracks[0]"); // handle is now dead.
+    const r = refFromHandle(scopeCtx(fake), handle, TOKENS);
+    expect(r.ok).toBe(false);
+
+    // The session built with `scopeRef: undefined` produces a header-only block.
+    const snapshot = parse(buildSnapshot(scopeCtx(fake), undefined));
+    expect(snapshot.scopedTrack).toBeUndefined();
+    expect(snapshot.scopeNote).toBeUndefined();
+  });
+});

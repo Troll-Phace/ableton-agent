@@ -16,7 +16,8 @@
  *
  * Message table (§13):
  * - webview → ext  ({@link ClientMessage}):
- *     `ready`, `user_message`, `confirm_response`, `cancel`, `set_config`
+ *     `ready`, `user_message`, `confirm_response`, `cancel`, `set_config`,
+ *     `new_chat`
  * - ext → webview  ({@link ServerMessage}):
  *     `config_state`, `assistant_delta`, `assistant_done`, `tool_activity`,
  *     `confirm_request`, `refs_updated`, `error`, `history`
@@ -42,7 +43,7 @@ export type ToolActivityStatus = "started" | "ok" | "error";
 /* Per-type payloads                                                          */
 /* -------------------------------------------------------------------------- */
 
-/** Empty payload, used by envelope-only messages (`ready`, `cancel`). */
+/** Empty payload, used by envelope-only messages (`ready`, `cancel`, `new_chat`). */
 export type EmptyPayload = Record<string, never>;
 
 /** `user_message` payload: the user's chat input text. */
@@ -185,6 +186,19 @@ export type ConfirmResponseMessage = Envelope<
 export type CancelMessage = Envelope<"cancel", EmptyPayload>;
 /** `set_config`: the user updated API key and/or model. */
 export type SetConfigMessage = Envelope<"set_config", SetConfigPayload>;
+/**
+ * `new_chat`: the user clicked the "New chat" control to clear the current
+ * conversation and start a fresh one.
+ *
+ * DELIBERATE PROTOCOL EXTENSION (mirrors the `history` precedent): §13's message
+ * table was treated as "frozen", but a "New chat" control is a real, documented
+ * feature — the chat auto-restores the newest transcript on launch, and this is
+ * the only way to clear it and begin a new conversation. This new webview → ext
+ * type is intentional and additive; no existing message type is altered. The
+ * handler resets the in-memory transcript and starts persisting to a NEW session
+ * file, leaving the prior conversation's file untouched on disk (§10).
+ */
+export type NewChatMessage = Envelope<"new_chat", EmptyPayload>;
 
 /* ext → webview ------------------------------------------------------------ */
 
@@ -231,7 +245,8 @@ export type ClientMessage =
   | UserMessageMessage
   | ConfirmResponseMessage
   | CancelMessage
-  | SetConfigMessage;
+  | SetConfigMessage
+  | NewChatMessage;
 
 /** Discriminated union of every extension → webview message. */
 export type ServerMessage =
@@ -260,6 +275,7 @@ export interface MessageByType {
   confirm_response: ConfirmResponseMessage;
   cancel: CancelMessage;
   set_config: SetConfigMessage;
+  new_chat: NewChatMessage;
   config_state: ConfigStateMessage;
   assistant_delta: AssistantDeltaMessage;
   assistant_done: AssistantDoneMessage;
@@ -277,6 +293,7 @@ const CLIENT_TYPES: ReadonlySet<MessageType> = new Set<MessageType>([
   "confirm_response",
   "cancel",
   "set_config",
+  "new_chat",
 ]);
 
 /** The set of ext → webview discriminants, for runtime classification. */
@@ -412,6 +429,7 @@ function validatePayload(type: MessageType, payload: unknown): string | null {
   switch (type) {
     case "ready":
     case "cancel":
+    case "new_chat":
       // Empty-payload messages: presence of extra keys is tolerated but not
       // required; an object payload is sufficient.
       return null;

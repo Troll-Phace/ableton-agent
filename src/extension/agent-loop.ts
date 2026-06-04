@@ -243,6 +243,51 @@ function toToolResultBlock(
   };
 }
 
+/** Coerce an unknown structured-error field to a short single-line string. */
+function fieldStr(value: unknown, fallback: string): string {
+  if (typeof value === "string" && value.trim() !== "") {
+    // Collapse newlines so the diagnostic stays one line.
+    return value.replace(/\s+/g, " ").trim();
+  }
+  return fallback;
+}
+
+/**
+ * Host-side diagnostic for a failed tool call (observability only — never changes
+ * behavior). Every read/mutation result that comes back with `isError` is the §6
+ * error contract `{ error, ref?, detail, hint }`; we parse it defensively and emit
+ * ONE structural `console.warn` line so a red chip in the UI always has a matching
+ * terminal line. Logs ONLY the failure class / ref / detail (object names and
+ * positions) — NEVER the tool input, transcript, message content, or the API key.
+ * It cannot throw: a non-JSON or oddly-shaped body falls back to a literal label.
+ */
+function logToolError(toolName: string, payload: ToolResultPayload): void {
+  if (payload.isError !== true) {
+    return;
+  }
+  try {
+    let error = "error";
+    let ref = "-";
+    let detail = "(no detail)";
+    if (typeof payload.content === "string") {
+      const parsed: unknown = JSON.parse(payload.content);
+      if (typeof parsed === "object" && parsed !== null) {
+        const body = parsed as Record<string, unknown>;
+        error = fieldStr(body["error"], error);
+        ref = fieldStr(body["ref"], "-");
+        detail = fieldStr(body["detail"], detail);
+      }
+    }
+    console.warn(
+      `[tool] ${toolName} failed: ${error} ref=${ref} detail=${detail}`
+    );
+  } catch {
+    // Body was not the structured-error JSON we expected; still record the class
+    // of failure without ever risking a throw in the loop.
+    console.warn(`[tool] ${toolName} failed: (unparseable error payload)`);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // runAgentLoop
 // ---------------------------------------------------------------------------
@@ -365,6 +410,7 @@ export async function runAgentLoop(
       events.toolActivity(call.name, summaryOf(call), "started");
       const payload = await runtime.executeRead(call);
       resultsById.set(payload.toolUseId, payload);
+      logToolError(call.name, payload);
       events.toolActivity(
         call.name,
         payload.summary ?? summaryOf(call),
@@ -486,6 +532,7 @@ export async function runAgentLoop(
               isError: true,
             } satisfies ToolResultPayload);
           resultsById.set(payload.toolUseId, payload);
+          logToolError(mutationCalls[i].name, payload);
           events.toolActivity(
             mutationCalls[i].name,
             payload.summary ?? summaryOf(mutationCalls[i]),

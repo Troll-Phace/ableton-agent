@@ -109,7 +109,8 @@ body {
 }
 
 #close-button,
-#settings-button {
+#settings-button,
+#new-chat-button {
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
@@ -118,7 +119,10 @@ body {
   min-height: 24px;
   padding: 0 var(--space-2);
   font: var(--type-label);
-  color: var(--text-secondary);
+  /* AA: --text-primary on --bg-primary clears 4.5:1 (the "New chat" button is
+   * essential TEXT; --text-secondary at rest was ~2.2:1 and is reserved for
+   * non-essential hints per DESIGN_SYSTEM.md). Hover keeps --text-primary. */
+  color: var(--text-primary);
   background: transparent;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
@@ -129,13 +133,16 @@ body {
 #close-button:hover,
 #close-button:active,
 #settings-button:hover,
-#settings-button:active {
+#settings-button:active,
+#new-chat-button:hover,
+#new-chat-button:active {
   background: var(--bg-surface);
   color: var(--text-primary);
 }
 
 #close-button:focus-visible,
-#settings-button:focus-visible {
+#settings-button:focus-visible,
+#new-chat-button:focus-visible {
   outline: 2px solid var(--text-secondary);
   outline-offset: 1px;
 }

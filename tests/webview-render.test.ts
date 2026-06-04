@@ -18,13 +18,13 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createSink } from "../src/webview/main.js";
+import { createSink, type ChatSinkWithReset } from "../src/webview/main.js";
 import type { ChatSink } from "../src/webview/transport.js";
 
 /** A fresh message-list element (the `#log` analogue) for one test. */
 let log: HTMLElement;
 /** The sink under test, bound to {@link log}. */
-let sink: ChatSink;
+let sink: ChatSinkWithReset;
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -535,5 +535,76 @@ describe("createSink — history rehydration", () => {
     // The streamed text landed in its OWN, new node.
     expect(agents[1]).not.toBe(restoredAgentNode);
     expect(agents[1]?.textContent).toBe("Hi");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* "New chat" reset — sink.clear() (the header New chat button's UI seam)      */
+/* -------------------------------------------------------------------------- */
+
+describe("createSink — clear() reset", () => {
+  it("test_webview_newChat_clearWipesAllRenderedContent", () => {
+    // Populate the log across EVERY render surface: a streamed bubble, a
+    // tool-activity chip, a confirm card, and restored history bubbles.
+    sink.appendAssistantDelta("streaming…");
+    sink.appendToolActivity("live_update_track", "Rename track", "started");
+    sink.appendConfirmCard("plan-x", "This deletes 1 thing.", [
+      "Delete track:1:Bass",
+    ]);
+    sink.renderHistory([
+      { role: "user", text: "earlier question" },
+      { role: "assistant", text: "earlier answer" },
+    ]);
+    // Sanity: the log is non-empty before the reset.
+    expect(log.childNodes.length).toBeGreaterThan(0);
+
+    sink.clear();
+
+    // Every rendered node is gone — bubbles, chips, the card, the divider.
+    expect(log.childNodes.length).toBe(0);
+    expect(log.querySelector(".msg")).toBeNull();
+    expect(log.querySelector(".chip")).toBeNull();
+    expect(log.querySelector(".confirm-card")).toBeNull();
+    expect(log.querySelector(".history-divider")).toBeNull();
+  });
+
+  it("test_webview_newChat_clearResetsStreamAccumulatorSoNextDeltaOpensFreshBubble", () => {
+    // Open a streaming bubble (the accumulator now points at a live node)…
+    sink.appendAssistantDelta("partial-before-clear");
+    const before = log.querySelectorAll(".msg-agent");
+    expect(before).toHaveLength(1);
+    const staleBubble = before[0];
+
+    // …clear wipes the DOM AND nulls the accumulator…
+    sink.clear();
+    expect(log.querySelectorAll(".msg-agent")).toHaveLength(0);
+
+    // …so the next delta opens a BRAND-NEW bubble rather than appending into the
+    // (now-removed) stale node. This proves `streamBubble/streamText` were reset.
+    sink.appendAssistantDelta("x");
+    const after = log.querySelectorAll(".msg-agent");
+    expect(after).toHaveLength(1);
+    expect(after[0]).not.toBe(staleBubble);
+    expect(after[0]?.textContent).toBe("x");
+    // A fresh stream → exactly one live caret in the new bubble.
+    expect(log.querySelectorAll(".caret")).toHaveLength(1);
+    expect(after[0]?.querySelector(".caret")).not.toBeNull();
+  });
+
+  it("test_webview_newChat_clearResetsChipRegistrySoLateSettleCannotRetarget", () => {
+    // A started chip is registered in the unsettled-chip map…
+    sink.appendToolActivity("live_set_param", "Set volume", "started");
+    expect(log.querySelectorAll(".chip")).toHaveLength(1);
+
+    // …clear drops the registry (and the DOM)…
+    sink.clear();
+    expect(log.querySelectorAll(".chip")).toHaveLength(0);
+
+    // …so a late `ok` for the cleared turn cannot re-target a removed chip; it
+    // renders as a fresh standalone settled chip instead of mutating a stale one.
+    sink.appendToolActivity("live_set_param", "Set volume", "ok");
+    const chips = log.querySelectorAll(".chip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]?.classList.contains("chip-ok")).toBe(true);
   });
 });

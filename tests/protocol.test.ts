@@ -18,12 +18,12 @@ import {
  * `src/shared/protocol.ts`. Pure only: no SDK, no Node server, no `ws`.
  *
  * Coverage:
- *  - Round-trip every one of the 12 message types via
+ *  - Round-trip every one of the 13 message types via
  *    `serialize(message(...))` → `parseEnvelope(...)` and assert deep equality.
  *  - Malformed-input rejection: `parseEnvelope` returns `{ ok:false, error }`
  *    and NEVER throws, across envelope- and payload-level violations.
  *  - Type guards: `isClientMessage` / `isServerMessage` / `isMessageOfType`.
- *  - Empty-payload (`ready`/`cancel`) handling.
+ *  - Empty-payload (`ready`/`cancel`/`new_chat`) handling.
  *  - Extra-key tolerance (pinned as intentional behavior).
  *
  * Malformed inputs are supplied as raw JSON *strings* (the only input shape
@@ -45,6 +45,7 @@ const SAMPLE_PAYLOADS: {
   user_message: { text: "make the bass louder" },
   confirm_response: { planId: "plan-7", approved: true },
   cancel: {},
+  new_chat: {},
   set_config: { apiKey: "sk-ant-test", model: "claude-sonnet-4-6" },
   config_state: { hasKey: true, model: "claude-sonnet-4-6" },
   assistant_delta: { text: "Sure, " },
@@ -78,6 +79,7 @@ const CLIENT_TYPES: MessageType[] = [
   "confirm_response",
   "cancel",
   "set_config",
+  "new_chat",
 ];
 
 const SERVER_TYPES: MessageType[] = [

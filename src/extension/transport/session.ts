@@ -6,8 +6,8 @@
  * One {@link ChatSession} exists **per open modal**. It owns:
  *  - the inbound dispatcher (`server.onMessage`), branching with
  *    {@link isMessageOfType} over the §13 client subset
- *    (`ready` / `user_message` / `cancel` / `confirm_response` / `set_config`);
- *    any other type is ignored gracefully;
+ *    (`ready` / `user_message` / `cancel` / `new_chat` / `confirm_response` /
+ *    `set_config`); any other type is ignored gracefully;
  *  - the in-memory transcript (`Anthropic.MessageParam[]`) carried across turns
  *    of this session and mirrored to disk after each turn for cross-session
  *    continuity (§10, restored on construction);
@@ -18,9 +18,10 @@
  *    trips so the loop never lands a half-applied transaction (§7 / R5).
  *
  * **Outcome D only**: mutations apply in place — there is no close-to-apply
- * bridge (that is Outcome C) and no propose→apply plan (that is A/B). There is no
- * real project snapshot yet (Phase 11); a short honest placeholder is sent so the
- * model never fabricates project state.
+ * bridge (that is Outcome C) and no propose→apply plan (that is A/B). The per-turn
+ * scoped snapshot is built by {@link buildSnapshot} (project header + the
+ * launch-scoped track expanded shallow, with an honest `scopeNote` when the scope
+ * is unresolvable) so the model never fabricates project state.
  *
  * **Key discipline (§10):** the Anthropic API key never enters any outbound
  * {@link ProtocolMessage} — `config_state` carries only the boolean `hasKey`. The
@@ -62,6 +63,7 @@ import {
   type Config,
 } from "../config-store.js";
 import { ReferenceTable } from "../references.js";
+import { buildSnapshot } from "../snapshot.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import { LiveToolRuntime } from "../tool-registry.js";
 
@@ -74,15 +76,6 @@ import {
 
 /** Log prefix mirroring the host's `console.*` convention. */
 const LOG_PREFIX = "[session]";
-
-/**
- * Placeholder snapshot sent until the real serializer lands (Phase 11). Kept
- * deliberately minimal and honest — it states that no project data is wired yet
- * so the model leans on the `live_get_*` read tools rather than inventing state.
- */
-const SNAPSHOT_PLACEHOLDER =
-  "[project snapshot not yet wired — Phase 11 will provide the full Live Set " +
-  "snapshot here; until then, use the live_get_* read tools to inspect the Set].";
 
 /** Message surfaced to the webview when no Anthropic API key is available. */
 const NO_KEY_MESSAGE =
@@ -160,6 +153,13 @@ export interface ChatSessionOptions {
   /** Max output tokens per turn (forwarded to the loop/client). */
   maxTokens?: number;
   /**
+   * The launch-scope ref STRING (e.g. `"track:0:Drums"`) the agent was opened on,
+   * minted from the clicked handle at launch (§5). Stored as a string only — never
+   * a {@link Handle} — and re-resolved fresh by {@link buildSnapshot} on every turn
+   * (§6). `undefined` → header-only snapshot.
+   */
+  scopeRef?: string;
+  /**
    * Test seam: override the per-turn loop runner. Defaults to the production
    * `createClaudeClient` + `LiveToolRuntime` + `runAgentLoop` wiring. The session
    * still owns the `activeTurn` AbortController (set before the runner, cleared in
@@ -191,6 +191,14 @@ export class ChatSession<V extends ApiVersion> {
   private readonly opts: ChatSessionOptions;
 
   /**
+   * The launch-scope ref STRING this session was opened on (e.g. `"track:0:Drums"`),
+   * or `undefined` for a header-only snapshot. A STRING only — never a {@link Handle}
+   * — so nothing is cached across turns (§6); {@link buildSnapshot} re-resolves it
+   * fresh each turn.
+   */
+  private readonly scopeRef: string | undefined;
+
+  /**
    * The SDK storage directory (`ctx.environment.storageDirectory`), or
    * `undefined` when none is granted (first run / no storage). Cached at
    * construction; the persistence helpers treat `undefined` as a first-class
@@ -211,9 +219,11 @@ export class ChatSession<V extends ApiVersion> {
    * The id of THIS session's transcript file under
    * `storageDirectory/sessions/<sessionId>.json`. Reused from the restored
    * session on construction (so a continued conversation overwrites the same
-   * file), else freshly minted (§10).
+   * file), else freshly minted (§10). Re-minted by {@link handleNewChat} when the
+   * user starts a fresh conversation, so subsequent turns persist to a NEW file
+   * and the prior conversation's file is left untouched on disk.
    */
-  private readonly sessionId: string;
+  private sessionId: string;
 
   /**
    * In-memory transcript carried across turns of THIS session, seeded from the
@@ -225,6 +235,19 @@ export class ChatSession<V extends ApiVersion> {
 
   /** The in-flight turn's abort controller, or `null` when idle. */
   private activeTurn: AbortController | null = null;
+
+  /**
+   * Monotonic conversation generation. Bumped ONLY by {@link handleNewChat} when
+   * the conversation is reset (`transcript = []` + new `sessionId`). A turn
+   * captures this value before `await runner(...)`; if it differs after the await,
+   * the turn was superseded by a "New chat" mid-flight and MUST discard its result
+   * (do not adopt the transcript, persist, error, or emit `refs_updated`) —
+   * otherwise the aborted turn's returned array would reinstate the old
+   * conversation and pollute the new `sessions/<id>.json`. NOT bumped by `cancel`
+   * (which keeps the conversation and adopts partial progress) or `dispose`
+   * (which persists the final transcript for continuity).
+   */
+  private conversationEpoch = 0;
 
   /**
    * Pending destructive-action confirmations awaiting a `confirm_response`
@@ -256,6 +279,7 @@ export class ChatSession<V extends ApiVersion> {
     this.ctx = ctx;
     this.server = server;
     this.opts = opts;
+    this.scopeRef = opts.scopeRef;
 
     // Cache the storage dir and load the host config (§10). `loadConfig` never
     // throws and treats an undefined dir as a first-class first-run path.
@@ -299,8 +323,8 @@ export class ChatSession<V extends ApiVersion> {
   /**
    * Route one validated inbound {@link ClientMessage} to its handler.
    *
-   * Wired: `ready`, `user_message`, `cancel`, `confirm_response` (Phase 9),
-   * `set_config` (Phase 10). Any other type is ignored gracefully with a debug
+   * Wired: `ready`, `user_message`, `cancel`, `new_chat`, `confirm_response`
+   * (Phase 9), `set_config` (Phase 10). Any other type is ignored gracefully with a debug
    * log — never an error to the user. Never throws (the transport's handler
    * wrapper also guards, but we keep this total for safety).
    */
@@ -316,6 +340,10 @@ export class ChatSession<V extends ApiVersion> {
       }
       if (isMessageOfType(msg, "cancel")) {
         this.handleCancel();
+        return;
+      }
+      if (isMessageOfType(msg, "new_chat")) {
+        this.handleNewChat();
         return;
       }
       if (isMessageOfType(msg, "confirm_response")) {
@@ -418,6 +446,52 @@ export class ChatSession<V extends ApiVersion> {
       console.debug(`${LOG_PREFIX} cancel — aborting in-flight turn`);
       this.activeTurn.abort();
     }
+  }
+
+  /**
+   * Clear the current conversation and start a fresh one (the "New chat" control,
+   * §13 `new_chat`). A clean control action — never an `error` frame, never a
+   * silent no-op.
+   *
+   * Steps, mirroring the `cancel` + `dispose`-drain invariants:
+   *  1. Abort any in-flight turn (same as {@link handleCancel}) so a half-applied
+   *     transaction never lands; the turn's own `finally` clears `activeTurn`.
+   *  2. Drain any `pendingConfirmations` with `settle(false)` (mirroring the
+   *     {@link ChatSession.dispose} drain) so a half-open confirm can't dangle.
+   *  3. Reset the in-memory transcript to empty and re-mint `sessionId`, so the
+   *     NEXT turn persists to a NEW `sessions/<id>.json`. The prior conversation's
+   *     file is left untouched on disk — auto-restore-latest still finds the old
+   *     thread until a new turn supersedes it (§10).
+   *
+   * Deliberately persists NOTHING here: writing an empty transcript would create a
+   * meaningless newest file that auto-restore would then surface. One honest
+   * `console.debug` is logged (no key/secret, §10); no outbound frame is sent —
+   * the webview clears its own DOM.
+   */
+  private handleNewChat(): void {
+    if (this.activeTurn !== null) {
+      this.activeTurn.abort();
+    }
+
+    // Drain pending confirmations so a half-open confirm cannot dangle. Snapshot
+    // the values first since `settle` mutates the map (same pattern as `dispose`).
+    for (const settle of [...this.pendingConfirmations.values()]) {
+      settle(false);
+    }
+
+    // Reset the conversation. The empty transcript is intentionally NOT persisted;
+    // the new session file appears only when the next turn writes to it, so the
+    // old thread's file stays the newest (and restorable) until then.
+    this.transcript = [];
+    this.sessionId = newSessionId();
+
+    // Bump the generation so any turn aborted above discards its (now-stale)
+    // result instead of reinstating the old transcript under the new sessionId.
+    this.conversationEpoch += 1;
+
+    console.debug(
+      `${LOG_PREFIX} new chat — transcript reset, new session ${this.sessionId}`
+    );
   }
 
   /**
@@ -534,6 +608,11 @@ export class ChatSession<V extends ApiVersion> {
     let refs: string[] = [];
     let sendRefs = true;
 
+    // Capture the conversation generation BEFORE the await. If `new_chat` resets
+    // the conversation while this turn is in flight, the epoch bumps and the
+    // turn's result is stale — see the supersession guard after the await.
+    const turnEpoch = this.conversationEpoch;
+
     try {
       const result = await runner({
         text,
@@ -542,38 +621,63 @@ export class ChatSession<V extends ApiVersion> {
         signal: controller.signal,
       });
 
-      // Adopt the updated transcript either way so multi-turn context carries
-      // (the runner returns it as far as it progressed, even on failure).
-      this.transcript = result.messages;
-      refs = result.refs;
-      sendRefs = result.ran !== false;
+      if (this.conversationEpoch !== turnEpoch) {
+        // Superseded by a mid-flight `new_chat`: the conversation was already
+        // reset to `[]` under a new sessionId. Adopting `result.messages` here
+        // would reinstate the old (grown) array and persist it under the NEW
+        // sessionId, polluting the fresh session. Discard the result entirely —
+        // no adopt, no persist, no error frame, no `refs_updated`.
+        sendRefs = false;
+        console.debug(
+          `${LOG_PREFIX} turn superseded by new chat — discarding result`
+        );
+      } else {
+        // Adopt the updated transcript either way so multi-turn context carries
+        // (the runner returns it as far as it progressed, even on failure).
+        this.transcript = result.messages;
+        refs = result.refs;
+        sendRefs = result.ran !== false;
 
-      // Mirror the transcript to disk for cross-session continuity (§10).
-      // `persistTranscript` never throws, but keep the call defensive so a
-      // surprise can never break the turn or leave a dangling rejection.
-      try {
-        persistTranscript(this.storageDir, this.sessionId, this.transcript);
-      } catch (err) {
-        console.error(`${LOG_PREFIX} failed to persist transcript`, err);
-      }
+        // Mirror the transcript to disk for cross-session continuity (§10).
+        // `persistTranscript` never throws, but keep the call defensive so a
+        // surprise can never break the turn or leave a dangling rejection.
+        try {
+          persistTranscript(this.storageDir, this.sessionId, this.transcript);
+        } catch (err) {
+          console.error(`${LOG_PREFIX} failed to persist transcript`, err);
+        }
 
-      if (!result.ok && result.errorMessage !== undefined) {
-        // EXACTLY ONE `error` frame per failed turn. The session sends the frame
-        // ONLY when the runner hands up an (already-sanitized) `errorMessage` —
-        // i.e. for a failure the runner did NOT itself surface (e.g. the no-key
-        // short-circuit). A loop failure already emitted its frame via
-        // `events.error` and returns WITHOUT `errorMessage`, so the session adds
-        // none — never double-reporting.
-        this.sendError(result.errorMessage);
+        if (!result.ok && result.errorMessage !== undefined) {
+          // EXACTLY ONE `error` frame per failed turn. The session sends the frame
+          // ONLY when the runner hands up an (already-sanitized) `errorMessage` —
+          // i.e. for a failure the runner did NOT itself surface (e.g. the no-key
+          // short-circuit). A loop failure already emitted its frame via
+          // `events.error` and returns WITHOUT `errorMessage`, so the session adds
+          // none — never double-reporting.
+          this.sendError(result.errorMessage);
+        }
       }
     } catch (err) {
       // Defensive: the default runner never throws, but an injected runner (or a
       // surprise) must still become an `error` frame, never an unhandled
-      // rejection.
-      console.error(`${LOG_PREFIX} unexpected turn failure`, err);
-      this.sendError("The turn failed unexpectedly. Please try again.");
+      // rejection. A superseded turn that also threw stays silent — the
+      // conversation has moved on and the error is for a discarded turn.
+      if (this.conversationEpoch !== turnEpoch) {
+        sendRefs = false;
+        console.debug(
+          `${LOG_PREFIX} superseded turn threw after new chat — discarding`
+        );
+      } else {
+        console.error(`${LOG_PREFIX} unexpected turn failure`, err);
+        this.sendError("The turn failed unexpectedly. Please try again.");
+      }
     } finally {
-      this.activeTurn = null;
+      // Clear `activeTurn` only if it is still THIS turn's controller, so a
+      // superseded turn's teardown can never clobber a newer turn's controller.
+      // (The busy-guard already prevents overlap; this makes it explicit.)
+      if (this.activeTurn === controller) {
+        this.activeTurn = null;
+      }
     }
 
     // After a turn that ran, surface the turn-scoped refs so the webview can
@@ -641,7 +745,11 @@ export class ChatSession<V extends ApiVersion> {
       runtime,
       events,
       system: buildSystemPrompt(),
-      snapshot: SNAPSHOT_PLACEHOLDER,
+      // Fresh, scoped per-turn snapshot (§4). `buildSnapshot` re-resolves
+      // `this.scopeRef` against the live model every turn (§6) — no Handle is
+      // cached — and falls back to a header-only snapshot when there is no scope
+      // or the scope no longer resolves.
+      snapshot: buildSnapshot(this.ctx, this.scopeRef),
       messages: transcript,
       model,
       maxTokens: this.opts.maxTokens,

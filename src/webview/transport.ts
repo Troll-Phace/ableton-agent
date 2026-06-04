@@ -222,6 +222,23 @@ export class ChatTransport {
   }
 
   /**
+   * Send a `new_chat` clearing the current conversation and starting a fresh
+   * session. No-op (with a status line) when disconnected — mirrors
+   * {@link ChatTransport.sendConfirmResponse}'s open-guard. The payload is empty
+   * (§13): the host's `handleNewChat` resets the transcript and mints a new
+   * session id on receipt. The caller (the header "New chat" button) clears the
+   * chat UI locally first, so this frame carries no UI state.
+   */
+  public sendNewChat(): void {
+    if (this.socket === null || this.socket.readyState !== WebSocket.OPEN) {
+      this.sink.appendStatus("Not connected — new chat not started.");
+      return;
+    }
+    const envelope = message("new_chat", {}, crypto.randomUUID());
+    this.socket.send(serialize(envelope));
+  }
+
+  /**
    * Send a `set_config` carrying an optional API key and/or model. No-op (with a
    * status line) when disconnected. The key, when present, travels ONE WAY — out
    * to the host — and is never retained here: the caller (the settings view)
