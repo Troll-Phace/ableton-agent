@@ -30,6 +30,7 @@ import type Anthropic from "@anthropic-ai/sdk";
 import {
   isDestructiveCall,
   summarizeDestructivePlan,
+  summarizeToolCall,
 } from "../shared/tools.js";
 
 import type {
@@ -571,7 +572,13 @@ export async function runAgentLoop(
   return { ok: false, err: capErr, messages };
 }
 
-/** A short, key-free narration summary for a tool call (refined in Phase 7). */
+/**
+ * A short, key-free narration summary for a tool call, driving the §13
+ * `tool_activity.summary` chip (the *started* and *error* states). Delegates to
+ * the pure {@link summarizeToolCall} in shared. The *ok* chip may still be
+ * overridden at the settle sites by a richer executor-returned summary via the
+ * `payload.summary ?? summaryOf(call)` fallback.
+ */
 function summaryOf(call: ToolCall): string {
-  return call.name;
+  return summarizeToolCall(call.name, call.input);
 }

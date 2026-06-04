@@ -812,6 +812,72 @@ describe("runAgentLoop — destructive-action confirmation gate (Phase 9, §9/§
   });
 });
 
+describe("runAgentLoop — tool-activity narration summaries (Phase 12 Task C)", () => {
+  it("agentLoop_startedChip_carriesHumanSummaryNotBareToolName", async () => {
+    // The started chip is narrated via summaryOf → summarizeToolCall, so it must
+    // be the human phrase ("Update track:0:X (name)"), NOT the bare tool name.
+    const runtime = new FakeToolRuntime({
+      classifier: { live_update_track: "mutation" },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        {
+          id: "u1",
+          name: "live_update_track",
+          input: { track: "track:0:X", name: "Lead" },
+        },
+      ]),
+      textTurn("done"),
+    ];
+
+    const result = await runAgentLoop(makeLoopInput(turns, runtime, events));
+    expect(result.ok).toBe(true);
+
+    const started = events.activity.find(
+      (a) => a.tool === "live_update_track" && a.status === "started"
+    );
+    expect(started?.summary).toBe("Update track:0:X (name)");
+    // Defensive: it is NOT the bare tool name.
+    expect(started?.summary).not.toBe("live_update_track");
+  });
+
+  it("agentLoop_okChip_prefersExecutorPayloadSummaryOverComputedOne", async () => {
+    // Fallback precedence at the settle site is `payload.summary ?? summaryOf`,
+    // so a richer executor-returned summary wins on the OK chip while the STARTED
+    // chip still shows the computed phrase.
+    const runtime = new FakeToolRuntime({
+      classifier: { live_update_track: "mutation" },
+      mutationResults: {
+        u1: { summary: "Renamed track to Lead" },
+      },
+    });
+    const events = makeEvents();
+    const turns: ScriptedTurn[] = [
+      toolUseTurn([
+        {
+          id: "u1",
+          name: "live_update_track",
+          input: { track: "track:0:X", name: "Lead" },
+        },
+      ]),
+      textTurn("done"),
+    ];
+
+    const result = await runAgentLoop(makeLoopInput(turns, runtime, events));
+    expect(result.ok).toBe(true);
+
+    const updates = events.activity.filter(
+      (a) => a.tool === "live_update_track"
+    );
+    const started = updates.find((a) => a.status === "started");
+    const ok = updates.find((a) => a.status === "ok");
+    // STARTED uses the computed phrase; OK uses the executor's richer summary.
+    expect(started?.summary).toBe("Update track:0:X (name)");
+    expect(ok?.summary).toBe("Renamed track to Lead");
+  });
+});
+
 describe("runAgentLoop — client failure propagation", () => {
   it("agentLoop_clientError_returnsErrAndEmitsError", async () => {
     const runtime = new FakeToolRuntime();
