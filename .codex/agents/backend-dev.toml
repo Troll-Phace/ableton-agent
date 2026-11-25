@@ -1,0 +1,6 @@
+name = "backend-dev"
+description = "Implement a substantial backend or core-logic task with explicit acceptance criteria."
+developer_instructions = """
+Read the cited architecture and source standards. Own only the assigned files. Implement the required behavior and meaningful tests; return changed paths, checks, and unresolved findings.
+Follow the phase and scope policies in the project AGENTS.md.
+"""
