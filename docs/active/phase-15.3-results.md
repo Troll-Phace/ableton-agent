@@ -10,7 +10,7 @@ Status: F2 corrected and installed no-credential checks completed. Unshimmed nat
 | F3 official sign-in / Responses fixture | Not started; blocked on direct native transport |
 | F4 regression proof | PASS after correction (39/39, baseline 951/951) |
 | F5 personal consent and real function round trip | NOT RUN; no consent requested and no real API usage |
-| F6 review PR | Bounded code-reviewer: no blocking findings for BLOCKED checkpoint; owner PR review pending |
+| F6 review PR | Bounded code-reviewer: no blocking findings for BLOCKED checkpoint; PR #5 merged by owner (2ca8db0 verified), BLOCKED outcome retained |
 
 Only sanitized outcomes and tested revisions/artifact hashes belong here.
 
@@ -96,4 +96,4 @@ BLOCKED checkpoint PR. Confirmed fixture isolation, authenticated loopback,
 synchronous denial cleanup, non-vacuous tests, archive contents and exact
 SHA256. Confirmed the native stream/abort blockers and unstarted F3/F5
 are reported accurately. This is not a migration GO, OAuth proof, or
-provider test. Owner review is required before the recommended next spike.
+provider test. Owner merged [PR #5](https://github.com/Troll-Phace/ableton-agent/pull/5) on 2026-11-27 and authorized continuing with the recommended bounded compatibility spike. This does not clear the F3/F5 gate.
