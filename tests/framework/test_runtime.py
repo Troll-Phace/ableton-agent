@@ -56,12 +56,12 @@ class RuntimeTests(unittest.TestCase):
  def test_context_uses_configured_shared_ledger(self):
   path = self.root/'.claude/state/progress.md'
   path.parent.mkdir(parents=True)
-  path.write_text('Phase: 15\nP15-1 pending\n' + 'x'*1200)
+  path.write_text('Phase: 42\nManual smoke pending\n' + 'x'*1200)
   cfg = dict(self.cfg, progress_path='.claude/state/progress.md')
   with patch.object(m.subprocess,'run',return_value=subprocess.CompletedProcess([],0,'dev\n','')):
    result = m.context(self.root,cfg)
-  self.assertIn('Phase: 15',result)
-  self.assertIn('P15-1 pending',result)
+  self.assertIn('Phase: 42',result)
+  self.assertIn('Manual smoke pending',result)
   self.assertIn('read .claude/state/progress.md',result)
   self.assertNotIn('Phase: 2',result)
  def test_context_rejects_escaping_progress_path(self):

@@ -5,8 +5,8 @@ The installed implementation still uses Claude; the approved product direction
 is Sign in with ChatGPT plan usage through the Responses API, as scoped in
 [provider migration](CHATGPT_MIGRATION.md). The product runtime is distinct from
 the Claude and Codex development harnesses; retain both. Phase 15's migration
-and live gate are active, not yet implemented. Sources: `src/extension` (SDK host, transaction and transport
-boundaries), `src/webview` (Vite SPA) and `src/shared` (shared TypeScript
+and live gate are active, not yet implemented. Sources: `src/extension`
+(SDK host, transaction and transport boundaries), `src/webview` (Vite SPA) and `src/shared` (shared TypeScript
 contracts). Tests use Vitest and fake SDK/API seams. See
 [architecture](ARCHITECTURE.md), [phase plan](PLAN.md), and [progress](PROGRESS.md).
 
@@ -22,7 +22,8 @@ contracts). Tests use Vitest and fake SDK/API seams. See
   the recorded Live Beta setup, not an automated or CI check. Do not start Live,
   open a real set, spend API usage, expose secrets, or perform mutations unless
   the user authorizes that live exercise. Refer to the phase's exact smoke
-  checklist. Headless checks cannot satisfy the replacement Phase 15 live gate.
+  checklist. Headless checks cannot substitute for a recorded in-Live gate,
+  including the replacement Phase 15 live gate.
   Use the installed extension on a disposable Set for current-beta verification.
   OAuth consent and real provider usage require operator authorization; use
   offline fake providers in automated tests.
