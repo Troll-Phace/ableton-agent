@@ -19,3 +19,6 @@ coverage/
 # Codex harness runtime cache and Python helper artifacts
 /.agent-runtime/
 __pycache__/
+
+# Ableton-provided SDK/CLI archives are obtained locally under Ableton's terms.
+/vendor/ableton-extensions-*.tgz
