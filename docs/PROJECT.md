@@ -39,12 +39,21 @@ Git remote metadata identifies `Troll-Phace/ableton-agent`; default branch is
 future phase branch. Do not infer a clean merge or use that branch to ship
 unrelated work. See [issue policy](ISSUES.md) and the Codex ship-pr workflow.
 
-Retained implementors: backend-dev, frontend-dev and test-engineer. No user
-Codex model/effort choices were available for them during adoption. Leave both
-fields unset and do not dispatch these agents until the user selects both per
-role. Claude agent configuration and the application's runtime model are not
-substitutes. Phase planning uses the dedicated Astra/low agent; the orchestrator
-inherits the user's chat selection and code-reviewer is read-only.
+User-approved Codex role selections (2026-11-27):
+
+| Role | Model | Reasoning effort |
+| --- | --- | --- |
+| backend-dev | gpt-6.2-sol | high |
+| frontend-dev | gpt-6.2-sol | medium |
+| test-engineer | gpt-6.2-sol | high |
+| phase-plan | gpt-6-astra | low |
+
+These are development-agent choices, not product inference model defaults.
+The orchestrator inherits the user's chat selection; code-reviewer remains
+read-only. The owner authorized the orchestrator to approve Astra's plans,
+but every implementation PR must stop for owner review before advancing.
+OAuth consent remains an operator action. Do not silently substitute models
+if a configured role cannot run.
 
 ## Native client caveats
 
