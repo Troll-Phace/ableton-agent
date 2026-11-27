@@ -18,13 +18,13 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { createSink } from "../src/webview/main.js";
+import { createSink, type ChatSinkWithReset } from "../src/webview/main.js";
 import type { ChatSink } from "../src/webview/transport.js";
 
 /** A fresh message-list element (the `#log` analogue) for one test. */
 let log: HTMLElement;
 /** The sink under test, bound to {@link log}. */
-let sink: ChatSink;
+let sink: ChatSinkWithReset;
 
 beforeEach(() => {
   document.body.replaceChildren();
@@ -437,5 +437,174 @@ describe("createSink — confirm card", () => {
     expect(() =>
       log.querySelector<HTMLButtonElement>(".confirm-btn-destructive")?.click()
     ).not.toThrow();
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* History rehydration (Phase 10 follow-up — `renderHistory`)                  */
+/* -------------------------------------------------------------------------- */
+
+describe("createSink — history rehydration", () => {
+  it("test_webview_history_rendersUserAndAgentBubblesInOrder", () => {
+    sink.renderHistory([
+      { role: "user", text: "what's in this track?" },
+      { role: "assistant", text: "A Reverb and a Compressor." },
+      { role: "user", text: "rename it" },
+    ]);
+
+    // The restored bubbles reuse the SAME live classes, in chronological order.
+    const bubbles = log.querySelectorAll(".msg");
+    expect(bubbles).toHaveLength(3);
+    expect(bubbles[0]?.className).toBe("msg msg-user");
+    expect(bubbles[0]?.textContent).toBe("what's in this track?");
+    expect(bubbles[1]?.className).toBe("msg msg-agent");
+    expect(bubbles[1]?.textContent).toBe("A Reverb and a Compressor.");
+    expect(bubbles[2]?.className).toBe("msg msg-user");
+    expect(bubbles[2]?.textContent).toBe("rename it");
+
+    // One user-bubble per user item, one agent-bubble per assistant item.
+    expect(log.querySelectorAll(".msg-user")).toHaveLength(2);
+    expect(log.querySelectorAll(".msg-agent")).toHaveLength(1);
+    // Restored assistant bubbles are finished — no streaming caret.
+    expect(log.querySelectorAll(".caret")).toHaveLength(0);
+  });
+
+  it("test_webview_history_xssInert_textContentVerbatimNoInjection", () => {
+    const evil = '<img src=x onerror="alert(1)"><b>x</b>';
+    sink.renderHistory([
+      { role: "user", text: evil },
+      { role: "assistant", text: "<script>steal()</script>" },
+    ]);
+
+    const bubbles = log.querySelectorAll(".msg");
+    // The markup round-trips as inert plain text (set via textContent).
+    expect(bubbles[0]?.textContent).toBe(evil);
+    expect(bubbles[1]?.textContent).toBe("<script>steal()</script>");
+    // No element nodes were injected from the payload strings.
+    expect(log.querySelector("img")).toBeNull();
+    expect(log.querySelector("b")).toBeNull();
+    expect(log.querySelector("script")).toBeNull();
+  });
+
+  it("test_webview_history_dividerPresentWithLabelWhenItemsNonEmpty", () => {
+    sink.renderHistory([{ role: "user", text: "hi" }]);
+
+    const divider = log.querySelector(".history-divider");
+    expect(divider).not.toBeNull();
+    // Decorative + a11y-inert so the restored bubbles are not double-narrated.
+    expect(divider?.getAttribute("aria-hidden")).toBe("true");
+    expect(divider?.querySelector(".history-divider-label")?.textContent).toBe(
+      "Restored from your last session"
+    );
+  });
+
+  it("test_webview_history_emptyArray_rendersNothingNoDivider", () => {
+    // Pinned impl behavior: renderHistory([]) early-returns — no bubbles, and
+    // (crucially) no orphan divider for an empty restored block.
+    sink.renderHistory([]);
+
+    expect(log.querySelectorAll(".msg")).toHaveLength(0);
+    expect(log.querySelector(".history-divider")).toBeNull();
+    expect(log.childElementCount).toBe(0);
+  });
+
+  it("test_webview_history_thenStreamingOpensFreshAgentBubbleUntouched", () => {
+    // After rehydration, a live turn must open a BRAND-NEW agent bubble rather
+    // than appending into a restored assistant bubble: renderHistory must not
+    // touch the streaming accumulator (streamText/streamBubble stay null).
+    sink.renderHistory([
+      { role: "user", text: "earlier question" },
+      { role: "assistant", text: "earlier answer" },
+    ]);
+
+    // Snapshot the restored agent bubble + its text before streaming.
+    const restoredAgent = log.querySelectorAll(".msg-agent");
+    expect(restoredAgent).toHaveLength(1);
+    const restoredAgentNode = restoredAgent[0];
+
+    // A fresh streamed turn.
+    sink.appendAssistantDelta("Hi");
+    sink.finishAssistant("end_turn");
+
+    const agents = log.querySelectorAll(".msg-agent");
+    // Two agent bubbles now: the restored one + the freshly streamed one.
+    expect(agents).toHaveLength(2);
+    // The restored bubble is unchanged (same node, same text — NOT appended into).
+    expect(agents[0]).toBe(restoredAgentNode);
+    expect(agents[0]?.textContent).toBe("earlier answer");
+    // The streamed text landed in its OWN, new node.
+    expect(agents[1]).not.toBe(restoredAgentNode);
+    expect(agents[1]?.textContent).toBe("Hi");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* "New chat" reset — sink.clear() (the header New chat button's UI seam)      */
+/* -------------------------------------------------------------------------- */
+
+describe("createSink — clear() reset", () => {
+  it("test_webview_newChat_clearWipesAllRenderedContent", () => {
+    // Populate the log across EVERY render surface: a streamed bubble, a
+    // tool-activity chip, a confirm card, and restored history bubbles.
+    sink.appendAssistantDelta("streaming…");
+    sink.appendToolActivity("live_update_track", "Rename track", "started");
+    sink.appendConfirmCard("plan-x", "This deletes 1 thing.", [
+      "Delete track:1:Bass",
+    ]);
+    sink.renderHistory([
+      { role: "user", text: "earlier question" },
+      { role: "assistant", text: "earlier answer" },
+    ]);
+    // Sanity: the log is non-empty before the reset.
+    expect(log.childNodes.length).toBeGreaterThan(0);
+
+    sink.clear();
+
+    // Every rendered node is gone — bubbles, chips, the card, the divider.
+    expect(log.childNodes.length).toBe(0);
+    expect(log.querySelector(".msg")).toBeNull();
+    expect(log.querySelector(".chip")).toBeNull();
+    expect(log.querySelector(".confirm-card")).toBeNull();
+    expect(log.querySelector(".history-divider")).toBeNull();
+  });
+
+  it("test_webview_newChat_clearResetsStreamAccumulatorSoNextDeltaOpensFreshBubble", () => {
+    // Open a streaming bubble (the accumulator now points at a live node)…
+    sink.appendAssistantDelta("partial-before-clear");
+    const before = log.querySelectorAll(".msg-agent");
+    expect(before).toHaveLength(1);
+    const staleBubble = before[0];
+
+    // …clear wipes the DOM AND nulls the accumulator…
+    sink.clear();
+    expect(log.querySelectorAll(".msg-agent")).toHaveLength(0);
+
+    // …so the next delta opens a BRAND-NEW bubble rather than appending into the
+    // (now-removed) stale node. This proves `streamBubble/streamText` were reset.
+    sink.appendAssistantDelta("x");
+    const after = log.querySelectorAll(".msg-agent");
+    expect(after).toHaveLength(1);
+    expect(after[0]).not.toBe(staleBubble);
+    expect(after[0]?.textContent).toBe("x");
+    // A fresh stream → exactly one live caret in the new bubble.
+    expect(log.querySelectorAll(".caret")).toHaveLength(1);
+    expect(after[0]?.querySelector(".caret")).not.toBeNull();
+  });
+
+  it("test_webview_newChat_clearResetsChipRegistrySoLateSettleCannotRetarget", () => {
+    // A started chip is registered in the unsettled-chip map…
+    sink.appendToolActivity("live_set_param", "Set volume", "started");
+    expect(log.querySelectorAll(".chip")).toHaveLength(1);
+
+    // …clear drops the registry (and the DOM)…
+    sink.clear();
+    expect(log.querySelectorAll(".chip")).toHaveLength(0);
+
+    // …so a late `ok` for the cleared turn cannot re-target a removed chip; it
+    // renders as a fresh standalone settled chip instead of mutating a stale one.
+    sink.appendToolActivity("live_set_param", "Set volume", "ok");
+    const chips = log.querySelectorAll(".chip");
+    expect(chips).toHaveLength(1);
+    expect(chips[0]?.classList.contains("chip-ok")).toBe(true);
   });
 });

@@ -16,10 +16,11 @@
  *
  * Message table (§13):
  * - webview → ext  ({@link ClientMessage}):
- *     `ready`, `user_message`, `confirm_response`, `cancel`, `set_config`
+ *     `ready`, `user_message`, `confirm_response`, `cancel`, `set_config`,
+ *     `new_chat`
  * - ext → webview  ({@link ServerMessage}):
  *     `config_state`, `assistant_delta`, `assistant_done`, `tool_activity`,
- *     `confirm_request`, `refs_updated`, `error`
+ *     `confirm_request`, `refs_updated`, `error`, `history`
  *
  * Phase 7 wires only the `ready` / `user_message` / `cancel` inbound subset and
  * the `assistant_delta` / `assistant_done` / `tool_activity` / `refs_updated` /
@@ -42,7 +43,7 @@ export type ToolActivityStatus = "started" | "ok" | "error";
 /* Per-type payloads                                                          */
 /* -------------------------------------------------------------------------- */
 
-/** Empty payload, used by envelope-only messages (`ready`, `cancel`). */
+/** Empty payload, used by envelope-only messages (`ready`, `cancel`, `new_chat`). */
 export type EmptyPayload = Record<string, never>;
 
 /** `user_message` payload: the user's chat input text. */
@@ -119,6 +120,29 @@ export interface ErrorPayload {
   message: string;
 }
 
+/**
+ * One restored conversation turn projected to renderable text (Phase 10 UI
+ * rehydration). Carries ONLY the display role + text — never tool internals,
+ * raw content blocks, system text, or any key/secret (§10).
+ */
+export interface HistoryItem {
+  /** Whether this line is a user utterance or an assistant reply. */
+  role: "user" | "assistant";
+  /** The display text for this turn (already projected by the extension). */
+  text: string;
+}
+
+/**
+ * `history` payload: the restored conversation, replayed into a freshly-opened
+ * chat window so a reopened session shows the prior messages rather than a blank
+ * chat. Sent once, right after `config_state` on `ready`, only when there is
+ * renderable history (§13, §10).
+ */
+export interface HistoryPayload {
+  /** The restored turns, in order, projected to user/assistant text lines. */
+  items: HistoryItem[];
+}
+
 /* -------------------------------------------------------------------------- */
 /* Envelope + message unions                                                  */
 /* -------------------------------------------------------------------------- */
@@ -162,6 +186,19 @@ export type ConfirmResponseMessage = Envelope<
 export type CancelMessage = Envelope<"cancel", EmptyPayload>;
 /** `set_config`: the user updated API key and/or model. */
 export type SetConfigMessage = Envelope<"set_config", SetConfigPayload>;
+/**
+ * `new_chat`: the user clicked the "New chat" control to clear the current
+ * conversation and start a fresh one.
+ *
+ * DELIBERATE PROTOCOL EXTENSION (mirrors the `history` precedent): §13's message
+ * table was treated as "frozen", but a "New chat" control is a real, documented
+ * feature — the chat auto-restores the newest transcript on launch, and this is
+ * the only way to clear it and begin a new conversation. This new webview → ext
+ * type is intentional and additive; no existing message type is altered. The
+ * handler resets the in-memory transcript and starts persisting to a NEW session
+ * file, leaving the prior conversation's file untouched on disk (§10).
+ */
+export type NewChatMessage = Envelope<"new_chat", EmptyPayload>;
 
 /* ext → webview ------------------------------------------------------------ */
 
@@ -191,6 +228,16 @@ export type ConfirmRequestMessage = Envelope<
 export type RefsUpdatedMessage = Envelope<"refs_updated", RefsUpdatedPayload>;
 /** `error`: a failure to surface in the UI. */
 export type ErrorMessage = Envelope<"error", ErrorPayload>;
+/**
+ * `history`: the restored conversation replayed on `ready` (Phase 10 UI
+ * rehydration).
+ *
+ * DELIBERATE PROTOCOL EXTENSION: §13's message table was treated as "frozen"
+ * through Phases 7/8/9, but this is a real, documented feature — a reopened chat
+ * must show its restored history. This new server→webview type is intentional
+ * and additive; no existing message type is altered.
+ */
+export type HistoryMessage = Envelope<"history", HistoryPayload>;
 
 /** Discriminated union of every webview → extension message. */
 export type ClientMessage =
@@ -198,7 +245,8 @@ export type ClientMessage =
   | UserMessageMessage
   | ConfirmResponseMessage
   | CancelMessage
-  | SetConfigMessage;
+  | SetConfigMessage
+  | NewChatMessage;
 
 /** Discriminated union of every extension → webview message. */
 export type ServerMessage =
@@ -208,7 +256,8 @@ export type ServerMessage =
   | ToolActivityMessage
   | ConfirmRequestMessage
   | RefsUpdatedMessage
-  | ErrorMessage;
+  | ErrorMessage
+  | HistoryMessage;
 
 /** Discriminated union of every protocol message, either direction. */
 export type ProtocolMessage = ClientMessage | ServerMessage;
@@ -226,6 +275,7 @@ export interface MessageByType {
   confirm_response: ConfirmResponseMessage;
   cancel: CancelMessage;
   set_config: SetConfigMessage;
+  new_chat: NewChatMessage;
   config_state: ConfigStateMessage;
   assistant_delta: AssistantDeltaMessage;
   assistant_done: AssistantDoneMessage;
@@ -233,6 +283,7 @@ export interface MessageByType {
   confirm_request: ConfirmRequestMessage;
   refs_updated: RefsUpdatedMessage;
   error: ErrorMessage;
+  history: HistoryMessage;
 }
 
 /** The set of webview → ext discriminants, for runtime classification. */
@@ -242,6 +293,7 @@ const CLIENT_TYPES: ReadonlySet<MessageType> = new Set<MessageType>([
   "confirm_response",
   "cancel",
   "set_config",
+  "new_chat",
 ]);
 
 /** The set of ext → webview discriminants, for runtime classification. */
@@ -253,6 +305,7 @@ const SERVER_TYPES: ReadonlySet<MessageType> = new Set<MessageType>([
   "confirm_request",
   "refs_updated",
   "error",
+  "history",
 ]);
 
 /* -------------------------------------------------------------------------- */
@@ -334,6 +387,24 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((v) => typeof v === "string");
 }
 
+/**
+ * True if `value` is a valid {@link HistoryItem}: a record whose `role` is the
+ * string `"user"` or `"assistant"` and whose `text` is a string. Defensive (no
+ * throw) — used to validate restored `history` frames element-by-element.
+ */
+function isHistoryItem(value: unknown): value is HistoryItem {
+  return (
+    isRecord(value) &&
+    (value.role === "user" || value.role === "assistant") &&
+    typeof value.text === "string"
+  );
+}
+
+/** True if `value` is an array whose every element is a {@link HistoryItem}. */
+function isHistoryItemArray(value: unknown): value is HistoryItem[] {
+  return Array.isArray(value) && value.every(isHistoryItem);
+}
+
 /** True if `value` is a known {@link MessageType} discriminant. */
 function isKnownType(value: unknown): value is MessageType {
   return (
@@ -358,6 +429,7 @@ function validatePayload(type: MessageType, payload: unknown): string | null {
   switch (type) {
     case "ready":
     case "cancel":
+    case "new_chat":
       // Empty-payload messages: presence of extra keys is tolerated but not
       // required; an object payload is sufficient.
       return null;
@@ -434,6 +506,11 @@ function validatePayload(type: MessageType, payload: unknown): string | null {
       return typeof payload.message === "string"
         ? null
         : `"error" requires a string "message"`;
+
+    case "history":
+      return isHistoryItemArray(payload.items)
+        ? null
+        : `"history" requires an "items" array of { role: "user" | "assistant", text: string }`;
 
     default: {
       // Exhaustiveness guard: every MessageType must be handled above.

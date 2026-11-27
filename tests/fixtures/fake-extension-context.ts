@@ -115,6 +115,16 @@ export interface FakeChainMixer extends FakeObject {
   readonly sends: FakeDeviceParameter[];
 }
 
+/**
+ * Mirror of the SDK `Sample` (the value of `Simpler.sample`). The real SDK type is
+ * `Sample<V> | null` with a `filePath` getter; the fake only needs `filePath` (the
+ * executor checks identity against `null`, never reads fields). `className` is
+ * "Sample" for parity, though the fake does not resolve Samples by handle.
+ */
+export interface FakeSample {
+  readonly filePath: string;
+}
+
 export interface FakeDevice extends FakeObject {
   readonly name: string;
   readonly parameters: FakeDeviceParameter[];
@@ -122,6 +132,13 @@ export interface FakeDevice extends FakeObject {
   readonly chains?: FakeChain[];
   /** Present only on RackDevice/DrumRack nodes; async (returns the new chain). */
   insertChain?(index: number): Promise<FakeChain>;
+  /**
+   * Present only on Simpler nodes: the SYNC `Simpler.sample` getter (SDK type
+   * `Sample<V> | null`). `null` ⇒ an EMPTY Simpler (e.g. freshly inserted) — the
+   * executor refuses `live_replace_sample` up front in that case. A seeded/default
+   * Simpler reports a non-null {@link FakeSample}.
+   */
+  readonly sample?: FakeSample | null;
   /** Present only on Simpler nodes; async (returns the new sample's managed path). */
   replaceSample?(filePath: string): Promise<{ filePath: string }>;
 }
@@ -144,14 +161,68 @@ export interface FakeClip extends FakeObject {
   warping?: boolean;
   /** AudioClip only (undefined on MIDI clips). */
   warpMode?: number;
+  /**
+   * AudioClip only (undefined on MIDI clips). The managed source path the clip was
+   * created from (Phase 14). The SDK's `AudioClip` exposes `filePath`; the fixture
+   * surfaces it so a test can assert which sample a `live_create_clip` (audio) call
+   * landed in the clip. `null` for an audio clip that carries no path (e.g. one
+   * seeded without a `filePath`).
+   */
+  filePath?: string | null;
   /** MidiClip only (undefined on audio clips); getter returns a fresh copy. */
   notes?: FakeNoteDescription[];
+}
+
+/**
+ * Mirror of the SDK `ClipLoopSettings` (all fields required, all in beats). The
+ * fixture stores it verbatim on the created clip node only so that, if needed, a
+ * test could inspect it later; the executors enforce the value constraints, so the
+ * fake does not validate them.
+ */
+export interface FakeClipLoopSettings {
+  looping: boolean;
+  startMarker: number;
+  endMarker: number;
+  loopStart: number;
+  loopEnd: number;
+}
+
+/**
+ * Arg object for `ClipSlot.createAudioClip` (session slots — NO `startTime` /
+ * `duration`, mirroring the SDK `index.d.mts:437`).
+ */
+export interface FakeCreateAudioClipSlotArgs {
+  filePath: string;
+  isWarped?: boolean;
+  loopSettings?: FakeClipLoopSettings;
+}
+
+/**
+ * Arg object for `AudioTrack.createAudioClip` / `TakeLane.createAudioClip`
+ * (arrangement / take lane — `startTime` required, `duration` optional, mirroring
+ * the SDK `index.d.mts:598` / `:482`).
+ */
+export interface FakeCreateAudioClipTimedArgs {
+  filePath: string;
+  startTime: number;
+  duration?: number;
+  isWarped?: boolean;
+  loopSettings?: FakeClipLoopSettings;
 }
 
 export interface FakeClipSlot extends FakeObject {
   /** ClipSlot has NO name (SDK fidelity). */
   readonly clip: FakeClip | null;
   createMidiClip(length: number): Promise<FakeClip>;
+  /**
+   * Session-slot audio create (Phase 14). Mirrors `createMidiClip`: async, slots the
+   * resulting `FakeClip` into this slot's single clip pointer, and (like
+   * `createMidiClip`) performs its tree mutation in a resolved-Promise body so it
+   * lands AFTER the enclosing `withinTransaction` callback returns — therefore it is
+   * NOT journaled for sync-throw rollback, matching the SDK's async create semantics.
+   * The created clip carries `filePath`/`warping`/`warpMode` from `args`.
+   */
+  createAudioClip(args: FakeCreateAudioClipSlotArgs): Promise<FakeClip>;
   deleteClip(): Promise<void>;
 }
 
@@ -159,6 +230,8 @@ export interface FakeTakeLane extends FakeObject {
   name: string;
   readonly clips: FakeClip[];
   createMidiClip(startTime: number, duration: number): Promise<FakeClip>;
+  /** Take-lane audio create (Phase 14); see {@link FakeClipSlot.createAudioClip}. */
+  createAudioClip(args: FakeCreateAudioClipTimedArgs): Promise<FakeClip>;
 }
 
 export interface FakeTrack extends FakeObject {
@@ -176,6 +249,13 @@ export interface FakeTrack extends FakeObject {
   duplicateDevice(device: FakeDevice): Promise<FakeDevice>;
   deleteDevice(device: FakeDevice): Promise<void>;
   deleteClip(clip: FakeClip): Promise<void>;
+  /**
+   * Arrangement audio create (Phase 14); see {@link FakeClipSlot.createAudioClip}.
+   * Present on every materialized track (the fixture builds all tracks via one
+   * factory); the executor's `className === "AudioTrack"` guard is what gates real
+   * use, so a test driving a MidiTrack render/create still exercises that guard.
+   */
+  createAudioClip(args: FakeCreateAudioClipTimedArgs): Promise<FakeClip>;
 }
 
 /** MidiTrack adds the arrangement createMidiClip(startTime, duration). */
@@ -198,6 +278,16 @@ export interface FakeSong extends FakeObject {
   readonly scenes: FakeScene[];
   readonly cuePoints: FakeCuePoint[];
   tempo: number;
+  /**
+   * Project-header scale/grid getters read by `live_get_project` (§8.1). Each is
+   * `null` unless explicitly seeded via {@link SetSpec}, mirroring the executor's
+   * "unseeded getter reads as null" contract and keeping existing tests green.
+   */
+  readonly scaleName: string | null;
+  readonly scaleMode: boolean | null;
+  readonly rootNote: number | null;
+  readonly gridQuantization: number | null;
+  readonly gridIsTriplet: boolean | null;
   createAudioTrack(): Promise<FakeTrack>;
   createMidiTrack(): Promise<FakeMidiTrack>;
   createScene(index: number): Promise<FakeScene>;
@@ -242,6 +332,11 @@ interface FakeNode {
   /** AudioClip-only warp state. `undefined` ⇒ not an audio clip. */
   warping?: boolean;
   warpMode?: number;
+  /**
+   * AudioClip-only source path (Phase 14). Only meaningful when warp state is
+   * present (i.e. the node is an audio clip). `null` ⇒ audio clip with no path set.
+   */
+  filePath?: string | null;
   /** MidiClip-only note buffer. `undefined` ⇒ not a midi clip. */
   notes?: FakeNoteDescription[];
   /** DeviceParameter spec/state. `undefined` ⇒ not a parameter. */
@@ -252,6 +347,12 @@ interface FakeNode {
     value: number;
     valueItems: { name: string; shortName: string }[];
   };
+  /**
+   * Simpler-only loaded-sample state (SDK `Simpler.sample: Sample | null`). For a
+   * Simpler node this is always set: `{ filePath }` for a loaded sample, or `null`
+   * for an empty Simpler. `undefined` ⇒ not a Simpler.
+   */
+  sample?: { filePath: string } | null;
 }
 
 /**
@@ -370,6 +471,13 @@ export interface NodeSpec {
   /** AudioClip warp seed; presence marks the clip as audio. */
   warping?: boolean;
   warpMode?: number;
+  /**
+   * AudioClip source-path seed (Phase 14). Like `warping`/`warpMode`, its presence
+   * marks the clip as audio (so the `filePath` accessor is wired). Seed it to assert
+   * `live_get_clip` / re-read behavior; `live_create_clip` (audio) sets it at
+   * creation time from the call args.
+   */
+  filePath?: string | null;
   /** MidiClip note seed; presence marks the clip as midi. */
   notes?: FakeNoteDescription[];
   /** DeviceParameter seed; presence required for getValue/setValue to behave. */
@@ -380,16 +488,49 @@ export interface NodeSpec {
     value?: number;
     valueItems?: { name: string; shortName: string }[];
   };
+  /**
+   * Simpler-only loaded-sample seed (Phase 14). Controls the `Simpler.sample`
+   * getter: pass `null` to seed an EMPTY Simpler (the `live_replace_sample` guard
+   * then refuses), or `{ filePath }` for a specific loaded sample. OMITTED on a
+   * Simpler node ⇒ a default non-null sample (so the SDK's "replace an already
+   * loaded sample" happy path works without ceremony). Ignored on non-Simpler nodes.
+   */
+  sample?: { filePath: string } | null;
 }
 
 /** Spec for the whole Set passed to {@link makeFakeContext}. */
 export interface SetSpec {
   tempo?: number;
+  /**
+   * Project-header scale/grid fields read by `live_get_project` (§8.1). All are
+   * optional and, when omitted, the fake `song` getter reads as `null` (the
+   * executor's unseeded-getter contract) — so leaving them unset never changes a
+   * current assertion. Seed any of them to make `live_get_project` return it.
+   */
+  scaleName?: string;
+  scaleMode?: boolean;
+  rootNote?: number;
+  gridQuantization?: number;
+  gridIsTriplet?: boolean;
   tracks?: NodeSpec[];
   returnTracks?: NodeSpec[];
   mainTrack?: NodeSpec;
   scenes?: NodeSpec[];
   cuePoints?: NodeSpec[];
+}
+
+/**
+ * Optional control over the fake `ctx.environment` (Phase 10). Both fields
+ * default to `undefined` — the SDK's first-class "no storage granted" path —
+ * so existing tests that never touch persistence are unaffected. A test that
+ * exercises the config / transcript stores passes a real `fs.mkdtempSync` dir
+ * here (and cleans it up in `afterEach`).
+ */
+export interface EnvSpec {
+  /** `ctx.environment.storageDirectory` (defaults to `undefined`). */
+  storageDirectory?: string;
+  /** `ctx.environment.tempDirectory` (defaults to `undefined`). */
+  tempDirectory?: string;
 }
 // #endregion
 
@@ -411,8 +552,71 @@ export interface SetSpec {
  *  - `"tracks[0]/takeLanes[0]/clips[0]"`  → first clip of take lane 0
  *  - `"scenes[1]"`, `"cuePoints[0]"`, `"returnTracks[0]"`, `"mainTrack"`
  */
+/**
+ * Mirror of the SDK `Resources` service (Phase 14, §8.1/§8.3). Only the two methods
+ * the audio executors call are modeled. Both are async and resolve to a deterministic
+ * path so tests are wall-clock-free and assertion-friendly; both record their call
+ * args (see {@link FakeExtensionContext.resourceCalls}) and honor the opt-in
+ * force-error toggles (see {@link FakeExtensionContext.failImport} /
+ * {@link FakeExtensionContext.failRender}).
+ */
+export interface FakeResources {
+  /**
+   * Mirrors `Resources.importIntoProject(filePath): Promise<string>`. Resolves to a
+   * deterministic managed path `"managed:" + <basename of filePath>`. Records the
+   * call. Rejects with the configured `Error` when {@link FakeExtensionContext.failImport}
+   * is armed.
+   */
+  importIntoProject(filePath: string): Promise<string>;
+  /**
+   * Mirrors `Resources.renderPreFxAudio(track, startTime, endTime): Promise<string>`
+   * (start/end are BEATS, passed straight through). Resolves to a deterministic temp
+   * WAV path: `<tempDirectory>/render-<start>-<end>.wav` when `environment.tempDirectory`
+   * is set, else `/tmp/render-<start>-<end>.wav`. Records the call (including the
+   * track's handle id). Rejects with the configured `Error` when
+   * {@link FakeExtensionContext.failRender} is armed.
+   */
+  renderPreFxAudio(
+    track: FakeObject,
+    startTime: number,
+    endTime: number
+  ): Promise<string>;
+}
+
+/**
+ * One recorded {@link FakeResources} invocation, in call order, for assertions.
+ * `kind` discriminates the method; `args` carries the verbatim arguments (the
+ * render entry records the track's handle id, since the proxy object itself is not
+ * stable across re-resolution).
+ */
+export type FakeResourceCall =
+  | { kind: "importIntoProject"; filePath: string }
+  | {
+      kind: "renderPreFxAudio";
+      trackHandleId: bigint;
+      startTime: number;
+      endTime: number;
+    };
+
 export interface FakeExtensionContext {
   application: { song: FakeSong };
+
+  /**
+   * Mirror of the SDK `ctx.resources` (Phase 14). Absent before Phase 14; added here
+   * so the audio executors (`live_import_audio`, `live_render_audio`) can run against
+   * the fake. See {@link FakeResources}.
+   */
+  resources: FakeResources;
+
+  /**
+   * Mirror of the SDK `ctx.environment`. Per `.claude/rules/testing.md` the
+   * FakeExtensionContext is expected to expose `environment`; consumers
+   * (`ChatSession`, the config/transcript stores) read `storageDirectory` /
+   * `tempDirectory`, both of which the real SDK types as `string | undefined`.
+   * Backed by sync own-properties so a plain `ctx.environment.storageDirectory`
+   * read works exactly like the real (synchronous) getter.
+   */
+  environment: { storageDirectory?: string; tempDirectory?: string };
 
   /** Synchronous; throws a single generic `Error` for deleted/wrong-type/unknown — never returns null. */
   getObjectFromHandle<T>(handle: Handle, type: AbstractCtor<T>): T;
@@ -496,6 +700,40 @@ export interface FakeExtensionContext {
    * Off by default; once set it stays on for the context's lifetime.
    */
   failNameSets(message: string): void;
+
+  /**
+   * Observability for tests (NOT part of the SDK). Every {@link FakeResources} call
+   * is appended here in invocation order (including calls that then reject due to a
+   * force-error toggle — recorded BEFORE rejection so a test can assert the call was
+   * attempted). Returns a fresh copy each read.
+   */
+  readonly resourceCalls: ReadonlyArray<FakeResourceCall>;
+
+  /**
+   * Observability for tests (NOT part of the SDK). Each `Simpler.replaceSample` call
+   * on a fixture-materialized Simpler device, in order, as
+   * `{ simplerHandleId, filePath }`. Lets a test assert the replace fired and with
+   * what path WITHOUT a `routeHandleTo` spy (the spy seam still works for tests that
+   * prefer it). Returns a fresh copy each read.
+   */
+  readonly replaceSampleCalls: ReadonlyArray<{
+    simplerHandleId: bigint;
+    filePath: string;
+  }>;
+
+  /**
+   * Opt-in (mirrors {@link failNameSets}): make `resources.importIntoProject` REJECT
+   * with `Error(message)` instead of resolving. Models an SDK/import failure so the
+   * executor's structured-error mapping is exercised. Off by default; once armed it
+   * stays armed for the context's lifetime.
+   */
+  failImport(message: string): void;
+
+  /**
+   * Opt-in (mirrors {@link failNameSets}): make `resources.renderPreFxAudio` REJECT
+   * with `Error(message)` instead of resolving. Off by default; sticky once armed.
+   */
+  failRender(message: string): void;
 }
 // #endregion
 
@@ -505,7 +743,10 @@ export interface FakeExtensionContext {
  * {@link SetSpec} to customize, or omit it for the deterministic default Set
  * documented on {@link makeFakeContext}.
  */
-export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
+export function makeFakeContext(
+  spec?: SetSpec,
+  env: EnvSpec = {}
+): FakeExtensionContext {
   let nextId = 1n;
   const allocId = (): bigint => nextId++;
 
@@ -526,10 +767,19 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
       looping: s.looping ?? false,
       muted: s.muted ?? false,
     };
-    // AudioClip warp state: present iff a warp seed was given OR the class is AudioClip.
-    if (s.warping !== undefined || s.warpMode !== undefined) {
+    // AudioClip warp state: present iff a warp OR filePath seed was given. (A
+    // `filePath` seed alone is enough to mark the clip as audio so its warp +
+    // filePath accessors are wired — matching the create-time path. NB: a bare
+    // `className: "AudioClip"` with no seed still wires NO audio accessors, exactly
+    // as before — this branch is additive on the seed presence only.)
+    if (
+      s.warping !== undefined ||
+      s.warpMode !== undefined ||
+      s.filePath !== undefined
+    ) {
       node.warping = s.warping ?? false;
       node.warpMode = s.warpMode ?? FakeWarpMode.Beats;
+      node.filePath = s.filePath ?? null;
     }
     // MidiClip notes: present iff a notes seed was given OR the class is MidiClip.
     if (s.notes !== undefined) {
@@ -548,6 +798,13 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         value: s.param?.value ?? min,
         valueItems: s.param?.valueItems ?? [],
       };
+    }
+    // Simpler loaded-sample state. A Simpler ALWAYS has a defined `sample` (the SDK
+    // getter is `Sample | null`): an explicit `sample` seed wins (`null` ⇒ empty),
+    // otherwise it defaults to a non-null sample so the replace happy path works.
+    if (s.className === "Simpler") {
+      node.sample =
+        "sample" in s ? (s.sample ?? null) : { filePath: "seed:loaded.wav" };
     }
     byId.set(node.id, node);
 
@@ -621,6 +878,19 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
   const commitHooks: ((committedCount: number) => void)[] = [];
   /** Opt-in: when set, every name setter throws `Error(this)` (see {@link failNameSets}). */
   let nameSetterError: string | null = null;
+  /** Recorded {@link FakeResources} calls, in order (see {@link FakeResourceCall}). */
+  const resourceCalls: FakeResourceCall[] = [];
+  /**
+   * Recorded `Simpler.replaceSample` calls on FIXTURE-MATERIALIZED Simpler devices,
+   * in order, each `{ simplerHandleId, filePath }`. (A test may instead spy via the
+   * `routeHandleTo` seam with its own instance; this log is the no-spy alternative,
+   * so the replace path is recordable either way — see {@link FakeExtensionContext.replaceSampleCalls}.)
+   */
+  const replaceSampleCalls: { simplerHandleId: bigint; filePath: string }[] =
+    [];
+  /** Opt-in force-error messages for the two resource methods (`null` ⇒ resolve). */
+  let importError: string | null = null;
+  let renderError: string | null = null;
   /**
    * While a transaction is open, every SYNC mutation pushes an undo thunk here so a
    * sync throw can roll back in reverse order (R5 = atomic). `null` ⇒ no open
@@ -725,6 +995,7 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
     if (node.warping !== undefined) {
       spec.warping = node.warping;
       spec.warpMode = node.warpMode;
+      spec.filePath = node.filePath ?? null;
     }
     if (node.notes !== undefined) {
       spec.notes = node.notes.map((n) => ({ ...n }));
@@ -735,7 +1006,35 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         valueItems: node.param.valueItems.map((v) => ({ ...v })),
       };
     }
+    // Preserve Simpler loaded-sample state across duplicate (Sample | null).
+    if (node.sample !== undefined) {
+      spec.sample = node.sample ? { filePath: node.sample.filePath } : null;
+    }
     return spec;
+  }
+
+  /**
+   * Builds the {@link NodeSpec} for an AudioClip created by `createAudioClip`,
+   * mapping the SDK arg object onto the fake's seed fields:
+   *  - `filePath`  → `filePath` seed (marks the node as audio, wires the accessor).
+   *  - `isWarped`  → `warping` seed (defaults to `false` when omitted, mirroring how
+   *    the fake represents an unset warp flag; the executor enforces the SDK's
+   *    "isWarped required when loopSettings given" rule before reaching here).
+   * The `warpMode` defaults to `Beats` (the fixture's existing audio-clip default).
+   * `loopSettings` is not stored as a clip accessor (the SDK exposes it only at
+   * create time and as separate read fields the fixture does not model); it is
+   * intentionally not surfaced — tests assert on `filePath`/`warping`.
+   */
+  function audioClipSpecFromArgs(args: {
+    filePath: string;
+    isWarped?: boolean;
+  }): NodeSpec {
+    return {
+      className: "AudioClip",
+      name: "",
+      filePath: args.filePath,
+      warping: args.isWarped ?? false,
+    };
   }
 
   /** Finds the (live) sibling node of `parent.children[key]` whose handle matches. */
@@ -892,6 +1191,14 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
           node.warpMode = value;
         },
       });
+      // AudioClip-only source path (Phase 14). Read-only in the SDK (no setter), so
+      // the fixture exposes a getter only; it is set at create time on the node.
+      Object.defineProperty(clip, "filePath", {
+        enumerable: true,
+        get() {
+          return node.filePath ?? null;
+        },
+      });
     }
     // MidiClip-only notes accessor (full-array replace; getter returns a fresh copy).
     if (node.notes !== undefined) {
@@ -954,11 +1261,23 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         },
       };
     }
-    // Simpler exposes replaceSample.
+    // Simpler exposes the sync `sample` getter (Sample | null) + replaceSample.
+    // `sample` reflects the node's loaded-sample state live; `replaceSample` resolves
+    // to a Sample-shaped object (the SDK returns a `Sample` whose `filePath` is the
+    // new managed path), the executor only awaits it. Records the call (no-spy
+    // alternative to `routeHandleTo`).
     if (node.className === "Simpler") {
       return {
         ...base,
+        get sample(): FakeSample | null {
+          const s = node.sample;
+          return s ? { filePath: s.filePath } : null;
+        },
         replaceSample(filePath: string): Promise<{ filePath: string }> {
+          replaceSampleCalls.push({ simplerHandleId: node.id, filePath });
+          // Mirror the SDK: a successful replace leaves the Simpler with a sample
+          // loaded (so a follow-up replace is still valid).
+          node.sample = { filePath };
           return Promise.resolve({ filePath });
         },
       };
@@ -1047,6 +1366,17 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
           return makeClip(fresh);
         });
       },
+      createAudioClip(args: FakeCreateAudioClipSlotArgs): Promise<FakeClip> {
+        // Mirrors createMidiClip: async create lands AFTER the txn callback returns
+        // (no journal entry, matching SDK async create semantics). The new AudioClip
+        // node carries the call's filePath + warp state so a test can assert which
+        // sample landed in the slot.
+        return Promise.resolve().then(() => {
+          const fresh = buildNode(audioClipSpecFromArgs(args));
+          node.clip = fresh;
+          return makeClip(fresh);
+        });
+      },
       deleteClip(): Promise<void> {
         return Promise.resolve().then(() => {
           if (node.clip) {
@@ -1084,6 +1414,13 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
             name: "",
             notes: [],
           });
+          return makeClip(fresh);
+        });
+      },
+      createAudioClip(args: FakeCreateAudioClipTimedArgs): Promise<FakeClip> {
+        // Mirrors createMidiClip on the take lane (appends to `clips`, async).
+        return Promise.resolve().then(() => {
+          const fresh = appendChild(node, "clips", audioClipSpecFromArgs(args));
           return makeClip(fresh);
         });
       },
@@ -1188,6 +1525,19 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
           return makeClip(fresh);
         });
       },
+      createAudioClip(args: FakeCreateAudioClipTimedArgs): Promise<FakeClip> {
+        // Mirrors createMidiClip on the arrangement (appends to `arrangementClips`).
+        // Present on every track proxy; the executor's AudioTrack class guard gates
+        // real use, so a MidiTrack create attempt is refused by the executor, not here.
+        return Promise.resolve().then(() => {
+          const fresh = appendChild(
+            node,
+            "arrangementClips",
+            audioClipSpecFromArgs(args)
+          );
+          return makeClip(fresh);
+        });
+      },
     };
     return track;
   }
@@ -1252,6 +1602,23 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         tempoState.value = prev;
       });
       tempoState.value = value;
+    },
+    // Project-header scale/grid getters: return the seeded value or `null` when
+    // unseeded (matching the executor's unseeded-getter contract; §8.1).
+    get scaleName() {
+      return filled.scaleName ?? null;
+    },
+    get scaleMode() {
+      return filled.scaleMode ?? null;
+    },
+    get rootNote() {
+      return filled.rootNote ?? null;
+    },
+    get gridQuantization() {
+      return filled.gridQuantization ?? null;
+    },
+    get gridIsTriplet() {
+      return filled.gridIsTriplet ?? null;
     },
     createAudioTrack(): Promise<FakeTrack> {
       return Promise.resolve().then(() =>
@@ -1328,6 +1695,40 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
         const at = live.indexOf(original) + 1;
         return makeScene(appendChild(songNode, "scenes", specOf(original), at));
       });
+    },
+  };
+
+  // --- resources service (Phase 14) ---
+  /** Last path segment of `p` (handles both `/` and `\` separators), or `p` itself. */
+  function basename(p: string): string {
+    const segs = p.split(/[/\\]/);
+    return segs[segs.length - 1] || p;
+  }
+  const resources: FakeResources = {
+    importIntoProject(filePath: string): Promise<string> {
+      // Record BEFORE the (possible) rejection so a test can assert it was attempted.
+      resourceCalls.push({ kind: "importIntoProject", filePath });
+      if (importError !== null) {
+        return Promise.reject(new Error(importError));
+      }
+      return Promise.resolve(`managed:${basename(filePath)}`);
+    },
+    renderPreFxAudio(
+      track: FakeObject,
+      startTime: number,
+      endTime: number
+    ): Promise<string> {
+      resourceCalls.push({
+        kind: "renderPreFxAudio",
+        trackHandleId: track.handle.id,
+        startTime,
+        endTime,
+      });
+      if (renderError !== null) {
+        return Promise.reject(new Error(renderError));
+      }
+      const dir = env.tempDirectory ?? "/tmp";
+      return Promise.resolve(`${dir}/render-${startTime}-${endTime}.wav`);
     },
   };
 
@@ -1542,6 +1943,11 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
 
   return {
     application: { song },
+    resources,
+    environment: {
+      storageDirectory: env.storageDirectory,
+      tempDirectory: env.tempDirectory,
+    },
     getObjectFromHandle,
     withinTransaction,
     get transactions() {
@@ -1562,6 +1968,18 @@ export function makeFakeContext(spec?: SetSpec): FakeExtensionContext {
     },
     failNameSets(message: string): void {
       nameSetterError = message;
+    },
+    get resourceCalls() {
+      return resourceCalls.map((c) => ({ ...c }));
+    },
+    get replaceSampleCalls() {
+      return replaceSampleCalls.map((c) => ({ ...c }));
+    },
+    failImport(message: string): void {
+      importError = message;
+    },
+    failRender(message: string): void {
+      renderError = message;
     },
   };
 }

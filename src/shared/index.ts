@@ -9,3 +9,4 @@
 export const PROTOCOL_VERSION = 1 as const;
 
 export * from "./protocol.js";
+export * from "./context-budget.js";

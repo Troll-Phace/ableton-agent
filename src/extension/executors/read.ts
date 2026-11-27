@@ -20,25 +20,33 @@
  * eagerly across the whole Set.
  */
 
-import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
+import type {
+  ApiVersion,
+  AudioTrack,
+  ExtensionContext,
+} from "@ableton-extensions/sdk";
 
 import type { ToolCall, ToolResultPayload } from "../agent-loop.js";
 import type {
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
   LiveGetTrackArgs,
+  LiveRenderAudioArgs,
   ReportLimitationArgs,
 } from "../../shared/tools.js";
 import {
-  deferred,
+  beatsToSeconds,
   errorMessage,
   fail,
   invalidArgs,
   isRecord,
   ok,
   optString,
+  readNumber,
   readString,
   resolveOrFail,
+  sdkError,
+  unsupported,
   type Resolved,
 } from "./shared.js";
 
@@ -112,6 +120,113 @@ function summarizeNamed(items: unknown[]): { index: number; name: string }[] {
 }
 
 // ---------------------------------------------------------------------------
+// Shared shape builders (single source of truth for read tools + snapshot)
+// ---------------------------------------------------------------------------
+
+/**
+ * The shallow project-header shape (§8.1): tempo, scale, grid, and `{index,name}`
+ * lists of tracks / return tracks / scenes / cue points + the main-track name.
+ * Used by both {@link executeGetProject} and the per-turn snapshot serializer
+ * (`../snapshot`) so the two cannot drift. Reads `song.*` synchronously — no
+ * `getValue()`, no mutation.
+ */
+export interface ProjectHeader {
+  tempo: number | null;
+  scaleName: string | null;
+  scaleMode: boolean | null;
+  rootNote: number | null;
+  gridQuantization: number | null;
+  gridIsTriplet: boolean | null;
+  tracks: { index: number; name: string }[];
+  returnTracks: { index: number; name: string }[];
+  mainTrack: { name: string | null };
+  scenes: { index: number; name: string }[];
+  cuePoints: { index: number; name: string }[];
+}
+
+/**
+ * Build the shallow {@link ProjectHeader} off the freshly-read song. This is the
+ * single source of truth for the `live_get_project` payload AND the snapshot
+ * header (`../snapshot`). Pure read: SYNC, no `getValue()`, no transaction, no
+ * mutation. Re-reads `ctx.application.song` fresh on every call (§6).
+ */
+export function buildProjectHeader<V extends ApiVersion>(
+  ctx: ExtensionContext<V>
+): ProjectHeader {
+  const song = ctx.application.song as unknown as Record<string, unknown>;
+  return {
+    tempo: getNumber(song, "tempo"),
+    scaleName: getString(song, "scaleName"),
+    scaleMode: getBoolean(song, "scaleMode"),
+    rootNote: getNumber(song, "rootNote"),
+    gridQuantization: getNumber(song, "gridQuantization"),
+    gridIsTriplet: getBoolean(song, "gridIsTriplet"),
+    tracks: summarizeNamed(getArray(song, "tracks")),
+    returnTracks: summarizeNamed(getArray(song, "returnTracks")),
+    mainTrack: { name: getString(getObject(song, "mainTrack"), "name") },
+    scenes: summarizeNamed(getArray(song, "scenes")),
+    cuePoints: summarizeNamed(getArray(song, "cuePoints")),
+  };
+}
+
+/**
+ * The shallow track-detail shape (§8.1): ref/className/name, mute/solo/arm,
+ * group-track name, and `{index,name}`-level lists of devices / arrangement clips
+ * / clip slots / take lanes plus mixer presence. Used by both
+ * {@link executeGetTrack} and the snapshot's `scopedTrack` block. No
+ * device-parameter values, no MIDI note arrays — those are fetched on demand via
+ * the other `live_get_*` tools (§15).
+ */
+export interface TrackDetail {
+  ref: string;
+  className: string;
+  name: string | null;
+  mute: boolean | null;
+  solo: boolean | null;
+  arm: boolean | null;
+  groupTrack: string | null;
+  devices: { index: number; name: string }[];
+  arrangementClips: { index: number; name: string }[];
+  clipSlots: { index: number; hasClip: boolean; clipName: string | null }[];
+  takeLanes: { index: number; name: string }[];
+  hasMixer: boolean;
+}
+
+/**
+ * Build the shallow {@link TrackDetail} from an already-resolved track object.
+ * This is the single source of truth for the `live_get_track` payload AND the
+ * snapshot's `scopedTrack` block (`../snapshot`). Pure read: SYNC, no
+ * `getValue()`, no transaction, no mutation.
+ *
+ * @param resolved A freshly-resolved track (its `object`, `className`, and
+ *                 `canonicalRef`). The object must NOT be cached across calls (§6).
+ */
+export function buildTrackDetail<V extends ApiVersion>(
+  resolved: Resolved<V>
+): TrackDetail {
+  const track = resolved.object as unknown as Record<string, unknown>;
+  const groupTrack = getObject(track, "groupTrack");
+  return {
+    ref: resolved.canonicalRef,
+    className: resolved.className,
+    name: getString(track, "name"),
+    mute: getBoolean(track, "mute"),
+    solo: getBoolean(track, "solo"),
+    arm: getBoolean(track, "arm"),
+    groupTrack: groupTrack === null ? null : getString(groupTrack, "name"),
+    devices: summarizeNamed(getArray(track, "devices")),
+    arrangementClips: summarizeNamed(getArray(track, "arrangementClips")),
+    clipSlots: getArray(track, "clipSlots").map((slot, index) => ({
+      index,
+      hasClip: getObject(slot, "clip") !== null,
+      clipName: getString(getObject(slot, "clip"), "name"),
+    })),
+    takeLanes: summarizeNamed(getArray(track, "takeLanes")),
+    hasMixer: getObject(track, "mixer") !== null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // live_get_project
 // ---------------------------------------------------------------------------
 
@@ -119,27 +234,15 @@ function summarizeNamed(items: unknown[]): { index: number; name: string }[] {
  * `live_get_project` — the project header: tempo, scale, grid, and shallow lists
  * of tracks / scenes / cue points / return tracks / the main track (§8.1). Reads
  * `song.*` directly off the freshly-read song; names + indices ground every ref.
+ * Delegates shape construction to {@link buildProjectHeader} (shared with the
+ * snapshot serializer).
  */
 export function executeGetProject<V extends ApiVersion>(
   ctx: ExtensionContext<V>,
   call: ToolCall
 ): ToolResultPayload {
   try {
-    const song = ctx.application.song as unknown as Record<string, unknown>;
-    const data = {
-      tempo: getNumber(song, "tempo"),
-      scaleName: getString(song, "scaleName"),
-      scaleMode: getBoolean(song, "scaleMode"),
-      rootNote: getNumber(song, "rootNote"),
-      gridQuantization: getNumber(song, "gridQuantization"),
-      gridIsTriplet: getBoolean(song, "gridIsTriplet"),
-      tracks: summarizeNamed(getArray(song, "tracks")),
-      returnTracks: summarizeNamed(getArray(song, "returnTracks")),
-      mainTrack: { name: getString(getObject(song, "mainTrack"), "name") },
-      scenes: summarizeNamed(getArray(song, "scenes")),
-      cuePoints: summarizeNamed(getArray(song, "cuePoints")),
-    };
-    return ok(call.id, data, "read project");
+    return ok(call.id, buildProjectHeader(ctx), "read project");
   } catch (e) {
     return fail(
       call.id,
@@ -155,6 +258,8 @@ export function executeGetProject<V extends ApiVersion>(
 /**
  * `live_get_track` — one track's contents: devices, arrangement clips, clip
  * slots, take lanes, mixer presence, and mute/solo/arm/group state (§8.1).
+ * Delegates shape construction to {@link buildTrackDetail} (shared with the
+ * snapshot serializer).
  */
 export function executeGetTrack<V extends ApiVersion>(
   ctx: ExtensionContext<V>,
@@ -172,30 +277,7 @@ export function executeGetTrack<V extends ApiVersion>(
     return fail(call.id, resolved.err);
   }
   try {
-    const track = resolved.resolved.object as unknown as Record<
-      string,
-      unknown
-    >;
-    const groupTrack = getObject(track, "groupTrack");
-    const data = {
-      ref: resolved.resolved.canonicalRef,
-      className: resolved.resolved.className,
-      name: getString(track, "name"),
-      mute: getBoolean(track, "mute"),
-      solo: getBoolean(track, "solo"),
-      arm: getBoolean(track, "arm"),
-      groupTrack: groupTrack === null ? null : getString(groupTrack, "name"),
-      devices: summarizeNamed(getArray(track, "devices")),
-      arrangementClips: summarizeNamed(getArray(track, "arrangementClips")),
-      clipSlots: getArray(track, "clipSlots").map((slot, index) => ({
-        index,
-        hasClip: getObject(slot, "clip") !== null,
-        clipName: getString(getObject(slot, "clip"), "name"),
-      })),
-      takeLanes: summarizeNamed(getArray(track, "takeLanes")),
-      hasMixer: getObject(track, "mixer") !== null,
-    };
-    return ok(call.id, data, "read track");
+    return ok(call.id, buildTrackDetail(resolved.resolved), "read track");
   } catch (e) {
     return fail(
       call.id,
@@ -367,16 +449,105 @@ export async function executeGetDeviceParams<V extends ApiVersion>(
 }
 
 // ---------------------------------------------------------------------------
-// live_render_audio (deferred to Phase 14)
+// live_render_audio (§8.1, §14, §16)
 // ---------------------------------------------------------------------------
 
 /**
- * `live_render_audio` — schema is registered but the body is DEFERRED to Phase 14
- * (§8.1, §14). Returns the honest deferred payload (`isError: true`); never a fake
- * success or a fake WAV path (§9).
+ * True if a resolver `className` denotes an **audio** track. Render is
+ * AudioTrack-only (the SDK's `renderPreFxAudio` takes an `AudioTrack`), so a
+ * `MidiTrack` — or the base `"Track"` fallback the test fake reports for
+ * generic tracks — is refused. The real SDK reports the concrete subtype.
  */
-export function executeRenderAudio(call: ToolCall): ToolResultPayload {
-  return deferred(call.id, "live_render_audio");
+function isAudioTrackClass(className: string): boolean {
+  return className === "AudioTrack";
+}
+
+/**
+ * `live_render_audio` — render a region of an AudioTrack to a temporary pre-FX
+ * WAV and return its path (§8.1, §14). A READ tool: it runs immediately in the
+ * read partition and opens NO transaction (the render is a side-effecting read,
+ * not an undoable model edit).
+ *
+ * The `track` ref is re-resolved FRESH (§6); it must resolve to an `AudioTrack`
+ * (a `MidiTrack` is refused with a structured `unsupported`, never a fake path,
+ * §9). `startTime`/`endTime` cross the boundary in **beats** (§16) and are passed
+ * STRAIGHT THROUGH to `renderPreFxAudio` (which is itself beats-native) — no
+ * seconds conversion happens at the SDK boundary. The reported `durationSeconds`
+ * is a convenience derived from the rendered span and the song tempo (§16). The
+ * SDK call is wrapped in try/catch → structured `sdk_error`; it never throws (§9).
+ */
+export async function executeRenderAudio<V extends ApiVersion>(
+  ctx: ExtensionContext<V>,
+  call: ToolCall
+): Promise<ToolResultPayload> {
+  if (!isRecord(call.input)) {
+    return fail(
+      call.id,
+      invalidArgs("expected an object with 'track', 'startTime', 'endTime'")
+    );
+  }
+  const ref = readString(call.input, "track");
+  if (ref === null) {
+    return fail(call.id, invalidArgs("'track' must be a ref string"));
+  }
+  const startTime = readNumber(call.input, "startTime");
+  if (startTime === null) {
+    return fail(
+      call.id,
+      invalidArgs("'startTime' must be a finite number (beats)")
+    );
+  }
+  const endTime = readNumber(call.input, "endTime");
+  if (endTime === null) {
+    return fail(
+      call.id,
+      invalidArgs("'endTime' must be a finite number (beats)")
+    );
+  }
+  if (endTime <= startTime) {
+    return fail(
+      call.id,
+      invalidArgs("'endTime' must be greater than 'startTime' (beats)")
+    );
+  }
+  const resolved = resolveOrFail(ctx, ref);
+  if (!resolved.ok) {
+    return fail(call.id, resolved.err);
+  }
+  if (!isAudioTrackClass(resolved.resolved.className)) {
+    return fail(
+      call.id,
+      unsupported(
+        `render needs an audio track; "${ref}" resolved to ${resolved.resolved.className}`,
+        "target an AudioTrack; MIDI tracks carry no renderable pre-FX audio"
+      )
+    );
+  }
+  try {
+    // Pass beats straight through — `renderPreFxAudio` is beats-native (§16).
+    const path = await ctx.resources.renderPreFxAudio(
+      resolved.resolved.object as unknown as AudioTrack<V>,
+      startTime,
+      endTime
+    );
+    const tempo = getNumber(ctx.application.song, "tempo") ?? 120;
+    return ok(
+      call.id,
+      {
+        path,
+        track: resolved.resolved.canonicalRef,
+        startBeats: startTime,
+        endBeats: endTime,
+        durationSeconds: beatsToSeconds(endTime - startTime, tempo),
+      },
+      "render audio"
+    );
+  } catch (e) {
+    return fail(
+      call.id,
+      sdkError(`render of "${ref}" failed: ${errorMessage(e)}`)
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -434,6 +605,7 @@ export type {
   LiveGetTrackArgs,
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
+  LiveRenderAudioArgs,
   ReportLimitationArgs,
   Resolved,
 };

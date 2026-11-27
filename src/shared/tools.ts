@@ -154,8 +154,10 @@ export interface LiveGetDeviceParamsArgs {
 
 /**
  * `live_render_audio` — pre-FX render of an AudioTrack region to a temp WAV
- * (§8.1, §14). `startTime`/`endTime` are in **beats** (§16); the executor
- * converts to the seconds the render API needs.
+ * (§8.1, §14). `startTime`/`endTime` are in **beats** (§16) and are passed
+ * STRAIGHT THROUGH to the render API, which is itself beats-native — no
+ * seconds conversion happens at the SDK boundary. (The executor reports a
+ * convenience `durationSeconds` derived from the span and tempo.)
  */
 export interface LiveRenderAudioArgs {
   /** Ref to the audio track to render. */
@@ -596,6 +598,128 @@ export function summarizeDestructivePlan(
   const summary = `This will permanently change ${count} ${noun} and cannot be undone automatically by the agent.`;
 
   return { summary, actions };
+}
+
+/**
+ * A short, human-readable, **key-free** narration phrase for a single tool call,
+ * derived ONLY from defensively-read `input` fields. Drives the §13
+ * `tool_activity.summary` chip the webview renders.
+ *
+ * PURE, deterministic, never throws (reads `input` via {@link asRecord}; a
+ * missing/malformed field falls back to that tool's generic phrasing). An
+ * **unknown tool name returns the bare `name`** unchanged, preserving the prior
+ * narration behavior for anything unmapped. No ids; display-only — this does
+ * NOT affect destructive classification ({@link isDestructiveCall}) or the
+ * confirm gate.
+ *
+ * @param name the tool name (matched against the known set).
+ * @param input the call's raw arguments, off the wire as `unknown`.
+ * @returns a short phrase such as `"Transpose notes in clip:0:Verse"`.
+ */
+export function summarizeToolCall(name: string, input: unknown): string {
+  const record = asRecord(input);
+
+  /** Defensively read a string field; `undefined` if absent/non-string/empty. */
+  const str = (key: string): string | undefined => {
+    const value = record?.[key];
+    return typeof value === "string" && value ? value : undefined;
+  };
+
+  /** List the present field names from `keys`, comma-joined, or `undefined`. */
+  const presentFields = (keys: readonly string[]): string | undefined => {
+    const present = keys.filter((key) => record?.[key] !== undefined);
+    return present.length > 0 ? present.join(", ") : undefined;
+  };
+
+  /** Capitalize the first character of a non-empty string. */
+  const capitalize = (value: string): string =>
+    value.charAt(0).toUpperCase() + value.slice(1);
+
+  switch (name) {
+    case "live_update_track": {
+      const track = str("track") ?? "track";
+      const fields = presentFields(["name", "mute", "solo", "arm"]);
+      return fields ? `Update ${track} (${fields})` : "Update track";
+    }
+    case "live_update_clip": {
+      const clip = str("clip") ?? "clip";
+      const fields = presentFields([
+        "name",
+        "color",
+        "looping",
+        "muted",
+        "warping",
+        "warpMode",
+      ]);
+      return fields ? `Update ${clip} (${fields})` : "Update clip";
+    }
+    case "live_edit_midi_notes": {
+      const clip = str("clip") ?? "clip";
+      const op = str("op");
+      return op
+        ? `${capitalize(op)} notes in ${clip}`
+        : `Edit notes in ${clip}`;
+    }
+    case "live_set_param": {
+      const target = asRecord(record?.target);
+      if (target) {
+        const param =
+          typeof target.param === "string" ? target.param : undefined;
+        const mixer =
+          typeof target.mixer === "string" ? target.mixer : undefined;
+        const label = param ?? mixer;
+        if (label) {
+          return `Set ${label}`;
+        }
+      }
+      return "Set parameter";
+    }
+    case "live_create": {
+      const kind = str("kind");
+      return kind ? `Create ${kind}` : "Create object";
+    }
+    case "live_create_clip": {
+      const type = str("type");
+      return type ? `Create ${type} clip` : "Create clip";
+    }
+    case "live_insert_device": {
+      const deviceName = str("deviceName");
+      return deviceName ? `Insert ${deviceName}` : "Insert device";
+    }
+    case "live_modify_device_chain": {
+      const op = str("op");
+      return op ? `Modify device chain (${op})` : "Modify device chain";
+    }
+    case "live_replace_sample":
+      return "Replace sample";
+    case "live_delete": {
+      const target = str("target");
+      return target ? `Delete ${target}` : "Delete object";
+    }
+    case "live_get_project":
+      return "Read project";
+    case "live_get_track": {
+      const track = str("track");
+      return track ? `Read ${track}` : "Read track";
+    }
+    case "live_get_clip": {
+      const clip = str("clip");
+      return clip ? `Read ${clip}` : "Read clip";
+    }
+    case "live_get_device_params": {
+      const device = str("device");
+      return device ? `Read ${device}` : "Read device";
+    }
+    case "live_render_audio":
+      return "Render audio";
+    case "live_import_audio":
+      return "Import audio";
+    case "report_limitation":
+      return "Report limitation";
+    default:
+      // Unknown tool — preserve the prior bare-name narration behavior.
+      return name;
+  }
 }
 
 // ---------------------------------------------------------------------------

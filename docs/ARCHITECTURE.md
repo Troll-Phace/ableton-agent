@@ -1,6 +1,14 @@
-# Ableton Claude Agent — Architecture Reference
+# Ableton Agent — Architecture Reference
 
-> A conversational agent, embedded in Ableton Live 12 via the Extensions SDK and powered by the Claude API, that reads the current Live Set, reasons about it, and edits it through a constrained, undoable tool surface — reached through a chat window.
+> A conversational agent embedded in Ableton Live 12 via the Extensions SDK, which reads the current Live Set, reasons about it, and edits through a constrained, undoable tool surface.
+
+**Active provider decision (2026-11-27):** sections below describe the existing
+Claude implementation, including its original schemas, key storage and caching
+contract. The accepted target is [Sign in with ChatGPT provider migration](CHATGPT_MIGRATION.md);
+that document overrides provider-specific text in §§1–4, 8–10, 13, 15–16 for
+Phase 15.3 onward. Preserve the SDK behavior, tool semantics, Outcome D,
+transport/permission boundaries and historical evidence. No migration code
+has yet landed; do not mistake the target architecture for current behavior.
 
 ## Table of Contents
 

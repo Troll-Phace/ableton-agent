@@ -18,7 +18,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ChatTransport, type ChatSink } from "../src/webview/transport.js";
-import { message, serialize } from "../src/shared/protocol.js";
+import { message, parseEnvelope, serialize } from "../src/shared/protocol.js";
 
 /* -------------------------------------------------------------------------- */
 /* Fake WebSocket                                                             */
@@ -91,6 +91,7 @@ function recordingSink(): ChatSink & { statuses: string[]; errors: string[] } {
   return {
     statuses,
     errors,
+    renderHistory(): void {},
     appendAssistantDelta(): void {},
     finishAssistant(): void {},
     appendToolActivity(): void {},
@@ -196,5 +197,57 @@ describe("ChatTransport — reconnect-counter reset", () => {
     }
 
     expect(sink.errors).toContain("Disconnected — gave up reconnecting.");
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* sendNewChat — open-guard + on-wire frame                                   */
+/* -------------------------------------------------------------------------- */
+
+describe("ChatTransport — sendNewChat", () => {
+  it("test_webview_newChat_openSocketSendsExactlyOneEmptyNewChatFrame", () => {
+    const sink = recordingSink();
+    const transport = new ChatTransport(sink, "ws://test/");
+    transport.connect();
+
+    // Bring the socket to OPEN (the `open` handler sends a `ready` frame first).
+    const socket = FakeWebSocket.instances[0];
+    socket?.fireOpen();
+    const beforeNewChat = socket?.sent.length ?? 0;
+
+    transport.sendNewChat();
+
+    // Exactly ONE additional frame was written on the wire.
+    expect((socket?.sent.length ?? 0) - beforeNewChat).toBe(1);
+
+    const raw = socket?.sent[beforeNewChat];
+    expect(raw).toBeDefined();
+    const parsed = parseEnvelope(raw ?? "");
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok) {
+      // It is a `new_chat` envelope carrying an EMPTY payload (§13).
+      expect(parsed.message.type).toBe("new_chat");
+      expect(parsed.message.payload).toEqual({});
+    }
+    // No status line on the happy path (the open-guard did not trip).
+    expect(sink.statuses).not.toContain(
+      "Not connected — new chat not started."
+    );
+  });
+
+  it("test_webview_newChat_notOpenAppendsStatusAndSendsZeroFrames", () => {
+    const sink = recordingSink();
+    const transport = new ChatTransport(sink, "ws://test/");
+    transport.connect();
+
+    // The socket exists but is still CONNECTING (never fired `open`) → not OPEN.
+    const socket = FakeWebSocket.instances[0];
+    const beforeNewChat = socket?.sent.length ?? 0;
+
+    transport.sendNewChat();
+
+    // Open-guard tripped: a status line, and ZERO frames on the wire.
+    expect(sink.statuses).toContain("Not connected — new chat not started.");
+    expect((socket?.sent.length ?? 0) - beforeNewChat).toBe(0);
   });
 });

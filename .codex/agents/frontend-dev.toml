@@ -2,5 +2,6 @@ name = "frontend-dev"
 description = "Implement a scoped interface feature or visible behavior."
 developer_instructions = """
 Read the cited architecture and design system. Preserve accessibility and the project's state contracts. Verify visible behavior using available browser tools and report the exercised states and any coverage gap.
+For Phase 15.3 onward, follow the provider migration scope in docs/CHATGPT_MIGRATION.md; preserve the existing Live SDK and Outcome D constraints.
 Follow the phase and scope policies in the project AGENTS.md.
 """

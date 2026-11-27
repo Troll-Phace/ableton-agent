@@ -1,4 +1,14 @@
-import { describe, expect, it, vi } from "vitest";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
 
@@ -14,7 +24,9 @@ import type {
 } from "../src/extension/agent-loop.js";
 import {
   makeFakeContext,
+  type AbstractCtor,
   type FakeExtensionContext,
+  type Handle,
   type NodeSpec,
   type SetSpec,
   type FakeNoteDescription,
@@ -132,6 +144,23 @@ function call(name: string, input: unknown, id = `id_${name}`): ToolCall {
 /** Parse a payload's JSON content. */
 function body(p: ToolResultPayload): Record<string, unknown> {
   return JSON.parse(p.content as string) as Record<string, unknown>;
+}
+
+/**
+ * Pin the resolver seam so the handle with `id` always re-resolves to `instance`.
+ * The runtime re-resolves a fresh object every call (§6), so to spy on the exact
+ * SDK method an executor invokes we route that handle to a captured, spied
+ * instance; every other handle falls through to the real factory. Type-safe (no
+ * `any`): matches the fake's `getObjectFromHandle<T>(handle, type)` signature.
+ */
+function routeHandleTo(
+  fake: FakeExtensionContext,
+  id: bigint,
+  instance: unknown
+): void {
+  const raw = fake.getObjectFromHandle.bind(fake);
+  fake.getObjectFromHandle = <T>(handle: Handle, type: AbstractCtor<T>): T =>
+    handle.id === id ? (instance as T) : raw(handle, type);
 }
 
 /** A MixerDevice spec with named volume/pan and the given send names. */
@@ -453,9 +482,98 @@ describe("read executors — live_get_device_params (lazy getValue)", () => {
   });
 });
 
-describe("read executors — live_render_audio is deferred (not a fake success)", () => {
-  it("executor_renderAudio_returnsDeferredError", async () => {
-    const p = await runtimeOf(makeFakeContext()).executeRead(
+describe("read executors — live_render_audio (§8.1, §14, §16)", () => {
+  it("executor_renderAudio_audioTrack_returnsPathAndSecondsNoTransaction", async () => {
+    // Default Set tempo 120 ⇒ durationSeconds = (end-start)*60/tempo = 4*60/120 = 2.0.
+    const fake = tagged(makeFakeContext());
+    const p = await runtimeOf(fake).executeRead(
+      call("live_render_audio", {
+        track: "track:0:Drums",
+        startTime: 0,
+        endTime: 4,
+      })
+    );
+    expect(p.isError).toBeUndefined();
+    const data = body(p);
+    // The fake resolves the rendered WAV under the (unset) temp dir → /tmp default.
+    expect(data.path).toBe("/tmp/render-0-4.wav");
+    expect(data.track).toBe("track:0:Drums");
+    expect(data.startBeats).toBe(0);
+    expect(data.endBeats).toBe(4);
+    expect(data.durationSeconds).toBeCloseTo(2.0, 10);
+    // Render is a side-effecting READ — it opens NO transaction (§8.1).
+    expect(fake.transactions).toEqual([]);
+    expect(fake.committedCount).toBe(0);
+    // It passed BEATS straight through to renderPreFxAudio (§16), no seconds at the
+    // SDK boundary, and called it exactly once.
+    expect(fake.resourceCalls).toEqual([
+      {
+        kind: "renderPreFxAudio",
+        trackHandleId: fake.application.song.tracks[0].handle.id,
+        startTime: 0,
+        endTime: 4,
+      },
+    ]);
+  });
+
+  it("executor_renderAudio_usesConfiguredTempDirectoryInPath", async () => {
+    // The fake builds the WAV path under environment.tempDirectory when set.
+    const fake = tagged(
+      makeFakeContext(
+        {
+          tracks: [
+            { className: "AudioTrack", name: "Lead", mixer: mixerSpec() },
+          ],
+        },
+        { tempDirectory: "/x/tmp" }
+      )
+    );
+    const p = await runtimeOf(fake).executeRead(
+      call("live_render_audio", {
+        track: "track:0:Lead",
+        startTime: 2,
+        endTime: 6,
+      })
+    );
+    expect(p.isError).toBeUndefined();
+    expect(body(p).path).toBe("/x/tmp/render-2-6.wav");
+  });
+
+  it("executor_renderAudio_midiTrack_returnsUnsupported", async () => {
+    // "Keys" (track index 2) is a MidiTrack → render must be refused honestly (§9).
+    const fake = tagged(makeFakeContext());
+    const p = await runtimeOf(fake).executeRead(
+      call("live_render_audio", {
+        track: "track:2:Keys",
+        startTime: 0,
+        endTime: 4,
+      })
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("unsupported");
+    // No render attempted, no transaction.
+    expect(fake.resourceCalls).toEqual([]);
+    expect(fake.transactions).toEqual([]);
+  });
+
+  it("executor_renderAudio_endNotAfterStart_returnsInvalidArgs", async () => {
+    const fake = tagged(makeFakeContext());
+    const p = await runtimeOf(fake).executeRead(
+      call("live_render_audio", {
+        track: "track:0:Drums",
+        startTime: 4,
+        endTime: 4,
+      })
+    );
+    expect(p.isError).toBe(true);
+    expect(body(p).error).toBe("invalid_args");
+    expect(fake.resourceCalls).toEqual([]);
+  });
+
+  it("executor_renderAudio_sdkThrows_returnsSdkError", async () => {
+    const fake = tagged(makeFakeContext());
+    fake.failRender("disk full");
+    const p = await runtimeOf(fake).executeRead(
       call("live_render_audio", {
         track: "track:0:Drums",
         startTime: 0,
@@ -463,7 +581,11 @@ describe("read executors — live_render_audio is deferred (not a fake success)"
       })
     );
     expect(p.isError).toBe(true);
-    expect(body(p).error).toBe("deferred");
+    expect(body(p).error).toBe("sdk_error");
+    // The render WAS attempted (recorded before the forced rejection) but no
+    // transaction opened and the executor did not throw.
+    expect(fake.resourceCalls).toHaveLength(1);
+    expect(fake.transactions).toEqual([]);
   });
 });
 
@@ -1479,18 +1601,137 @@ describe("mutation executors — live_create_clip", () => {
     expect(fake.application.song.tracks[0].arrangementClips.length).toBe(1);
   });
 
-  it("executor_createClip_audioType_returnsDeferred", async () => {
+  // --- AUDIO create (§8.2, §14) ---------------------------------------------
+
+  /** An AudioTrack with one empty clip slot, for session-slot audio creates. */
+  const audioTrackWithEmptySlot = (): SetSpec => ({
+    tracks: [
+      {
+        className: "AudioTrack",
+        name: "Audio",
+        children: { clipSlots: [{ className: "ClipSlot", clip: null }] },
+        mixer: mixerSpec(),
+      },
+    ],
+  });
+
+  it("executor_createClip_audioOnClipSlot_createsWithFilePathNoTime", async () => {
+    const fake = tagged(makeFakeContext(audioTrackWithEmptySlot()));
+    expect(fake.application.song.tracks[0].clipSlots[0].clip).toBeNull();
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create_clip", {
+        location: "track:0:Audio/clipSlot:0",
+        type: "audio",
+        filePath: "managed:loop.wav",
+      }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).created).toBe("audio clip");
+    // The slot now holds an AudioClip carrying the managed filePath.
+    const clip = fake.application.song.tracks[0].clipSlots[0].clip;
+    expect(clip).not.toBeNull();
+    expect(clip?.filePath).toBe("managed:loop.wav");
+    // Exactly one undo step (§7).
+    expect(fake.committedCount).toBe(1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+  });
+
+  it("executor_createClip_audioOnTrack_arrangement_withStartTime_creates", async () => {
+    const fake = tagged(makeFakeContext());
+    const before = fake.application.song.tracks[0].arrangementClips.length;
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create_clip", {
+        location: "track:0:Drums",
+        type: "audio",
+        filePath: "managed:a.wav",
+        startTime: 8,
+      }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(fake.application.song.tracks[0].arrangementClips.length).toBe(
+      before + 1
+    );
+    const created = fake.application.song.tracks[0].arrangementClips[before];
+    expect(created.filePath).toBe("managed:a.wav");
+    expect(fake.committedCount).toBe(1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+  });
+
+  it("executor_createClip_audioWithWarp_validLoopSettings_setsWarping", async () => {
+    const fake = tagged(makeFakeContext(audioTrackWithEmptySlot()));
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create_clip", {
+        location: "track:0:Audio/clipSlot:0",
+        type: "audio",
+        filePath: "managed:warped.wav",
+        isWarped: true,
+        loopSettings: {
+          looping: true,
+          startMarker: 0,
+          endMarker: 2,
+          loopStart: 0,
+          loopEnd: 1,
+        },
+      }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    const clip = fake.application.song.tracks[0].clipSlots[0].clip;
+    expect(clip?.warping).toBe(true);
+    expect(clip?.filePath).toBe("managed:warped.wav");
+    expect(fake.committedCount).toBe(1);
+  });
+
+  it("executor_createClip_audioLoopConstraintViolation_returnsInvalidArgs", async () => {
+    // looping:false but loop markers ≠ start/end markers → executor rejects (§14).
+    const fake = tagged(makeFakeContext(audioTrackWithEmptySlot()));
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create_clip", {
+        location: "track:0:Audio/clipSlot:0",
+        type: "audio",
+        filePath: "managed:bad.wav",
+        isWarped: true,
+        loopSettings: {
+          looping: false,
+          startMarker: 0,
+          endMarker: 4,
+          loopStart: 1,
+          loopEnd: 3,
+        },
+      }),
+    ]);
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("invalid_args");
+    // Rejected before any create → empty slot, no transaction.
+    expect(fake.application.song.tracks[0].clipSlots[0].clip).toBeNull();
+    expect(fake.transactions).toEqual([]);
+  });
+
+  it("executor_createClip_audioMissingFilePath_returnsInvalidArgs", async () => {
+    const fake = tagged(makeFakeContext(audioTrackWithEmptySlot()));
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_create_clip", {
+        location: "track:0:Audio/clipSlot:0",
+        type: "audio",
+      }),
+    ]);
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("invalid_args");
+    expect(fake.application.song.tracks[0].clipSlots[0].clip).toBeNull();
+    expect(fake.transactions).toEqual([]);
+  });
+
+  it("executor_createClip_audioOnTrack_missingStartTime_returnsInvalidArgs", async () => {
+    // An arrangement audio clip on an AudioTrack needs startTime (slots do not).
     const fake = tagged(makeFakeContext());
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_create_clip", {
         location: "track:0:Drums",
         type: "audio",
-        filePath: "/managed/loop.wav",
+        filePath: "managed:a.wav",
       }),
     ]);
     expect(r.isError).toBe(true);
-    expect(body(r).error).toBe("deferred");
-    // A deferred (prepare-error) batch opens NO transaction.
+    expect(body(r).error).toBe("invalid_args");
     expect(fake.transactions).toEqual([]);
   });
 
@@ -1566,9 +1807,18 @@ describe("mutation executors — live_insert_device", () => {
 });
 
 describe("mutation executors — live_modify_device_chain", () => {
-  it("executor_modifyChain_duplicate_copiesDevice", async () => {
+  // op=duplicate, TRACK host: Track.duplicateDevice is the SDK method, the copy
+  // lands in the TRACK's device list (additive — no deletion), exactly ONE undo
+  // step, and the result carries the additive shape + the re-read/fresh-ref hint.
+  it("executor_modifyChain_duplicateOnTrackHost_callsTrackDuplicateDevice", async () => {
     const fake = tagged(makeFakeContext());
-    const before = fake.application.song.tracks[1].devices.length;
+    const track = fake.application.song.tracks[1];
+    const before = track.devices.length;
+    const spy = vi.spyOn(track, "duplicateDevice");
+    // Re-resolution mints a fresh host object per call (§6), so pin the resolver
+    // seam to route the Bass-track handle to OUR spied instance.
+    routeHandleTo(fake, track.handle.id, track);
+
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_modify_device_chain", {
         location: "track:1:Bass",
@@ -1576,15 +1826,82 @@ describe("mutation executors — live_modify_device_chain", () => {
         device: "track:1:Bass/device:0:Reverb",
       }),
     ]);
+
     expect(r.isError).toBeUndefined();
-    expect(body(r).duplicated).toContain("device:0:Reverb");
+    // The exact SDK method ran, on the right host, with the resolved device.
+    expect(spy).toHaveBeenCalledTimes(1);
+    // Additive result shape: a `duplicated`/`host` pair, NO `deleted`/`destructive`.
+    const data = body(r);
+    expect(data.duplicated).toContain("device:0:Reverb");
+    expect(data.host).toBe("track:1:Bass");
+    expect(data.deleted).toBeUndefined();
+    expect(data.destructive).toBeUndefined();
+    // Fresh-ref hint present so the agent re-grounds (§6).
+    expect(String(data.hint)).toMatch(/re-read|ground/i);
+    // Live: the copy landed on the TRACK, not elsewhere; exactly one undo step.
     expect(fake.application.song.tracks[1].devices.length).toBe(before + 1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
   });
 
-  it("executor_modifyChain_insertChain_addsChainToRack", async () => {
+  // op=duplicate, CHAIN host (a device inside a rack's chain): Chain.duplicateDevice
+  // is the SDK method, and the copy lands in the CHAIN's device list — NOT the
+  // track's — proving the host is resolved to the chain, not the owning track.
+  it("executor_modifyChain_duplicateOnChainHost_callsChainDuplicateDevice", async () => {
+    const fake = tagged(makeFakeContext());
+    const chainRef = "track:1:Bass/device:1:Rack/chain:0:Chain A";
+    const deviceRef = `${chainRef}/device:0:AutoFilter`;
+    const chain = fake.application.song.tracks[1].devices[1].chains![0];
+    const beforeChainDevices = chain.devices.length;
+    const beforeTrackDevices = fake.application.song.tracks[1].devices.length;
+    const spy = vi.spyOn(chain, "duplicateDevice");
+    // Route the chain handle to OUR spied instance through the resolver seam.
+    routeHandleTo(fake, chain.handle.id, chain);
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_modify_device_chain", {
+        location: chainRef,
+        op: "duplicate",
+        device: deviceRef,
+      }),
+    ]);
+
+    expect(r.isError).toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(1);
+    const data = body(r);
+    expect(data.duplicated).toContain("device:0:AutoFilter");
+    expect(data.host).toBe(chainRef);
+    expect(String(data.hint)).toMatch(/re-read|ground/i);
+    // The copy went into the CHAIN's device list; the track's own list is untouched.
+    const chainAfter =
+      fake.application.song.tracks[1].devices[1].chains![0].devices.length;
+    expect(chainAfter).toBe(beforeChainDevices + 1);
+    expect(fake.application.song.tracks[1].devices.length).toBe(
+      beforeTrackDevices
+    );
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
+  });
+
+  // op=insert_chain on a RackDevice: RackDevice.insertChain(index) is the SDK
+  // method, exactly ONE undo step, additive result + fresh-ref hint.
+  it("executor_modifyChain_insertChainOnRack_callsRackInsertChain", async () => {
     const fake = tagged(makeFakeContext());
     const rack = fake.application.song.tracks[1].devices[1];
     const before = rack.chains?.length ?? 0;
+    // `insertChain` is present only on rack nodes (optional on the device type);
+    // assert it exists before spying so the spy target is non-optional.
+    if (rack.insertChain === undefined) {
+      throw new Error(
+        "fixture invariant: device:1:Rack must expose insertChain"
+      );
+    }
+    const spy = vi.spyOn(
+      rack as Required<Pick<typeof rack, "insertChain">> & typeof rack,
+      "insertChain"
+    );
+    routeHandleTo(fake, rack.handle.id, rack);
+
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_modify_device_chain", {
         location: "track:1:Bass/device:1:Rack",
@@ -1592,15 +1909,30 @@ describe("mutation executors — live_modify_device_chain", () => {
         index: 0,
       }),
     ]);
+
     expect(r.isError).toBeUndefined();
-    expect(body(r).insertedChainInto).toContain("device:1:Rack");
+    // insertChain was called with the requested index.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith(0);
+    const data = body(r);
+    expect(data.insertedChainInto).toContain("device:1:Rack");
+    expect(data.index).toBe(0);
+    expect(data.deleted).toBeUndefined();
+    expect(data.destructive).toBeUndefined();
+    expect(String(data.hint)).toMatch(/re-read|ground/i);
     const after =
       fake.application.song.tracks[1].devices[1].chains?.length ?? 0;
     expect(after).toBe(before + 1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(fake.committedCount).toBe(1);
   });
 
-  it("executor_modifyChain_insertChainOnNonRack_returnsUnsupported", async () => {
+  // Honesty path: insert_chain on a NON-rack device must be a structured
+  // `unsupported` error — never a fake success — and must open NO transaction.
+  it("executor_modifyChain_insertChainOnNonRack_returnsUnsupportedNoTxn", async () => {
     const fake = tagged(makeFakeContext());
+    const reverb = fake.application.song.tracks[1].devices[0];
+    expect(reverb.chains).toBeUndefined(); // pre-state: not a rack.
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_modify_device_chain", {
         location: "track:1:Bass/device:0:Reverb",
@@ -1610,6 +1942,11 @@ describe("mutation executors — live_modify_device_chain", () => {
     ]);
     expect(r.isError).toBe(true);
     expect(body(r).error).toBe("unsupported");
+    // No transaction was opened for a rejected op (§7 — validate before commit).
+    expect(fake.transactions).toEqual([]);
+    expect(fake.committedCount).toBe(0);
+    // The non-rack device is unchanged.
+    expect(fake.application.song.tracks[1].devices[0].chains).toBeUndefined();
   });
 
   it("executor_modifyChain_badOp_returnsInvalidArgs", async () => {
@@ -1622,6 +1959,7 @@ describe("mutation executors — live_modify_device_chain", () => {
     ]);
     expect(r.isError).toBe(true);
     expect(body(r).error).toBe("invalid_args");
+    expect(fake.transactions).toEqual([]);
   });
 });
 
@@ -1712,30 +2050,402 @@ describe("mutation executors — live_delete", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Audio tools deferred — never a fake success (§9)
+// live_replace_sample (§8.2, §14)
 // ---------------------------------------------------------------------------
 
-describe("mutation executors — audio tools are deferred (§9 honesty)", () => {
-  it("executor_replaceSample_returnsDeferred", async () => {
-    const fake = makeFakeContext();
+describe("mutation executors — live_replace_sample", () => {
+  it("executor_replaceSample_simpler_replacesOneTransaction", async () => {
+    // The default Set's "Kit" (track 0 device 0) is a Simpler that reports a
+    // NON-NULL loaded sample (fixture default), so the executor's empty-Simpler
+    // guard passes and the real replace path runs.
+    const fake = tagged(makeFakeContext());
+    expect(fake.application.song.tracks[0].devices[0].sample).not.toBeNull();
+    const simplerHandleId =
+      fake.application.song.tracks[0].devices[0].handle.id;
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_replace_sample", {
         simpler: "track:0:Drums/device:0:Kit",
-        filePath: "/managed/kick.wav",
+        filePath: "managed:kick.wav",
+      }),
+    ]);
+    expect(r.isError).toBeUndefined();
+    expect(body(r).replaced).toBe("sample");
+    // replaceSample fired with the managed path on the resolved Simpler.
+    expect(fake.replaceSampleCalls).toEqual([
+      { simplerHandleId, filePath: "managed:kick.wav" },
+    ]);
+    // Exactly one undo step (§7).
+    expect(fake.committedCount).toBe(1);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+  });
+
+  it("executor_replaceSample_nonSimpler_returnsUnsupportedNoTransaction", async () => {
+    // "Reverb" (track 1 device 0) is not a Simpler → unsupported, never a fake success.
+    const fake = tagged(makeFakeContext());
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_replace_sample", {
+        simpler: "track:1:Bass/device:0:Reverb",
+        filePath: "managed:kick.wav",
       }),
     ]);
     expect(r.isError).toBe(true);
-    expect(body(r).error).toBe("deferred");
+    expect(body(r).error).toBe("unsupported");
+    expect(fake.replaceSampleCalls).toEqual([]);
     expect(fake.transactions).toEqual([]);
   });
 
-  it("executor_importAudio_returnsDeferred", async () => {
-    const fake = makeFakeContext();
+  it("executor_replaceSample_missingFilePath_returnsInvalidArgs", async () => {
+    const fake = tagged(makeFakeContext());
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_replace_sample", { simpler: "track:0:Drums/device:0:Kit" }),
+    ]);
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("invalid_args");
+    expect(fake.replaceSampleCalls).toEqual([]);
+    expect(fake.transactions).toEqual([]);
+  });
+
+  it("executor_replaceSample_emptySimpler_returnsUnsupportedNoTransaction", async () => {
+    // A freshly-inserted EMPTY Simpler reports `sample === null`. The SDK's
+    // replaceSample can only swap an already-loaded sample, so the executor must
+    // refuse up front (no transaction, replaceSample never fired) — never a fake
+    // success and never an SDK rollback. (In-Live smoke wall, Phase 14.)
+    const fake = tagged(
+      makeFakeContext({
+        tracks: [
+          {
+            className: "AudioTrack",
+            name: "Drums",
+            children: {
+              devices: [
+                { className: "Simpler", name: "Empty Kit", sample: null },
+              ],
+            },
+            mixer: mixerSpec(),
+          },
+        ],
+      })
+    );
+    // Precondition: the seeded Simpler genuinely reports a null sample.
+    expect(fake.application.song.tracks[0].devices[0].sample).toBeNull();
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_replace_sample", {
+        simpler: "track:0:Drums/device:0:Empty Kit",
+        filePath: "managed:kick.wav",
+      }),
+    ]);
+
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("unsupported");
+    // Refused before any side effect: replaceSample never called, no transaction.
+    expect(fake.replaceSampleCalls).toEqual([]);
+    expect(fake.transactions).toEqual([]);
+    expect(fake.committedCount).toBe(0);
+    // The empty Simpler is untouched (still no sample).
+    expect(fake.application.song.tracks[0].devices[0].sample).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// live_import_audio (§8.3, §10, §14)
+//
+// Establishes the fetch-mock pattern (vi.stubGlobal) reused by the E2E proof.
+// The URL branch downloads bytes into a REAL temp dir (mkdtempSync) and asserts
+// the file was actually written; cleanup removes the dir + unstubs fetch.
+// ---------------------------------------------------------------------------
+
+describe("mutation executors — live_import_audio", () => {
+  let tempDir: string | undefined;
+
+  afterEach(() => {
+    if (tempDir !== undefined) {
+      rmSync(tempDir, { recursive: true, force: true });
+      tempDir = undefined;
+    }
+    vi.unstubAllGlobals();
+  });
+
+  /**
+   * The leading bytes of a real WAV file: ASCII "RIFF" then 4 size bytes then
+   * "WAVE". Used as default happy-path bytes so the non-audio guard
+   * (`looksLikeNonAudio`) does NOT false-trip — the first non-whitespace byte is
+   * `R` (0x52), neither `<` nor `{`.
+   */
+  const RIFF_WAVE_BYTES = new Uint8Array([
+    0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+  ]);
+
+  /**
+   * Stub the GLOBAL `fetch` with a scripted `Response`-like object carrying the
+   * fields the URL branch reads: `ok`/`status`/`statusText`, a
+   * `headers.get("content-type")` (the non-audio guard reads it), and
+   * `arrayBuffer()`. `body` may be a string (encoded UTF-8) or raw bytes;
+   * `contentType` defaults to absent (`headers.get` → `null`), exercising the
+   * "no content-type ⇒ rely on the byte-sniff" path. Returns the spy so a test can
+   * assert it was (not) called.
+   */
+  function stubFetchResponse(opts: {
+    ok: boolean;
+    status?: number;
+    statusText?: string;
+    contentType?: string;
+    body?: string | Uint8Array;
+  }): ReturnType<typeof vi.fn> {
+    const bytes: Uint8Array =
+      opts.body === undefined
+        ? RIFF_WAVE_BYTES
+        : typeof opts.body === "string"
+          ? new TextEncoder().encode(opts.body)
+          : opts.body;
+    const contentType = opts.contentType ?? null;
+    const spy = vi.fn(
+      (): Promise<{
+        ok: boolean;
+        status: number;
+        statusText: string;
+        headers: { get(name: string): string | null };
+        arrayBuffer: () => Promise<ArrayBuffer>;
+      }> =>
+        Promise.resolve({
+          ok: opts.ok,
+          status: opts.status ?? (opts.ok ? 200 : 404),
+          statusText: opts.statusText ?? (opts.ok ? "OK" : "Not Found"),
+          headers: {
+            get(name: string): string | null {
+              return name.toLowerCase() === "content-type" ? contentType : null;
+            },
+          },
+          arrayBuffer: (): Promise<ArrayBuffer> =>
+            Promise.resolve(
+              bytes.buffer.slice(
+                bytes.byteOffset,
+                bytes.byteOffset + bytes.byteLength
+              ) as ArrayBuffer
+            ),
+        })
+    );
+    vi.stubGlobal("fetch", spy);
+    return spy;
+  }
+
+  it("executor_importAudio_url_downloadsToTempDirAndReturnsManagedPath", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "p14-import-"));
+    // Real-audio bytes (RIFF/WAVE) + audio content-type so the non-audio guard
+    // passes — strengthened from the earlier arbitrary bytes, which would now
+    // need to dodge the byte-sniff anyway.
+    const bytes = RIFF_WAVE_BYTES;
+    const fetchSpy = stubFetchResponse({
+      ok: true,
+      contentType: "audio/wav",
+      body: bytes,
+    });
+    const fake = tagged(makeFakeContext(undefined, { tempDirectory: tempDir }));
+
     const [r] = await runtimeOf(fake).flushMutations([
       call("live_import_audio", { source: "https://example.com/loop.wav" }),
     ]);
+
+    expect(r.isError).toBeUndefined();
+    // The fake's importIntoProject returns "managed:" + basename of the temp file.
+    expect(body(r).managedPath).toBe("managed:loop.wav");
+    // fetch was called with the URL.
+    expect(fetchSpy).toHaveBeenCalledWith("https://example.com/loop.wav");
+    // The bytes were actually written under the temp dir, then handed to import.
+    const writtenPath = join(tempDir, "loop.wav");
+    expect(existsSync(writtenPath)).toBe(true);
+    expect(new Uint8Array(readFileSync(writtenPath))).toEqual(bytes);
+    expect(fake.resourceCalls).toEqual([
+      { kind: "importIntoProject", filePath: writtenPath },
+    ]);
+  });
+
+  it("executor_importAudio_url_createsMissingTempDirBeforeWrite", async () => {
+    // In-Live, the SDK hands back a tempDirectory path string whose directory
+    // does NOT physically exist yet. The URL branch must `mkdir -p` it before
+    // writing, or fs.writeFileSync throws ENOENT (Phase 14 in-Live regression).
+    // We create only the real root and point tempDirectory at an un-created
+    // nested subpath under it — mkdtempSync would have hidden this by creating
+    // the dir.
+    const base = mkdtempSync(join(tmpdir(), "abl-"));
+    tempDir = base; // afterEach removes the whole tree recursively.
+    const missingTempDir = join(base, "nested", "deep");
+    expect(existsSync(missingTempDir)).toBe(false);
+
+    const bytes = RIFF_WAVE_BYTES;
+    const fetchSpy = stubFetchResponse({
+      ok: true,
+      contentType: "audio/wav",
+      body: bytes,
+    });
+    const fake = tagged(
+      makeFakeContext(undefined, { tempDirectory: missingTempDir })
+    );
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "https://example.com/loop.wav" }),
+    ]);
+
+    // Pre-fix this fails with ENOENT; post-fix it succeeds with a managed path.
+    expect(r.isError).toBeUndefined();
+    expect(body(r).managedPath).toBe("managed:loop.wav");
+    expect(fetchSpy).toHaveBeenCalledWith("https://example.com/loop.wav");
+    // The previously-missing nested temp directory was created on demand.
+    expect(existsSync(missingTempDir)).toBe(true);
+    // And the bytes were actually written into it, then handed to import.
+    const writtenPath = join(missingTempDir, "loop.wav");
+    expect(existsSync(writtenPath)).toBe(true);
+    expect(new Uint8Array(readFileSync(writtenPath))).toEqual(bytes);
+    expect(fake.resourceCalls).toEqual([
+      { kind: "importIntoProject", filePath: writtenPath },
+    ]);
+  });
+
+  it("executor_importAudio_localPath_importsDirectlyWithoutFetch", async () => {
+    const fetchSpy = stubFetchResponse({ ok: true });
+    const fake = tagged(makeFakeContext());
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "/local/samples/snare.wav" }),
+    ]);
+
+    expect(r.isError).toBeUndefined();
+    expect(body(r).managedPath).toBe("managed:snare.wav");
+    // Local-path branch never fetches; it hands the path straight to the SDK.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fake.resourceCalls).toEqual([
+      { kind: "importIntoProject", filePath: "/local/samples/snare.wav" },
+    ]);
+  });
+
+  it("executor_importAudio_httpNotOk_returnsNetworkErrorNoImport", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "p14-import-"));
+    stubFetchResponse({ ok: false, status: 404, statusText: "Not Found" });
+    const fake = tagged(makeFakeContext(undefined, { tempDirectory: tempDir }));
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "https://example.com/missing.wav" }),
+    ]);
+
     expect(r.isError).toBe(true);
-    expect(body(r).error).toBe("deferred");
+    expect(body(r).error).toBe("network_error");
+    // A failed download never reaches importIntoProject.
+    expect(fake.resourceCalls).toEqual([]);
+  });
+
+  it("executor_importAudio_urlWithoutTempDir_returnsNoTempDir", async () => {
+    const fetchSpy = stubFetchResponse({ ok: true });
+    // tempDirectory undefined (default) → URL import is refused honestly.
+    const fake = tagged(makeFakeContext());
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "https://example.com/loop.wav" }),
+    ]);
+
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("no_temp_dir");
+    // No fetch, no import — refused before any side effect.
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fake.resourceCalls).toEqual([]);
+  });
+
+  it("executor_importAudio_missingSource_returnsInvalidArgs", async () => {
+    const fake = tagged(makeFakeContext());
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", {}),
+    ]);
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("invalid_args");
+  });
+
+  // --- non-audio guard (§9 honesty): a clearly-non-audio URL response is
+  //     rejected BEFORE any temp write / import (motivated by an anti-bot HTML
+  //     page being imported as a .wav in the Phase-14 smoke).
+
+  it("executor_importAudio_htmlContentType_returnsNotAudioNoWriteNoImport", async () => {
+    tempDir = mkdtempSync(join(tmpdir(), "p14-import-"));
+    stubFetchResponse({
+      ok: true,
+      contentType: "text/html",
+      body: "<!DOCTYPE html><html><body>Are you a robot?</body></html>",
+    });
+    const fake = tagged(makeFakeContext(undefined, { tempDirectory: tempDir }));
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "https://example.com/loop.wav" }),
+    ]);
+
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("not_audio");
+    // NO temp file written and import NOT called — refused before any side effect.
+    expect(existsSync(join(tempDir, "loop.wav"))).toBe(false);
+    expect(readdirSync(tempDir)).toEqual([]);
+    expect(fake.resourceCalls).toEqual([]);
+  });
+
+  it("executor_importAudio_leadingMarkupByte_overridesBenignContentType_returnsNotAudio", async () => {
+    // content-type is benign (application/octet-stream) but the body starts with
+    // whitespace + "<html" → the byte-sniff trips independently of content-type.
+    tempDir = mkdtempSync(join(tmpdir(), "p14-import-"));
+    stubFetchResponse({
+      ok: true,
+      contentType: "application/octet-stream",
+      body: "   \n  <html><head></head><body>blocked</body></html>",
+    });
+    const fake = tagged(makeFakeContext(undefined, { tempDirectory: tempDir }));
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", {
+        source: "https://cdn.example.com/track.wav",
+      }),
+    ]);
+
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("not_audio");
+    expect(readdirSync(tempDir)).toEqual([]);
+    expect(fake.resourceCalls).toEqual([]);
+  });
+
+  it("executor_importAudio_jsonErrorBody_returnsNotAudio", async () => {
+    // A JSON error body ({...}) is also clearly non-audio.
+    tempDir = mkdtempSync(join(tmpdir(), "p14-import-"));
+    stubFetchResponse({
+      ok: true,
+      contentType: "application/json",
+      body: '{"error":"rate limited"}',
+    });
+    const fake = tagged(makeFakeContext(undefined, { tempDirectory: tempDir }));
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "https://example.com/loop.wav" }),
+    ]);
+
+    expect(r.isError).toBe(true);
+    expect(body(r).error).toBe("not_audio");
+    expect(readdirSync(tempDir)).toEqual([]);
+    expect(fake.resourceCalls).toEqual([]);
+  });
+
+  it("executor_importAudio_realAudioBytesNoContentType_importsOk", async () => {
+    // A genuine audio response with NO content-type still imports (RIFF/WAVE
+    // bytes pass the byte-sniff; the guard never allowlists, so it does not block).
+    tempDir = mkdtempSync(join(tmpdir(), "p14-import-"));
+    const fetchSpy = stubFetchResponse({ ok: true, body: RIFF_WAVE_BYTES });
+    const fake = tagged(makeFakeContext(undefined, { tempDirectory: tempDir }));
+
+    const [r] = await runtimeOf(fake).flushMutations([
+      call("live_import_audio", { source: "https://example.com/loop.wav" }),
+    ]);
+
+    expect(r.isError).toBeUndefined();
+    expect(body(r).managedPath).toBe("managed:loop.wav");
+    expect(fetchSpy).toHaveBeenCalledWith("https://example.com/loop.wav");
+    const writtenPath = join(tempDir, "loop.wav");
+    expect(existsSync(writtenPath)).toBe(true);
+    expect(new Uint8Array(readFileSync(writtenPath))).toEqual(RIFF_WAVE_BYTES);
+    expect(fake.resourceCalls).toEqual([
+      { kind: "importIntoProject", filePath: writtenPath },
+    ]);
   });
 });
 

@@ -1,5 +1,5 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   ClaudeClient,
@@ -148,6 +148,86 @@ describe("ClaudeClient.runTurn — streaming + assembly", () => {
     if (result.ok) {
       expect(result.message.usage.cache_read_input_tokens).toBe(42);
       expect(result.message.usage.cache_creation_input_tokens).toBe(7);
+    }
+  });
+
+  it("claudeClient_runTurn_logsUsageWithCacheFieldsNoSecret", async () => {
+    // §15 calibration: after a successful turn the wrapper logs `message.usage`
+    // (input/output/cache_read/cache_creation) via console.info. Spy on it, run a
+    // turn whose scripted usage carries the cache fields, and assert the log line
+    // fired with those values — and that nothing key-like ever appears in it.
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const fake = new FakeMessagesClient([
+        {
+          textDeltas: ["ok"],
+          stopReason: "end_turn",
+          usage: {
+            input_tokens: 1234,
+            output_tokens: 56,
+            cache_read_input_tokens: 42,
+            cache_creation_input_tokens: 7,
+          },
+        },
+      ]);
+      const client = new ClaudeClient(fake);
+
+      const result = await client.runTurn(
+        // Pass a secret-looking key on a field that should never be logged, to
+        // prove the usage line carries counts only — never any key/content.
+        baseInput({
+          messages: [{ role: "user", content: "sk-ant-not-logged" }],
+        })
+      );
+      expect(result.ok).toBe(true);
+
+      // Exactly one usage line fired, and it carries the scripted counts.
+      const usageCalls = infoSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("usage:"));
+      expect(usageCalls).toHaveLength(1);
+      const line = usageCalls[0];
+      expect(line).toContain("input=1234");
+      expect(line).toContain("output=56");
+      expect(line).toContain("cache_read=42");
+      expect(line).toContain("cache_creation=7");
+
+      // No secret / message content leaks into the log line (§10 key discipline).
+      expect(line).not.toContain("sk-ant");
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it("claudeClient_runTurn_logsUsageNullCacheFieldsAsZero", async () => {
+    // SDK types the cache fields as `number | null`; the wrapper guards with
+    // `?? 0`. A turn with null cache fields must log `cache_read=0 cache_creation=0`.
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      const fake = new FakeMessagesClient([
+        {
+          textDeltas: ["ok"],
+          stopReason: "end_turn",
+          usage: {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_input_tokens: null,
+            cache_creation_input_tokens: null,
+          },
+        },
+      ]);
+      const client = new ClaudeClient(fake);
+      const result = await client.runTurn(baseInput());
+      expect(result.ok).toBe(true);
+
+      const line = infoSpy.mock.calls
+        .map((c) => String(c[0]))
+        .find((s) => s.includes("usage:"));
+      expect(line).toBeDefined();
+      expect(line).toContain("cache_read=0");
+      expect(line).toContain("cache_creation=0");
+    } finally {
+      infoSpy.mockRestore();
     }
   });
 });

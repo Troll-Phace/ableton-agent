@@ -8,6 +8,11 @@ paths:
 
 # Code Standards — Ableton Claude Agent
 
+**Active provider migration:** docs/CHATGPT_MIGRATION.md supersedes
+Claude-specific provider examples during Phase 15.3 onward. Preserve host/UI
+separation and SDK boundaries; OAuth credentials, codes and callback secrets
+stay out of the webview, logs and Git.
+
 ## TypeScript Standards (extension host + webview + shared)
 - **ESLint**: clean, no warnings (`@typescript-eslint` recommended-type-checked ruleset).
 - **Prettier**: applied on save (enforced by the PostToolUse hook). 2-space indent, double quotes, semicolons, trailing commas (es5).

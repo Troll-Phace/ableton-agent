@@ -5,11 +5,12 @@
  *
  * One {@link ChatSession} exists **per open modal**. It owns:
  *  - the inbound dispatcher (`server.onMessage`), branching with
- *    {@link isMessageOfType} over the §13 client subset wired this phase
- *    (`ready` / `user_message` / `cancel`); `confirm_response` / `set_config`
- *    are defined-but-unwired (Phases 9/10) and ignored gracefully;
+ *    {@link isMessageOfType} over the §13 client subset
+ *    (`ready` / `user_message` / `cancel` / `new_chat` / `confirm_response` /
+ *    `set_config`); any other type is ignored gracefully;
  *  - the in-memory transcript (`Anthropic.MessageParam[]`) carried across turns
- *    of this session (durable persistence is Phase 10);
+ *    of this session and mirrored to disk after each turn for cross-session
+ *    continuity (§10, restored on construction);
  *  - an {@link AgentEvents} adapter that serializes each loop event to a §13
  *    socket frame via `server.send(message(...))`, minting a fresh
  *    `crypto.randomUUID()` id per frame;
@@ -17,13 +18,16 @@
  *    trips so the loop never lands a half-applied transaction (§7 / R5).
  *
  * **Outcome D only**: mutations apply in place — there is no close-to-apply
- * bridge (that is Outcome C) and no propose→apply plan (that is A/B). There is no
- * real project snapshot yet (Phase 11); a short honest placeholder is sent so the
- * model never fabricates project state.
+ * bridge (that is Outcome C) and no propose→apply plan (that is A/B). The per-turn
+ * scoped snapshot is built by {@link buildSnapshot} (project header + the
+ * launch-scoped track expanded shallow, with an honest `scopeNote` when the scope
+ * is unresolvable) so the model never fabricates project state.
  *
  * **Key discipline (§10):** the Anthropic API key never enters any outbound
  * {@link ProtocolMessage} — `config_state` carries only the boolean `hasKey`. The
- * key lives in Node (env for now; Phase 10 reads it from `config.json`).
+ * key lives in Node only, read from `storageDirectory/config.json` (with the
+ * `ANTHROPIC_API_KEY` env fallback) via the config store; it is never echoed by
+ * `set_config`.
  *
  * **Concurrent turns:** a single turn runs at a time. If a `user_message` arrives
  * while a turn is in flight, the session rejects it with one `error` frame
@@ -45,27 +49,78 @@ import {
   isMessageOfType,
   message,
   type ClientMessage,
+  type HistoryItem,
   type ProtocolMessage,
 } from "../../shared/protocol.js";
+import {
+  compactTranscript,
+  estimateRequestTokens,
+} from "../../shared/index.js";
+import { TOOL_DEFINITIONS } from "../../shared/tools.js";
 import { runAgentLoop, type AgentEvents } from "../agent-loop.js";
-import { createClaudeClient, MODEL } from "../claude-client.js";
+import { createClaudeClient } from "../claude-client.js";
+import {
+  loadConfig,
+  resolveApiKey,
+  resolveModel,
+  saveConfig,
+  toConfigState,
+  type Config,
+} from "../config-store.js";
 import { ReferenceTable } from "../references.js";
+import { buildSnapshot } from "../snapshot.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import { LiveToolRuntime } from "../tool-registry.js";
 
 import type { TransportServer } from "./server.js";
+import {
+  loadLatestTranscript,
+  newSessionId,
+  persistTranscript,
+} from "./transcript-store.js";
 
 /** Log prefix mirroring the host's `console.*` convention. */
 const LOG_PREFIX = "[session]";
 
 /**
- * Placeholder snapshot sent until the real serializer lands (Phase 11). Kept
- * deliberately minimal and honest — it states that no project data is wired yet
- * so the model leans on the `live_get_*` read tools rather than inventing state.
+ * Per-turn input token budget (§15: ≤ 25k input). The pre-turn compaction gate
+ * keeps the persisted+sent transcript under `BUDGET_MAX_TOKENS - reserve`.
  */
-const SNAPSHOT_PLACEHOLDER =
-  "[project snapshot not yet wired — Phase 11 will provide the full Live Set " +
-  "snapshot here; until then, use the live_get_* read tools to inspect the Set].";
+const BUDGET_MAX_TOKENS = 25000;
+
+/**
+ * Honest reserve for the non-transcript portion of each request, computed once.
+ *
+ * The dominant, *stable* non-transcript cost is the system prompt + tool schemas;
+ * we estimate it exactly via {@link estimateRequestTokens} (the same estimator the
+ * budget module uses). The per-turn snapshot is built *inside* `defaultRunTurn`
+ * and is not cheaply available at the compaction call site, so we add a fixed,
+ * documented snapshot ALLOWANCE on top. The snapshot is deliberately shallow and
+ * now hard-capped (see `MAX_SNAPSHOT_CHARS` in snapshot.ts ≈ 2k tokens), so 2.5k
+ * tokens of allowance leaves comfortable headroom under 25k. Precision here is
+ * intentionally traded for simplicity — the real `usage` log (claude-client.ts)
+ * is the ground truth used to calibrate this later.
+ */
+const SNAPSHOT_ALLOWANCE_TOKENS = 2500;
+
+/**
+ * Cached reserve = estimate(system + tools) + snapshot allowance. Lazily computed
+ * once on first use so the (small, fixed) estimation cost is not paid per turn.
+ */
+let cachedReserveTokens: number | undefined;
+
+/** Compute (once) the honest per-turn reserve described on the constants above. */
+function reserveTokens(): number {
+  if (cachedReserveTokens === undefined) {
+    cachedReserveTokens =
+      estimateRequestTokens({
+        system: buildSystemPrompt(),
+        tools: [...TOOL_DEFINITIONS],
+        messages: [],
+      }) + SNAPSHOT_ALLOWANCE_TOKENS;
+  }
+  return cachedReserveTokens;
+}
 
 /** Message surfaced to the webview when no Anthropic API key is available. */
 const NO_KEY_MESSAGE =
@@ -143,6 +198,13 @@ export interface ChatSessionOptions {
   /** Max output tokens per turn (forwarded to the loop/client). */
   maxTokens?: number;
   /**
+   * The launch-scope ref STRING (e.g. `"track:0:Drums"`) the agent was opened on,
+   * minted from the clicked handle at launch (§5). Stored as a string only — never
+   * a {@link Handle} — and re-resolved fresh by {@link buildSnapshot} on every turn
+   * (§6). `undefined` → header-only snapshot.
+   */
+  scopeRef?: string;
+  /**
    * Test seam: override the per-turn loop runner. Defaults to the production
    * `createClaudeClient` + `LiveToolRuntime` + `runAgentLoop` wiring. The session
    * still owns the `activeTurn` AbortController (set before the runner, cleared in
@@ -174,14 +236,63 @@ export class ChatSession<V extends ApiVersion> {
   private readonly opts: ChatSessionOptions;
 
   /**
-   * In-memory transcript carried across turns of THIS session. The loop appends
-   * the assistant + tool_result messages and returns the updated array, which we
-   * adopt so multi-turn context accumulates (Phase 10 makes this durable).
+   * The launch-scope ref STRING this session was opened on (e.g. `"track:0:Drums"`),
+   * or `undefined` for a header-only snapshot. A STRING only — never a {@link Handle}
+   * — so nothing is cached across turns (§6); {@link buildSnapshot} re-resolves it
+   * fresh each turn.
+   */
+  private readonly scopeRef: string | undefined;
+
+  /**
+   * The SDK storage directory (`ctx.environment.storageDirectory`), or
+   * `undefined` when none is granted (first run / no storage). Cached at
+   * construction; the persistence helpers treat `undefined` as a first-class
+   * no-op path (§10).
+   */
+  private readonly storageDir: string | undefined;
+
+  /**
+   * The host-side config (API key, model, defaults) loaded from
+   * `storageDirectory/config.json` at construction (§10). Re-cached in
+   * {@link handleSetConfig} when the user updates settings so the running session
+   * reflects the change immediately. NEVER serialized to the webview — only the
+   * `{ hasKey, model }` projection ({@link toConfigState}) crosses the wire.
+   */
+  private config: Config;
+
+  /**
+   * The id of THIS session's transcript file under
+   * `storageDirectory/sessions/<sessionId>.json`. Reused from the restored
+   * session on construction (so a continued conversation overwrites the same
+   * file), else freshly minted (§10). Re-minted by {@link handleNewChat} when the
+   * user starts a fresh conversation, so subsequent turns persist to a NEW file
+   * and the prior conversation's file is left untouched on disk.
+   */
+  private sessionId: string;
+
+  /**
+   * In-memory transcript carried across turns of THIS session, seeded from the
+   * latest persisted session on construction (cross-session continuity, §10). The
+   * loop appends the assistant + tool_result messages and returns the updated
+   * array, which we adopt and mirror to disk after every turn.
    */
   private transcript: Anthropic.MessageParam[] = [];
 
   /** The in-flight turn's abort controller, or `null` when idle. */
   private activeTurn: AbortController | null = null;
+
+  /**
+   * Monotonic conversation generation. Bumped ONLY by {@link handleNewChat} when
+   * the conversation is reset (`transcript = []` + new `sessionId`). A turn
+   * captures this value before `await runner(...)`; if it differs after the await,
+   * the turn was superseded by a "New chat" mid-flight and MUST discard its result
+   * (do not adopt the transcript, persist, error, or emit `refs_updated`) —
+   * otherwise the aborted turn's returned array would reinstate the old
+   * conversation and pollute the new `sessions/<id>.json`. NOT bumped by `cancel`
+   * (which keeps the conversation and adopts partial progress) or `dispose`
+   * (which persists the final transcript for continuity).
+   */
+  private conversationEpoch = 0;
 
   /**
    * Pending destructive-action confirmations awaiting a `confirm_response`
@@ -213,6 +324,38 @@ export class ChatSession<V extends ApiVersion> {
     this.ctx = ctx;
     this.server = server;
     this.opts = opts;
+    this.scopeRef = opts.scopeRef;
+
+    // Cache the storage dir and load the host config (§10). `loadConfig` never
+    // throws and treats an undefined dir as a first-class first-run path.
+    this.storageDir = ctx.environment.storageDirectory;
+    this.config = loadConfig(this.storageDir);
+
+    // Honest, once-per-session launch line so the operator can see whether
+    // persistence is live (§10). Logs ONLY the directory path and an enabled
+    // boolean — never the API key or transcript contents. When the dir is
+    // undefined the stores no-op, so call that out with the dev-flag hint.
+    if (this.storageDir !== undefined) {
+      console.log(
+        `${LOG_PREFIX} storage directory: ${this.storageDir} — persistence enabled`
+      );
+    } else {
+      console.log(
+        `${LOG_PREFIX} storage directory: undefined — persistence disabled (pass --storage-directory)`
+      );
+    }
+
+    // Restore the most recent transcript for cross-session continuity (§10). A
+    // restored record reuses its sessionId so the continued thread overwrites the
+    // same file; otherwise we start a fresh, empty session.
+    const restored = loadLatestTranscript(this.storageDir);
+    if (restored !== null) {
+      this.transcript = restored.messages;
+      this.sessionId = restored.sessionId;
+    } else {
+      this.sessionId = newSessionId();
+    }
+
     this.server.onMessage((msg) => {
       this.dispatch(msg);
     });
@@ -225,8 +368,8 @@ export class ChatSession<V extends ApiVersion> {
   /**
    * Route one validated inbound {@link ClientMessage} to its handler.
    *
-   * Wired this phase: `ready`, `user_message`, `cancel`. `confirm_response`
-   * (Phase 9) and `set_config` (Phase 10) are ignored gracefully with a debug
+   * Wired: `ready`, `user_message`, `cancel`, `new_chat`, `confirm_response`
+   * (Phase 9), `set_config` (Phase 10). Any other type is ignored gracefully with a debug
    * log — never an error to the user. Never throws (the transport's handler
    * wrapper also guards, but we keep this total for safety).
    */
@@ -244,28 +387,102 @@ export class ChatSession<V extends ApiVersion> {
         this.handleCancel();
         return;
       }
+      if (isMessageOfType(msg, "new_chat")) {
+        this.handleNewChat();
+        return;
+      }
       if (isMessageOfType(msg, "confirm_response")) {
         this.handleConfirmResponse(msg.payload.planId, msg.payload.approved);
         return;
       }
-      // set_config (Phase 10): not wired here.
-      console.debug(`${LOG_PREFIX} ignoring unwired message "${msg.type}"`);
+      if (isMessageOfType(msg, "set_config")) {
+        this.handleSetConfig(msg.payload.apiKey, msg.payload.model);
+        return;
+      }
+      // Exhaustive: every `ClientMessage` variant is handled above, so `msg` is
+      // `never` here. The cast keeps the log total in case an unknown type slips
+      // past the transport's validation at runtime — never an error to the user.
+      console.debug(
+        `${LOG_PREFIX} ignoring unrecognized message "${(msg as { type: string }).type}"`
+      );
     } catch (err) {
       console.error(`${LOG_PREFIX} dispatch failed for "${msg.type}"`, err);
     }
   }
 
   /**
-   * Answer `ready` with a best-effort `config_state` carrying only the boolean
-   * `hasKey` (never the key itself, §10) and the active model. `hasKey` reflects
-   * whether a key is available to the host now (env fallback for this phase).
+   * Answer `ready` with a `config_state` carrying only the boolean `hasKey`
+   * (never the key itself, §10) and the active model, both derived from the
+   * loaded {@link Config} via {@link toConfigState}. `hasKey` reflects a key in
+   * config OR the env fallback; `model` reflects `resolveModel`.
    */
   private handleReady(): void {
-    const hasKey = this.hasApiKey();
-    // Single source of truth for the default model (the client's `MODEL`); an
-    // explicit `opts.model` override wins.
-    const model = this.opts.model ?? MODEL;
-    this.send(message("config_state", { hasKey, model }, randomUUID()));
+    this.send(
+      message("config_state", toConfigState(this.config), randomUUID())
+    );
+
+    // Phase 10 UI rehydration: a reopened window connects fresh, so replay the
+    // restored transcript (§10) into the chat as text-only history. Purely
+    // additive to `ready` — config_state above and the key discipline are
+    // untouched. Project each `MessageParam` to a single display string and emit
+    // ONE `history` frame; suppress entirely when nothing is renderable so a
+    // first-run / pure-tool transcript never sends an empty frame.
+    const items = this.projectHistory();
+    if (items.length > 0) {
+      this.send(message("history", { items }, randomUUID()));
+    }
+  }
+
+  /**
+   * Project the restored {@link transcript} to renderable {@link HistoryItem}s
+   * for the `history` frame (Phase 10 UI rehydration).
+   *
+   * Text-only by design — NEVER serializes tool internals, raw content blocks,
+   * images, or any system/secret content to the webview (§10). For each message:
+   *  - string content → used verbatim;
+   *  - array content → the `text` of every `type:"text"` block, joined by "\n";
+   *    `tool_use` / `tool_result` / image / other blocks are ignored.
+   * A turn is included only when its extracted text is non-empty, which naturally
+   * skips pure tool_result messages (user role) and pure tool_use turns
+   * (assistant role) — those are tool plumbing, not utterances.
+   */
+  private projectHistory(): HistoryItem[] {
+    const items: HistoryItem[] = [];
+    for (const msg of this.transcript) {
+      // The transcript holds "user" / "assistant" MessageParams. The SDK role
+      // type also admits "system"; we never author system turns into the
+      // transcript, but skip defensively so the display role stays exactly
+      // "user" | "assistant" and no system content can leak to the webview (§10).
+      if (msg.role !== "user" && msg.role !== "assistant") {
+        continue;
+      }
+      const text = this.extractDisplayText(msg.content);
+      if (text.length > 0) {
+        items.push({ role: msg.role, text });
+      }
+    }
+    return items;
+  }
+
+  /**
+   * Extract the single display string from one message's `content`: a string is
+   * used as-is; an array contributes the `text` of every `type:"text"` block,
+   * joined by newlines, with all non-text blocks (tool_use / tool_result / image
+   * / etc.) ignored. Returns "" when there is no renderable text.
+   */
+  private extractDisplayText(
+    content: Anthropic.MessageParam["content"]
+  ): string {
+    if (typeof content === "string") {
+      return content;
+    }
+    const parts: string[] = [];
+    for (const block of content) {
+      if (block.type === "text" && typeof block.text === "string") {
+        parts.push(block.text);
+      }
+    }
+    return parts.join("\n");
   }
 
   /** Trip the in-flight turn's abort signal, if any (idempotent). */
@@ -274,6 +491,52 @@ export class ChatSession<V extends ApiVersion> {
       console.debug(`${LOG_PREFIX} cancel — aborting in-flight turn`);
       this.activeTurn.abort();
     }
+  }
+
+  /**
+   * Clear the current conversation and start a fresh one (the "New chat" control,
+   * §13 `new_chat`). A clean control action — never an `error` frame, never a
+   * silent no-op.
+   *
+   * Steps, mirroring the `cancel` + `dispose`-drain invariants:
+   *  1. Abort any in-flight turn (same as {@link handleCancel}) so a half-applied
+   *     transaction never lands; the turn's own `finally` clears `activeTurn`.
+   *  2. Drain any `pendingConfirmations` with `settle(false)` (mirroring the
+   *     {@link ChatSession.dispose} drain) so a half-open confirm can't dangle.
+   *  3. Reset the in-memory transcript to empty and re-mint `sessionId`, so the
+   *     NEXT turn persists to a NEW `sessions/<id>.json`. The prior conversation's
+   *     file is left untouched on disk — auto-restore-latest still finds the old
+   *     thread until a new turn supersedes it (§10).
+   *
+   * Deliberately persists NOTHING here: writing an empty transcript would create a
+   * meaningless newest file that auto-restore would then surface. One honest
+   * `console.debug` is logged (no key/secret, §10); no outbound frame is sent —
+   * the webview clears its own DOM.
+   */
+  private handleNewChat(): void {
+    if (this.activeTurn !== null) {
+      this.activeTurn.abort();
+    }
+
+    // Drain pending confirmations so a half-open confirm cannot dangle. Snapshot
+    // the values first since `settle` mutates the map (same pattern as `dispose`).
+    for (const settle of [...this.pendingConfirmations.values()]) {
+      settle(false);
+    }
+
+    // Reset the conversation. The empty transcript is intentionally NOT persisted;
+    // the new session file appears only when the next turn writes to it, so the
+    // old thread's file stays the newest (and restorable) until then.
+    this.transcript = [];
+    this.sessionId = newSessionId();
+
+    // Bump the generation so any turn aborted above discards its (now-stale)
+    // result instead of reinstating the old transcript under the new sessionId.
+    this.conversationEpoch += 1;
+
+    console.debug(
+      `${LOG_PREFIX} new chat — transcript reset, new session ${this.sessionId}`
+    );
   }
 
   /**
@@ -293,6 +556,60 @@ export class ChatSession<V extends ApiVersion> {
       return;
     }
     settle(approved);
+  }
+
+  /**
+   * Apply a `set_config` from the settings UI (Phase 10, §10/§13): persist the
+   * (optional) new key and/or model to `storageDirectory/config.json`, re-cache
+   * the in-memory {@link Config} so the running session reflects the change
+   * immediately, and reply with a fresh `config_state`.
+   *
+   * Key discipline: the key is written in Node only and NEVER echoed — the reply
+   * carries the non-secret `{ hasKey, model }` projection only ({@link toConfigState}).
+   *
+   * Partial semantics: only fields actually provided are overlaid. `apiKey` is
+   * applied only when present AND non-empty (an empty string never clears or
+   * writes a key); `model` is applied only when present.
+   *
+   * Undefined-storageDir honesty: when there is nowhere to persist, `saveConfig`
+   * returns `{ ok:false, error:"no_storage_dir" }`. We STILL merge the partial
+   * into the in-memory config (so this session honors the change) and reply with
+   * `config_state`, but log honestly that it will not survive the session. The
+   * same in-memory merge runs on a `write_failed` so a transient I/O error never
+   * silently drops the user's change for the live session.
+   */
+  private handleSetConfig(
+    apiKey: string | undefined,
+    model: string | undefined
+  ): void {
+    // Build the partial from only the provided, valid fields (§10 partial
+    // semantics). `apiKey` requires non-empty; `model` requires presence.
+    const partial: Partial<Config> = {};
+    if (apiKey !== undefined && apiKey.length > 0) {
+      partial.anthropicApiKey = apiKey;
+    }
+    if (model !== undefined && model.length > 0) {
+      partial.model = model;
+    }
+
+    const result = saveConfig(this.storageDir, partial);
+    if (!result.ok) {
+      // No-key-in-log: detail never contains the key value (config-store
+      // guarantees this). Honest about non-persistence; we still apply in-memory.
+      console.warn(
+        `${LOG_PREFIX} set_config not persisted (${result.error}): ${result.detail} — applying in-memory for this session only`
+      );
+    }
+
+    // Re-cache the live config so this session reflects the change immediately,
+    // regardless of whether the write landed. Shallow-merge mirrors
+    // `saveConfig`'s on-disk merge (top-level keys replace whole values).
+    this.config = { ...this.config, ...partial };
+
+    // Reply with the non-secret projection ONLY — the key never crosses the wire.
+    this.send(
+      message("config_state", toConfigState(this.config), randomUUID())
+    );
   }
 
   /* ----------------------------------------------------------------------- */
@@ -336,6 +653,32 @@ export class ChatSession<V extends ApiVersion> {
     let refs: string[] = [];
     let sendRefs = true;
 
+    // Capture the conversation generation BEFORE the await. If `new_chat` resets
+    // the conversation while this turn is in flight, the epoch bumps and the
+    // turn's result is stale — see the supersession guard after the await.
+    const turnEpoch = this.conversationEpoch;
+
+    // Pre-turn compaction gate (§15: ≤ 25k input). Bound the STORED transcript
+    // here — before the runner appends THIS turn's user message — so both what
+    // the loop sends and what gets persisted stay under budget. Placement before
+    // the runner guarantees the current turn's tool_results (which don't exist
+    // yet) are never compacted; `compactTranscript` is pure/idempotent and
+    // preserves tool_use↔tool_result pairing, so re-running it each turn is safe.
+    const compacted = compactTranscript(this.transcript, {
+      maxTokens: BUDGET_MAX_TOKENS,
+      reserve: reserveTokens(),
+    });
+    this.transcript = compacted.messages;
+    if (
+      compacted.evicted.compactedResults > 0 ||
+      compacted.evicted.droppedMessages > 0
+    ) {
+      // Counts only — never message content, refs, or the key (§10).
+      console.debug(
+        `${LOG_PREFIX} transcript compacted: ${compacted.evicted.compactedResults} tool_result(s) stubbed, ${compacted.evicted.droppedMessages} message(s) dropped`
+      );
+    }
+
     try {
       const result = await runner({
         text,
@@ -344,29 +687,63 @@ export class ChatSession<V extends ApiVersion> {
         signal: controller.signal,
       });
 
-      // Adopt the updated transcript either way so multi-turn context carries
-      // (the runner returns it as far as it progressed, even on failure).
-      this.transcript = result.messages;
-      refs = result.refs;
-      sendRefs = result.ran !== false;
+      if (this.conversationEpoch !== turnEpoch) {
+        // Superseded by a mid-flight `new_chat`: the conversation was already
+        // reset to `[]` under a new sessionId. Adopting `result.messages` here
+        // would reinstate the old (grown) array and persist it under the NEW
+        // sessionId, polluting the fresh session. Discard the result entirely —
+        // no adopt, no persist, no error frame, no `refs_updated`.
+        sendRefs = false;
+        console.debug(
+          `${LOG_PREFIX} turn superseded by new chat — discarding result`
+        );
+      } else {
+        // Adopt the updated transcript either way so multi-turn context carries
+        // (the runner returns it as far as it progressed, even on failure).
+        this.transcript = result.messages;
+        refs = result.refs;
+        sendRefs = result.ran !== false;
 
-      if (!result.ok && result.errorMessage !== undefined) {
-        // EXACTLY ONE `error` frame per failed turn. The session sends the frame
-        // ONLY when the runner hands up an (already-sanitized) `errorMessage` —
-        // i.e. for a failure the runner did NOT itself surface (e.g. the no-key
-        // short-circuit). A loop failure already emitted its frame via
-        // `events.error` and returns WITHOUT `errorMessage`, so the session adds
-        // none — never double-reporting.
-        this.sendError(result.errorMessage);
+        // Mirror the transcript to disk for cross-session continuity (§10).
+        // `persistTranscript` never throws, but keep the call defensive so a
+        // surprise can never break the turn or leave a dangling rejection.
+        try {
+          persistTranscript(this.storageDir, this.sessionId, this.transcript);
+        } catch (err) {
+          console.error(`${LOG_PREFIX} failed to persist transcript`, err);
+        }
+
+        if (!result.ok && result.errorMessage !== undefined) {
+          // EXACTLY ONE `error` frame per failed turn. The session sends the frame
+          // ONLY when the runner hands up an (already-sanitized) `errorMessage` —
+          // i.e. for a failure the runner did NOT itself surface (e.g. the no-key
+          // short-circuit). A loop failure already emitted its frame via
+          // `events.error` and returns WITHOUT `errorMessage`, so the session adds
+          // none — never double-reporting.
+          this.sendError(result.errorMessage);
+        }
       }
     } catch (err) {
       // Defensive: the default runner never throws, but an injected runner (or a
       // surprise) must still become an `error` frame, never an unhandled
-      // rejection.
-      console.error(`${LOG_PREFIX} unexpected turn failure`, err);
-      this.sendError("The turn failed unexpectedly. Please try again.");
+      // rejection. A superseded turn that also threw stays silent — the
+      // conversation has moved on and the error is for a discarded turn.
+      if (this.conversationEpoch !== turnEpoch) {
+        sendRefs = false;
+        console.debug(
+          `${LOG_PREFIX} superseded turn threw after new chat — discarding`
+        );
+      } else {
+        console.error(`${LOG_PREFIX} unexpected turn failure`, err);
+        this.sendError("The turn failed unexpectedly. Please try again.");
+      }
     } finally {
-      this.activeTurn = null;
+      // Clear `activeTurn` only if it is still THIS turn's controller, so a
+      // superseded turn's teardown can never clobber a newer turn's controller.
+      // (The busy-guard already prevents overlap; this makes it explicit.)
+      if (this.activeTurn === controller) {
+        this.activeTurn = null;
+      }
     }
 
     // After a turn that ran, surface the turn-scoped refs so the webview can
@@ -398,9 +775,17 @@ export class ChatSession<V extends ApiVersion> {
   private async defaultRunTurn(args: TurnRunArgs): Promise<TurnRunResult> {
     const { text, transcript, events, signal } = args;
 
+    // Resolve the effective key + model from the loaded config (§10). The config
+    // value wins; the env key remains the fallback inside `resolveApiKey`. An
+    // explicit `opts.model` (test seam) still overrides the resolved model.
+    const apiKey = resolveApiKey(this.config);
+    const model = this.opts.model ?? resolveModel(this.config);
+
     // Build the client first so a missing key never appends a dangling user
-    // message to the transcript (the turn simply does not start).
-    const created = createClaudeClient(undefined, this.opts.model);
+    // message to the transcript (the turn simply does not start). The resolved
+    // key is passed explicitly (config wins; env is the fallback already folded
+    // into `resolveApiKey`).
+    const created = createClaudeClient(apiKey, model);
     if (!created.ok) {
       console.error(`${LOG_PREFIX} no Claude client: ${created.err.detail}`);
       return {
@@ -426,9 +811,13 @@ export class ChatSession<V extends ApiVersion> {
       runtime,
       events,
       system: buildSystemPrompt(),
-      snapshot: SNAPSHOT_PLACEHOLDER,
+      // Fresh, scoped per-turn snapshot (§4). `buildSnapshot` re-resolves
+      // `this.scopeRef` against the live model every turn (§6) — no Handle is
+      // cached — and falls back to a header-only snapshot when there is no scope
+      // or the scope no longer resolves.
+      snapshot: buildSnapshot(this.ctx, this.scopeRef),
       messages: transcript,
-      model: this.opts.model,
+      model,
       maxTokens: this.opts.maxTokens,
       signal,
       requestConfirmation: this.buildRequestConfirmation(signal),
@@ -566,21 +955,20 @@ export class ChatSession<V extends ApiVersion> {
     for (const settle of [...this.pendingConfirmations.values()]) {
       settle(false);
     }
+
+    // Final transcript flush on modal close so the last turn's state is durable
+    // for the next launch (§10). Best-effort and defensive — a persistence
+    // failure here must never throw out of `dispose`.
+    try {
+      persistTranscript(this.storageDir, this.sessionId, this.transcript);
+    } catch (err) {
+      console.error(`${LOG_PREFIX} failed to flush transcript on dispose`, err);
+    }
   }
 
   /* ----------------------------------------------------------------------- */
   /* Helpers                                                                 */
   /* ----------------------------------------------------------------------- */
-
-  /**
-   * Whether an Anthropic API key is available to the host right now. Reads the
-   * env fallback only (Phase 10 adds the `config.json` source). NEVER returns or
-   * logs the key itself.
-   */
-  private hasApiKey(): boolean {
-    const key = process.env.ANTHROPIC_API_KEY;
-    return typeof key === "string" && key.length > 0;
-  }
 
   /** Send one server frame; the transport no-ops when no client is connected. */
   private send(msg: ProtocolMessage): void {

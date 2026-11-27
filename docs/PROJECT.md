@@ -1,9 +1,12 @@
 # Ableton Agent
 
-Ableton Live 12 Extensions SDK extension with a Claude-powered chat UI. The
-product's Claude runtime is distinct from the Claude and Codex development
-harnesses. Sources: `src/extension` (SDK host, transaction and transport
-boundaries), `src/webview` (Vite SPA) and `src/shared` (shared TypeScript
+Ableton Live 12 Extensions SDK extension with an embedded agent chat UI.
+The installed implementation still uses Claude; the approved product direction
+is Sign in with ChatGPT plan usage through the Responses API, as scoped in
+[provider migration](CHATGPT_MIGRATION.md). The product runtime is distinct from
+the Claude and Codex development harnesses; retain both. Phase 15's migration
+and live gate are active, not yet implemented. Sources: `src/extension`
+(SDK host, transaction and transport boundaries), `src/webview` (Vite SPA) and `src/shared` (shared TypeScript
 contracts). Tests use Vitest and fake SDK/API seams. See
 [architecture](ARCHITECTURE.md), [phase plan](PLAN.md), and [progress](PROGRESS.md).
 
@@ -19,9 +22,15 @@ contracts). Tests use Vitest and fake SDK/API seams. See
   the recorded Live Beta setup, not an automated or CI check. Do not start Live,
   open a real set, spend API usage, expose secrets, or perform mutations unless
   the user authorizes that live exercise. Refer to the phase's exact smoke
-  checklist. Headless checks cannot substitute for a recorded in-Live gate.
-- Keep keys, `.env`, runtime `config.json`, transcripts, Live sets, and
-  `*.ablx` artifacts out of commits and issue repros.
+  checklist. Headless checks cannot substitute for a recorded in-Live gate,
+  including the replacement Phase 15 live gate.
+  Use the installed extension on a disposable Set for current-beta verification.
+  OAuth consent and real provider usage require operator authorization; use
+  offline fake providers in automated tests.
+- Keep API keys, OAuth tokens/codes/credential files, `.env`, runtime
+  `config.json`, transcripts, Live sets and `*.ablx` artifacts out of commits,
+  logs and issue repros. The legacy Anthropic schema command is not a ChatGPT
+  verification command; do not run it to validate the migration.
 
 ## Delivery and roles
 

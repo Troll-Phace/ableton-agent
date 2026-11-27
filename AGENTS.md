@@ -89,7 +89,12 @@ that subtree's guidance when starting from the repository root.
 
 ## Ableton boundaries
 
-Use the shared plan and recorded Outcome D. Do not claim a host mutation,
+Use the shared plan and recorded Outcome D. The active Phase 15 provider
+direction is documented in docs/CHATGPT_MIGRATION.md; it supersedes provider-
+specific Claude baseline instructions during migration only. Read it for
+Phase 15.3 onward; keep both development harnesses, all 17 Live tool behaviors,
+and the existing confirmation/undo boundaries. Do not bypass the feasibility
+or live gates or silently spend API credits. Do not claim a host mutation,
 live smoke result, or approval using only stubs or logs from an older diff.
 Avoid real Live sets, stored credentials and transcripts during headless work.
 Do not open Live or launch the real Extensions CLI for a Codex harness check.

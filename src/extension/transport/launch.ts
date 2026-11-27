@@ -38,6 +38,8 @@
 
 import type { ExtensionContext, Handle } from "@ableton-extensions/sdk";
 
+import { refFromHandle } from "../references.js";
+
 import { TransportServer } from "./server.js";
 import { ChatSession } from "./session.js";
 
@@ -138,11 +140,11 @@ export async function startLaunchWiring(
    * @param args Live's command arguments; `args[0]` is the clicked {@link Handle}.
    */
   const onLaunch = (...args: unknown[]): void => {
-    // The clicked-object handle (Phase 11 uses it to scope the snapshot). Cast
-    // is sound: the SDK passes the triggered object's handle as `args[0]` for
-    // object scopes like `AudioTrack`. Captured but intentionally unused now.
+    // The clicked-object handle. Cast is sound: the SDK passes the triggered
+    // object's handle as `args[0]` for object scopes like `AudioTrack`. We anchor
+    // it to a ref STRING below WHILE it is live (§5/§6) and pass only the string
+    // into the session — the Handle itself is never stored across turns.
     const clickedObject = args[0] as Handle | undefined;
-    void clickedObject;
 
     if (modalOpen) {
       // Double-launch: a modal is already open. The SDK offers no "focus modal"
@@ -152,9 +154,37 @@ export async function startLaunchWiring(
     }
     modalOpen = true;
 
+    // Anchor the clicked handle to a durable ref string NOW, while it is live
+    // (§6). `refFromHandle` anchors top-level track/scene/cuePoint scopes (an
+    // `AudioTrack` qualifies). On success the ref string scopes the snapshot to
+    // that track every turn; on a non-anchorable/dead handle (or no handle at
+    // all) we fall back to a header-only snapshot. The Handle is NOT carried into
+    // the session — only the resulting string is.
+    let scopeRef: string | undefined;
+    if (clickedObject !== undefined) {
+      const anchored = refFromHandle(ctx, clickedObject);
+      if (anchored.ok) {
+        scopeRef = anchored.ref;
+        console.debug(
+          `${LOG_PREFIX} launch scoped to ref "${scopeRef}" from clicked handle`
+        );
+      } else {
+        console.debug(
+          `${LOG_PREFIX} clicked handle not anchorable (${anchored.err.error}: ${anchored.err.detail}) — header-only snapshot`
+        );
+      }
+    } else {
+      console.debug(`${LOG_PREFIX} no clicked handle — header-only snapshot`);
+    }
+
     // Build the session BEFORE opening the modal so its `server.onMessage`
     // dispatcher is wired by the time the webview connects and sends `ready`.
-    const activeSession = new ChatSession<LaunchApiVersion>(ctx, server);
+    // Only the ref STRING crosses into the session (never the Handle, §6).
+    const activeSession = new ChatSession<LaunchApiVersion>(
+      ctx,
+      server,
+      scopeRef !== undefined ? { scopeRef } : {}
+    );
     session = activeSession;
 
     const onClose = (): void => {

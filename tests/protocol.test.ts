@@ -18,12 +18,12 @@ import {
  * `src/shared/protocol.ts`. Pure only: no SDK, no Node server, no `ws`.
  *
  * Coverage:
- *  - Round-trip every one of the 12 message types via
+ *  - Round-trip every one of the 13 message types via
  *    `serialize(message(...))` → `parseEnvelope(...)` and assert deep equality.
  *  - Malformed-input rejection: `parseEnvelope` returns `{ ok:false, error }`
  *    and NEVER throws, across envelope- and payload-level violations.
  *  - Type guards: `isClientMessage` / `isServerMessage` / `isMessageOfType`.
- *  - Empty-payload (`ready`/`cancel`) handling.
+ *  - Empty-payload (`ready`/`cancel`/`new_chat`) handling.
  *  - Extra-key tolerance (pinned as intentional behavior).
  *
  * Malformed inputs are supplied as raw JSON *strings* (the only input shape
@@ -45,6 +45,7 @@ const SAMPLE_PAYLOADS: {
   user_message: { text: "make the bass louder" },
   confirm_response: { planId: "plan-7", approved: true },
   cancel: {},
+  new_chat: {},
   set_config: { apiKey: "sk-ant-test", model: "claude-sonnet-4-6" },
   config_state: { hasKey: true, model: "claude-sonnet-4-6" },
   assistant_delta: { text: "Sure, " },
@@ -60,6 +61,12 @@ const SAMPLE_PAYLOADS: {
     actions: ["delete track:2:Bass"],
   },
   refs_updated: { refs: ["track:2:Bass", "track:3:Drums"] },
+  history: {
+    items: [
+      { role: "user", text: "what's in this track?" },
+      { role: "assistant", text: "A Reverb and a Compressor." },
+    ],
+  },
   error: { message: "loop aborted" },
 };
 
@@ -72,6 +79,7 @@ const CLIENT_TYPES: MessageType[] = [
   "confirm_response",
   "cancel",
   "set_config",
+  "new_chat",
 ];
 
 const SERVER_TYPES: MessageType[] = [
@@ -82,6 +90,7 @@ const SERVER_TYPES: MessageType[] = [
   "confirm_request",
   "refs_updated",
   "error",
+  "history",
 ];
 
 /* -------------------------------------------------------------------------- */
@@ -527,6 +536,55 @@ const BAD_PAYLOAD_CASES: ReadonlyArray<{
     payload: { message: 42 },
   },
   { name: "error_missingMessage", type: "error", payload: {} },
+  // history — the `items` array must be present and every element must be a
+  // `{ role: "user" | "assistant", text: string }`. Each row below violates one
+  // of those rules and must be rejected (`{ ok:false }`, no throw).
+  { name: "history_missingItems", type: "history", payload: {} },
+  {
+    name: "history_itemsNotArray",
+    type: "history",
+    payload: { items: "nope" },
+  },
+  {
+    name: "history_itemsObjectNotArray",
+    type: "history",
+    payload: { items: { role: "user", text: "hi" } },
+  },
+  {
+    name: "history_itemRoleSystem",
+    type: "history",
+    payload: { items: [{ role: "system", text: "leak" }] },
+  },
+  {
+    name: "history_itemRoleUnknown",
+    type: "history",
+    payload: {
+      items: [
+        { role: "assistant", text: "ok" },
+        { role: "bogus", text: "x" },
+      ],
+    },
+  },
+  {
+    name: "history_itemTextNotString",
+    type: "history",
+    payload: { items: [{ role: "user", text: 123 }] },
+  },
+  {
+    name: "history_itemMissingText",
+    type: "history",
+    payload: { items: [{ role: "user" }] },
+  },
+  {
+    name: "history_itemNotObject",
+    type: "history",
+    payload: { items: ["just a string"] },
+  },
+  {
+    name: "history_itemNull",
+    type: "history",
+    payload: { items: [null] },
+  },
 ];
 
 describe("protocol — per-type payload violations", () => {

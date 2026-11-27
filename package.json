@@ -10,7 +10,7 @@
     "build": "tsc -b && npm run build:webview && tsx build.ts --production",
     "build:dev": "tsc -b && npm run build:webview && tsx build.ts",
     "build:webview": "vite build",
-    "start": "npm run build:dev && extensions-cli run",
+    "start": "npm run build:dev && extensions-cli run --storage-directory \"$PWD/.dev-storage\" --temp-directory \"$PWD/.dev-temp\"",
     "package": "npm run build && extensions-cli package",
     "test": "vitest run",
     "test:watch": "vitest",

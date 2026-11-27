@@ -100,6 +100,72 @@ describe("system-prompt — verbatim §9 cannot-list", () => {
     // The list is introduced as a contract the model must read as "you cannot".
     expect(promptText()).toContain("You cannot");
   });
+
+  it("systemPrompt_cannotSection_hasExactlyEightBullets", () => {
+    // The §9 cannot-list is exactly 8 items (§14 SDK Capability Map). The Phase-14
+    // "# Audio & Simpler" note is an OPERATING RULE, NOT a 9th cannot — so the
+    // cannot-section bullet count must stay 8. Count the "- " bullets that fall
+    // between the "# You cannot" heading and the next "# " heading ("# Honesty").
+    const text = promptText();
+    const start = text.indexOf("# You cannot");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const rest = text.slice(start + "# You cannot".length);
+    const nextHeading = rest.indexOf("\n# ");
+    const section = nextHeading >= 0 ? rest.slice(0, nextHeading) : rest;
+    const bullets = section.split("\n").filter((line) => line.startsWith("- "));
+    expect(bullets).toHaveLength(8);
+  });
+});
+
+describe("system-prompt — Audio & Simpler operating rules (Phase 14)", () => {
+  // The Phase-14 "# Audio & Simpler" section is an OPERATING RULE (not part of the
+  // §9 cannot-list). It steers the model around two real SDK walls surfaced in the
+  // in-Live smoke: import-then-create sequencing, and the empty-Simpler replace
+  // failure. Pinned on stable substrings (not whole paragraphs) per system-prompt.ts.
+
+  it("systemPrompt_text_hasAudioAndSimplerSection", () => {
+    expect(promptText()).toContain("# Audio & Simpler");
+  });
+
+  it("systemPrompt_text_importReturnsManagedPathRunAsOwnStep", () => {
+    // (a) live_import_audio returns a MANAGED path; run it as its own turn, then use
+    // that path in a SUBSEQUENT live_create_clip — do not batch import with edits.
+    const text = promptText();
+    expect(text).toContain("live_import_audio");
+    expect(text).toContain("MANAGED path");
+    expect(text).toContain("its own step");
+    expect(text).toContain("SUBSEQUENT call to live_create_clip");
+    expect(text).toContain("Do NOT batch the import");
+  });
+
+  it("systemPrompt_text_cannotLoadSampleIntoEmptySimpler", () => {
+    // (b) Cannot load a sample into an empty Simpler; replace_sample only replaces an
+    // already-loaded sample; alternatives = audio clip, or drag-in manually.
+    const text = promptText();
+    expect(text).toContain(
+      "cannot load a sample into a freshly-inserted EMPTY Simpler"
+    );
+    expect(text).toContain(
+      "live_replace_sample only replaces a sample that is ALREADY loaded"
+    );
+    expect(text).toContain("live_create_clip with type 'audio'");
+    expect(text).toContain("drag the imported file onto a Simpler");
+  });
+
+  it("systemPrompt_text_defaultsToArrangementForAmbiguousSamplePlacement", () => {
+    // (c) The agent cannot see the active view (Session/Arrangement) or selection,
+    // so ambiguous "put this sample on this track" DEFAULTS to the Arrangement
+    // timeline; Session clip slots are used only when explicitly requested. This
+    // makes the operator's "default to Arrangement" decision a pinned contract.
+    const text = promptText();
+    expect(text).toContain(
+      "cannot see which view (Session or Arrangement) is active"
+    );
+    expect(text).toContain("DEFAULT to the Arrangement timeline");
+    expect(text).toContain(
+      "Only place into a Session clip slot when the user explicitly asks for Session or a clip slot"
+    );
+  });
 });
 
 describe("system-prompt — confirmation section (Phase 9 reconciliation, §9/§13)", () => {

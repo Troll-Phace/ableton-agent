@@ -9,6 +9,10 @@ coverage/
 
 .env
 
+# Dev-run storage/temp (contains real config.json with API key + transcripts; never commit)
+.dev-storage/
+.dev-temp/
+
 .claude/settings.local.json
 .claude/state/
 
