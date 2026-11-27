@@ -7,6 +7,12 @@ paths:
 
 # Testing Standards
 
+**Active provider migration (Phase 15.3 onward):** the new target is the
+official ChatGPT plan-usage flow. Follow docs/CHATGPT_MIGRATION.md for mock
+OAuth/Responses SSE and installed live gates. The Anthropic fixtures below
+describe the existing baseline; preserve equivalent behavior coverage, never
+make real provider requests in automated tests.
+
 ## General Rules
 - Write tests for every pure module: reference resolution, snapshot serialization, note transforms, tool-argument validation, unit conversion (beats↔seconds), and socket-protocol framing.
 - Test happy path, edge cases, and error handling (especially ref drift: deleted/moved/renamed objects).

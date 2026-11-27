@@ -9,6 +9,7 @@ import { LiveToolRuntime } from "../src/extension/tool-registry.js";
 import {
   makeFakeContext,
   type FakeExtensionContext,
+  type NodeSpec,
   type SetSpec,
 } from "./fixtures/fake-extension-context.js";
 
@@ -384,5 +385,112 @@ describe("buildSnapshot — always returns valid JSON", () => {
         parseSnapshot(buildSnapshot(ctxOf(fake), scope));
       }).not.toThrow();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. serializeCapped (§15) — pathological Sets degrade gracefully, never throw
+// ---------------------------------------------------------------------------
+
+/**
+ * The MAX_SNAPSHOT_CHARS cap (§15) is a private backstop in `snapshot.ts`; it is
+ * exercised end-to-end through `buildSnapshot` (its only caller). A normal Set
+ * passes through untouched; a pathological one degrades in two documented steps:
+ *  - an oversized `scopedTrack` (heavy track) → dropped, with a truncation note
+ *    appended to `scopeNote` (path 2);
+ *  - a header that is itself over the cap (hundreds of tracks) → a minimal valid
+ *    snapshot object with an honest note (path 3).
+ * Every path must remain valid JSON, carry the truncation note, stay ≤ the cap,
+ * and never throw. The cap value (8000) is mirrored locally to pin the contract.
+ */
+describe("buildSnapshot — serializeCapped backstop (§15)", () => {
+  /** Mirror of the private MAX_SNAPSHOT_CHARS in snapshot.ts. */
+  const MAX_SNAPSHOT_CHARS = 8000;
+  /** Mirror of the private TRUNCATION_NOTE marker text in snapshot.ts. */
+  const TRUNCATION_MARKER = "snapshot truncated to stay within context budget";
+
+  /**
+   * A minimal valid track mixer NodeSpec (the snapshot's `buildTrackDetail` reads
+   * a track's mixer; a track spec without one throws into the internal-error
+   * fallback rather than the cap path we want to exercise here).
+   */
+  const MIXER: NodeSpec = {
+    className: "MixerDevice",
+    children: {
+      volume: [{ className: "DeviceParameter", name: "Volume" }],
+      panning: [{ className: "DeviceParameter", name: "Pan" }],
+      sends: [],
+    },
+  };
+
+  it("snapshot_normalSet_passesThroughUnderCapNoTruncationNote", () => {
+    const fake = makeFakeContext();
+    const json = buildSnapshot(ctxOf(fake), "track:0:Drums");
+    expect(json.length).toBeLessThanOrEqual(MAX_SNAPSHOT_CHARS);
+    const snap = parseSnapshot(json);
+    // The normal scoped snapshot keeps its scopedTrack and carries no note.
+    expect(snap.scopedTrack).toBeDefined();
+    expect(snap.scopeNote).toBeUndefined();
+    expect(json).not.toContain(TRUNCATION_MARKER);
+  });
+
+  it("snapshot_oversizedScopedTrack_dropsScopedTrackWithTruncationNote", () => {
+    // A track carrying hundreds of long-named devices makes `scopedTrack` blow the
+    // cap while the 1-track header stays small → path 2: drop scopedTrack, note it.
+    const heavyDevices: NodeSpec[] = Array.from({ length: 400 }, (_, i) => ({
+      className: "Reverb",
+      name: `Device-${i}-${"x".repeat(40)}`,
+    }));
+    const spec: SetSpec = {
+      tracks: [
+        {
+          className: "AudioTrack",
+          name: "Heavy",
+          children: { devices: heavyDevices },
+          mixer: MIXER,
+        },
+      ],
+    };
+    const fake = makeFakeContext(spec);
+
+    let json = "";
+    expect(() => {
+      json = buildSnapshot(ctxOf(fake), "track:0:Heavy");
+    }).not.toThrow();
+
+    // Still valid JSON, within the cap, scopedTrack dropped, note present.
+    const snap = parseSnapshot(json);
+    expect(json.length).toBeLessThanOrEqual(MAX_SNAPSHOT_CHARS);
+    expect(snap.scopedTrack).toBeUndefined();
+    expect(typeof snap.scopeNote).toBe("string");
+    expect(snap.scopeNote as string).toContain(TRUNCATION_MARKER);
+    // The header survives the cap (path 2 keeps it).
+    expect(snap.header).toBeDefined();
+    expect((snap.header as { tracks: unknown[] }).tracks).toHaveLength(1);
+  });
+
+  it("snapshot_oversizedHeader_fallsBackToMinimalValidSnapshot", () => {
+    // Hundreds of long-named tracks push the HEADER itself over the cap → path 3:
+    // a minimal valid snapshot with empty header collections + an honest note.
+    const manyTracks: NodeSpec[] = Array.from({ length: 600 }, (_, i) => ({
+      className: "AudioTrack",
+      name: `Track-${i}-${"y".repeat(30)}`,
+      mixer: MIXER,
+    }));
+    const fake = makeFakeContext({ tracks: manyTracks });
+
+    let json = "";
+    expect(() => {
+      json = buildSnapshot(ctxOf(fake)); // header-only, but header is huge
+    }).not.toThrow();
+
+    const snap = parseSnapshot(json);
+    expect(json.length).toBeLessThanOrEqual(MAX_SNAPSHOT_CHARS);
+    expect(snap.kind).toBe("project_snapshot");
+    // Minimal fallback: the header's track list is emptied, note is honest.
+    expect((snap.header as { tracks: unknown[] }).tracks).toEqual([]);
+    expect(typeof snap.scopeNote).toBe("string");
+    expect(snap.scopeNote as string).toContain(TRUNCATION_MARKER);
+    expect(snap.scopeNote as string).toContain("live_get_");
   });
 });

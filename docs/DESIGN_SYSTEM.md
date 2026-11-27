@@ -1,4 +1,12 @@
-# Ableton Claude Agent — Design System
+# Ableton Agent — Design System
+
+Existing screens reflect the Claude baseline. The accepted ChatGPT onboarding
+direction is in [provider migration](CHATGPT_MIGRATION.md). In Phase 15.5,
+replace the API-key settings flow with official Continue with ChatGPT,
+connection/denial/reconnect/sign-out states and an account-specific model
+selector. Use the system browser for consent; never render OAuth credentials.
+Preserve the existing tokens, modal, chat, confirmation cards, activity
+chips, accessibility and input/streaming behavior. The current UI is not yet migrated.
 
 ## Design Philosophy
 

@@ -51,6 +51,78 @@ export interface ProjectSnapshot {
 }
 
 /**
+ * Defensive hard cap on the serialized snapshot length (§15: the snapshot must
+ * stay a small fraction of the ≤ 25k input budget). The snapshot is already
+ * shallow, so this is a BACKSTOP for pathological Sets (e.g. hundreds of tracks).
+ * ~8000 chars ≈ ~2k tokens, matching the snapshot allowance baked into the
+ * session's per-turn reserve. The cap degrades the snapshot GRACEFULLY (drop the
+ * heaviest optional part, then fall back to a minimal valid object) — it never
+ * slices the JSON string (that would hand the agent invalid JSON to read) and
+ * never throws.
+ */
+const MAX_SNAPSHOT_CHARS = 8000;
+
+/** Honest note appended to `scopeNote` when the snapshot is capped. */
+const TRUNCATION_NOTE = "…(snapshot truncated to stay within context budget)";
+
+/**
+ * Append {@link TRUNCATION_NOTE} to an optional existing `scopeNote` (honest,
+ * non-destructive: any prior note is preserved and the truncation note added).
+ */
+function withTruncationNote(existing?: string): string {
+  return existing !== undefined && existing.trim() !== ""
+    ? `${existing}; ${TRUNCATION_NOTE}`
+    : TRUNCATION_NOTE;
+}
+
+/**
+ * Serialize a snapshot, enforcing {@link MAX_SNAPSHOT_CHARS} while keeping the
+ * result VALID JSON and HONEST. Strategy, in order:
+ *  1. If the full snapshot fits, return it unchanged.
+ *  2. Else drop the heaviest optional part (`scopedTrack`) and add the truncation
+ *     note; if that now fits, return it.
+ *  3. Else (even the header is over cap) fall back to a minimal valid snapshot
+ *     object carrying only the truncation note — never an invalid string slice.
+ */
+function serializeCapped(snapshot: ProjectSnapshot): string {
+  const full = JSON.stringify(snapshot);
+  if (full.length <= MAX_SNAPSHOT_CHARS) {
+    return full;
+  }
+
+  // 2. Drop the heaviest optional detail and flag the truncation honestly.
+  const trimmed: ProjectSnapshot = {
+    kind: "project_snapshot",
+    header: snapshot.header,
+    scopeNote: withTruncationNote(snapshot.scopeNote),
+  };
+  const trimmedStr = JSON.stringify(trimmed);
+  if (trimmedStr.length <= MAX_SNAPSHOT_CHARS) {
+    return trimmedStr;
+  }
+
+  // 3. Even the header is over cap: minimal valid object, header omitted, honest.
+  const minimal: ProjectSnapshot = {
+    kind: "project_snapshot",
+    header: {
+      tempo: null,
+      scaleName: null,
+      scaleMode: null,
+      rootNote: null,
+      gridQuantization: null,
+      gridIsTriplet: null,
+      tracks: [],
+      returnTracks: [],
+      mainTrack: { name: null },
+      scenes: [],
+      cuePoints: [],
+    },
+    scopeNote: `${TRUNCATION_NOTE}; the project is too large to summarize inline — use the live_get_* tools to read state on demand`,
+  };
+  return JSON.stringify(minimal);
+}
+
+/**
  * True if a resolver `className` denotes a track. The base resolver fallback is
  * `"Track"`; the real SDK reports concrete subtypes (`"AudioTrack"`,
  * `"MidiTrack"`). A name-suffix check covers both without importing SDK classes,
@@ -118,7 +190,10 @@ export function buildSnapshot<V extends ApiVersion>(
       }
     }
 
-    return JSON.stringify(snapshot);
+    // Defensive hard cap (§15): keep the serialized snapshot under
+    // `MAX_SNAPSHOT_CHARS`, degrading to valid JSON + an honest note, never a
+    // string slice and never a throw.
+    return serializeCapped(snapshot);
   } catch (e) {
     // Defensive: the loop must never crash on a snapshot failure (§9). Emit a
     // minimal, honest snapshot and log context (console-only host).

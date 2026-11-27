@@ -33,7 +33,7 @@ import {
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WebSocket } from "ws";
 
@@ -58,6 +58,7 @@ import {
   refFromHandle,
   type ClassTokens,
 } from "../src/extension/references.js";
+import { estimateMessageTokens } from "../src/shared/context-budget.js";
 
 import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
 
@@ -2155,6 +2156,190 @@ describe("chatSession_ready_rehydratesHistory", () => {
 
     expect(collector.ofType("config_state")).toHaveLength(1);
     expect(collector.ofType("history")).toHaveLength(0);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 12b. Session glue — pre-turn compaction gate (Phase 15, §15)                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Drives the REAL pre-turn compaction gate in `ChatSession.handleUserMessage`
+ * (Phase 15, §15: ≤ 25k input). Before the runner is called, the session compacts
+ * `this.transcript` via `compactTranscript({ maxTokens: 25000, reserve })`,
+ * reassigns it, and `console.debug`s an eviction summary when anything was evicted.
+ *
+ * We pre-seed the session's private `transcript` with an OVER-BUDGET history
+ * (heavy stale tool_result rounds), then drive one turn via the injected `runTurn`
+ * seam. The seam captures the transcript HANDED TO THE RUNNER (the same array the
+ * loop would send and the session persists), so we can assert it is bounded — and
+ * we spy on `console.debug` to assert the eviction-summary line fired.
+ *
+ * Seeding the private field mirrors the §10b/§11 typed-accessor seams
+ * ({@link transcriptOf}); it is the least-invasive way to put the session in the
+ * over-budget state the gate guards against, with no new production hook.
+ */
+describe("chatSession_preTurnCompaction_boundsTranscriptAndLogs", () => {
+  function fakeCtx(): ConstructorParameters<typeof ChatSession>[0] {
+    return makeFakeContext() as unknown as ConstructorParameters<
+      typeof ChatSession
+    >[0];
+  }
+
+  /** Write the session's private `transcript` to a seeded over-budget array. */
+  function setTranscript(
+    session: unknown,
+    messages: Anthropic.MessageParam[]
+  ): void {
+    (session as SessionStateAccess).transcript = messages;
+  }
+
+  /**
+   * Build an OVER-BUDGET transcript (≈ well over the 25k input budget): many
+   * 4-message tool-rounds whose tool_results carry heavy payloads. Each round is a
+   * clean turn (user-text → assistant tool_use → user tool_result → assistant
+   * text) so the gate can stub stale results and/or drop oldest turn-pairs while
+   * preserving pairing.
+   */
+  function overBudgetTranscript(rounds: number): Anthropic.MessageParam[] {
+    const msgs: Anthropic.MessageParam[] = [];
+    for (let i = 0; i < rounds; i++) {
+      msgs.push({ role: "user", content: [{ type: "text", text: `q${i}` }] });
+      msgs.push({
+        role: "assistant",
+        content: [
+          {
+            type: "tool_use",
+            id: `tu_${i}`,
+            name: "live_get_track",
+            input: {},
+          },
+        ],
+      });
+      msgs.push({
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: `tu_${i}`,
+            // Heavy stale payload (~2k chars ≈ ~500 tokens each).
+            content: "R".repeat(2000),
+          },
+        ],
+      });
+      msgs.push({
+        role: "assistant",
+        content: [{ type: "text", text: `a${i}` }],
+      });
+    }
+    return msgs;
+  }
+
+  it("chatSession_overBudgetTranscript_compactedBeforeRunnerAndDebugLogged", async () => {
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    try {
+      // The injected runner captures the (already-compacted) transcript it is
+      // handed — exactly what the loop would send and what the session persists.
+      let handed: Anthropic.MessageParam[] = [];
+      const runTurn = (args: TurnRunArgs): Promise<TurnRunResult> => {
+        handed = args.transcript;
+        args.events.assistantDone("end_turn");
+        return Promise.resolve({
+          ok: true,
+          messages: args.transcript,
+          refs: [],
+        });
+      };
+
+      const { server, info } = await startServer();
+      const session = new ChatSession(fakeCtx(), server, { runTurn });
+
+      // Pre-seed an over-budget history (60 rounds ≈ 240 messages, ~30k+ tokens).
+      const seeded = overBudgetTranscript(60);
+      const seededTokens = seeded.reduce(
+        (a, m) => a + estimateMessageTokens(m),
+        0
+      );
+      // Sanity: the seed is genuinely over the 25k budget (non-vacuous).
+      expect(seededTokens).toBeGreaterThan(25000);
+      setTranscript(session, seeded);
+
+      const socket = await connect(toWsUrl(info.url));
+      const collector = new FrameCollector(socket);
+
+      socket.send(serialize(message("user_message", { text: "go" }, "id-cg")));
+      await collector.until((f) => f.some((m) => m.type === "refs_updated"));
+
+      // (1) The transcript handed to the runner is BOUNDED: it estimates under the
+      // 25k budget (the gate ran before the runner). The runner appends nothing
+      // heavy (one assistant_done), so `handed` reflects the compacted array.
+      const handedTokens = handed.reduce(
+        (a, m) => a + estimateMessageTokens(m),
+        0
+      );
+      expect(handedTokens).toBeLessThanOrEqual(25000);
+      // It is strictly smaller than the seed (eviction actually happened).
+      expect(handedTokens).toBeLessThan(seededTokens);
+      // A compaction trim note OR a stub is present (proof the gate, not the
+      // runner, shrank it). The stub text is the unambiguous PASS-1 marker.
+      const stubPresent = handed.some(
+        (m) =>
+          typeof m.content !== "string" &&
+          m.content.some(
+            (b) =>
+              b.type === "tool_result" &&
+              typeof b.content === "string" &&
+              b.content.includes("evicted stale result")
+          )
+      );
+      expect(stubPresent).toBe(true);
+
+      // (2) The eviction-summary console.debug fired (counts only — §10).
+      const compactionLogs = debugSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("transcript compacted"));
+      expect(compactionLogs.length).toBeGreaterThanOrEqual(1);
+      // The log carries the eviction counts, never message content or a key.
+      expect(compactionLogs[0]).toMatch(/tool_result\(s\) stubbed/);
+      expect(compactionLogs[0]).not.toMatch(/sk-ant/);
+      expect(compactionLogs[0]).not.toContain("R".repeat(50));
+    } finally {
+      debugSpy.mockRestore();
+    }
+  });
+
+  it("chatSession_underBudgetTranscript_noCompactionDebugLog", async () => {
+    // Contrast guard: a small transcript is under budget → the gate evicts nothing
+    // and emits NO "transcript compacted" debug line (the log is conditional).
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    try {
+      const runTurn = (args: TurnRunArgs): Promise<TurnRunResult> => {
+        args.events.assistantDone("end_turn");
+        return Promise.resolve({
+          ok: true,
+          messages: args.transcript,
+          refs: [],
+        });
+      };
+      const { server, info } = await startServer();
+      const session = new ChatSession(fakeCtx(), server, { runTurn });
+      setTranscript(session, [
+        { role: "user", content: "hi" },
+        { role: "assistant", content: "hello" },
+      ]);
+
+      const socket = await connect(toWsUrl(info.url));
+      const collector = new FrameCollector(socket);
+      socket.send(serialize(message("user_message", { text: "go" }, "id-ug")));
+      await collector.until((f) => f.some((m) => m.type === "refs_updated"));
+
+      const compactionLogs = debugSpy.mock.calls
+        .map((c) => String(c[0]))
+        .filter((s) => s.includes("transcript compacted"));
+      expect(compactionLogs).toHaveLength(0);
+    } finally {
+      debugSpy.mockRestore();
+    }
   });
 });
 

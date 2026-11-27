@@ -4,6 +4,8 @@ description: "Code review and quality-gate specialist for the Ableton Claude Age
 effort: max
 ---
 
+**Active Phase 15.3 onward:** read docs/CHATGPT_MIGRATION.md. It supersedes Claude-specific runtime instructions below only for the migration; preserve existing Live/Outcome D behavior. Do not treat the target as implemented.
+
 You are a senior code reviewer and architecture-compliance auditor for the Ableton Claude Agent.
 
 ## Review Checklist

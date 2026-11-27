@@ -2,7 +2,9 @@
 
 ## Overview
 
-Phased development guide. Each phase is small enough for a single session. The orchestrator (CLAUDE.md) delegates all implementation to subagents.
+Phased development guide. Each phase is small enough for a single session. The orchestrator follows the active development harness.
+
+**Provider direction (2026-11-27):** the existing Phases 1–15.2 describe the implemented Claude baseline and remain historical. Current work is Phase 15.3–15.8, scoped in [ChatGPT migration](CHATGPT_MIGRATION.md). Future runtime is ChatGPT plan usage, not Anthropic; preserve the Live tooling and recorded Outcome D. No further Anthropic-funded live smoke is required for the new direction. Do not start implementation without the approved feasibility gate and execution-ready phase plan.
 
 **Architecture branching:** Phase 2 runs Spike R3 and records an outcome **A/B/C/D** in `.claude/state/progress.md`. Phases **7, 8, 9, and 13** contain per-outcome task sets — implement only the branch matching the recorded outcome. Phases 3–6 and 10 are outcome-independent shared core, so progress is never blocked on the spike.
 
@@ -470,6 +472,25 @@ Summarize/drop stale tool results; cap snapshot depth; add token counting agains
 - [ ] Cached prefix reused across turns (verified via usage metrics)
 - [ ] Long sessions stay within the per-turn token budget
 
+### Provider migration continuation (15.3–15.8; active, planned)
+
+The user has chosen ChatGPT plan usage in place of Anthropic; 15.1–15.2 headless
+Claude evidence remains historical, and the operator P15-1 smoke was blocked.
+[CHATGPT_MIGRATION.md](CHATGPT_MIGRATION.md) defines the approved scope, sources,
+compatibility gates, preservation rules, proposed task order and exact evidence.
+The dedicated phase planner must turn this scope into an execution-ready plan.
+
+- [ ] 15.3: eligibility, official sign-in, installed-host capability and one completed synthetic function call spike.
+- [ ] 15.4: provider-neutral tool-loop and Responses adapter; preserve all 17 tool behaviors, confirm/undo/transaction rules.
+- [ ] 15.5: host-only auth, account/model settings, versioned per-account transcripts and UI parity.
+- [ ] 15.6: context budgeting, explicit paired input history, usage and cache observation, cancellation.
+- [ ] 15.7: regression suite, installed packaging and isolated current-beta smoke with operator approval.
+- [ ] 15.8: reviewed checkpoint and authorized delivery; no earlier completion claim.
+
+If subscription eligibility or installed host support is blocked, stop the
+dependent migration and obtain the owner's route decision. No silent API-key
+or Anthropic fallback, permissions bypass, or replacement of Live tooling.
+
 ---
 
 ## Phase 16: Multi-Scope Launch & Selection Scoping (R7)
@@ -479,6 +500,7 @@ Launch from all relevant scopes, normalized; scope context to selection.
 
 ### Prerequisites
 - Phase 11
+- Phase 15 migration gate and authorized phase closure (or explicit owner-approved re-scope).
 
 ### Tasks
 #### 16.1 Register all scopes
@@ -534,12 +556,12 @@ Produce an installable `.ablx` and finalize docs.
 `npm run build` then `npm run package` → `.ablx`; include the webview asset per the active branch.
 #### 18.2 README + settings/onboarding
 **Delegate to**: `backend-dev` + `frontend-dev`
-Document install (drop `.ablx` into Live's Extensions page), the first-run key flow, and the active architecture branch.
+Document install (drop `.ablx` into Live's Extensions page), the first-run ChatGPT sign-in and account connection flow selected in Phase 15, and the active architecture branch. Verify the package actually contains the webview and required bundled assets.
 
 ### Success Criteria
 - [ ] `.ablx` installs and launches in Live
-- [ ] First-run key capture works from a clean install
-- [ ] README documents install + the chosen architecture
+- [ ] First-run ChatGPT sign-in and consent work from a clean install on an eligible account
+- [ ] README documents install + the chosen architecture and account sign-in/usage limits
 
 ---
 
@@ -554,7 +576,7 @@ Full-journey validation and architecture-compliance sign-off.
 ### Tasks
 #### 19.1 Scripted E2E journeys
 **Delegate to**: `test-engineer`
-Run representative journeys (rename batch, transpose MIDI, insert+set device, delete with confirm, import sample) on a real Set; verify undo for each.
+Run representative journeys (rename batch, transpose MIDI, insert+set device, delete with confirm, import sample) on a disposable real Set under the active authenticated ChatGPT provider; verify undo for each. Record model, current beta and exact revision without credentials.
 #### 19.2 Limitation-honesty pass
 **Delegate to**: `test-engineer`
 Attempt unsupported requests (automation, sidechain, plugin, move loop brace); confirm honest `report_limitation` responses.

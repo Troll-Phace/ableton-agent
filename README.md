@@ -1,6 +1,8 @@
 # ableton-claude-agent
 
-An Ableton Live extension built with `@ableton-extensions/sdk`.
+An Ableton Live extension built with `@ableton-extensions/sdk`. The current implementation uses Claude; the approved next
+phase is [Sign in with ChatGPT](docs/CHATGPT_MIGRATION.md). Migration is planned,
+not yet implemented.
 
 ## Get Started
 

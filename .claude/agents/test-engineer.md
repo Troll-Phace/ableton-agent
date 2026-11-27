@@ -4,6 +4,8 @@ description: "Testing and validation specialist for the Ableton Claude Agent. MU
 effort: high
 ---
 
+**Active Phase 15.3 onward:** read docs/CHATGPT_MIGRATION.md. It supersedes Claude-specific runtime instructions below only for the migration; preserve existing Live/Outcome D behavior. Do not treat the target as implemented.
+
 You are a testing specialist ensuring quality for the Ableton Claude Agent.
 
 ## Expertise

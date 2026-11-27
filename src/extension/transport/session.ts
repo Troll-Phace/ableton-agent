@@ -52,6 +52,11 @@ import {
   type HistoryItem,
   type ProtocolMessage,
 } from "../../shared/protocol.js";
+import {
+  compactTranscript,
+  estimateRequestTokens,
+} from "../../shared/index.js";
+import { TOOL_DEFINITIONS } from "../../shared/tools.js";
 import { runAgentLoop, type AgentEvents } from "../agent-loop.js";
 import { createClaudeClient } from "../claude-client.js";
 import {
@@ -76,6 +81,46 @@ import {
 
 /** Log prefix mirroring the host's `console.*` convention. */
 const LOG_PREFIX = "[session]";
+
+/**
+ * Per-turn input token budget (§15: ≤ 25k input). The pre-turn compaction gate
+ * keeps the persisted+sent transcript under `BUDGET_MAX_TOKENS - reserve`.
+ */
+const BUDGET_MAX_TOKENS = 25000;
+
+/**
+ * Honest reserve for the non-transcript portion of each request, computed once.
+ *
+ * The dominant, *stable* non-transcript cost is the system prompt + tool schemas;
+ * we estimate it exactly via {@link estimateRequestTokens} (the same estimator the
+ * budget module uses). The per-turn snapshot is built *inside* `defaultRunTurn`
+ * and is not cheaply available at the compaction call site, so we add a fixed,
+ * documented snapshot ALLOWANCE on top. The snapshot is deliberately shallow and
+ * now hard-capped (see `MAX_SNAPSHOT_CHARS` in snapshot.ts ≈ 2k tokens), so 2.5k
+ * tokens of allowance leaves comfortable headroom under 25k. Precision here is
+ * intentionally traded for simplicity — the real `usage` log (claude-client.ts)
+ * is the ground truth used to calibrate this later.
+ */
+const SNAPSHOT_ALLOWANCE_TOKENS = 2500;
+
+/**
+ * Cached reserve = estimate(system + tools) + snapshot allowance. Lazily computed
+ * once on first use so the (small, fixed) estimation cost is not paid per turn.
+ */
+let cachedReserveTokens: number | undefined;
+
+/** Compute (once) the honest per-turn reserve described on the constants above. */
+function reserveTokens(): number {
+  if (cachedReserveTokens === undefined) {
+    cachedReserveTokens =
+      estimateRequestTokens({
+        system: buildSystemPrompt(),
+        tools: [...TOOL_DEFINITIONS],
+        messages: [],
+      }) + SNAPSHOT_ALLOWANCE_TOKENS;
+  }
+  return cachedReserveTokens;
+}
 
 /** Message surfaced to the webview when no Anthropic API key is available. */
 const NO_KEY_MESSAGE =
@@ -612,6 +657,27 @@ export class ChatSession<V extends ApiVersion> {
     // the conversation while this turn is in flight, the epoch bumps and the
     // turn's result is stale — see the supersession guard after the await.
     const turnEpoch = this.conversationEpoch;
+
+    // Pre-turn compaction gate (§15: ≤ 25k input). Bound the STORED transcript
+    // here — before the runner appends THIS turn's user message — so both what
+    // the loop sends and what gets persisted stay under budget. Placement before
+    // the runner guarantees the current turn's tool_results (which don't exist
+    // yet) are never compacted; `compactTranscript` is pure/idempotent and
+    // preserves tool_use↔tool_result pairing, so re-running it each turn is safe.
+    const compacted = compactTranscript(this.transcript, {
+      maxTokens: BUDGET_MAX_TOKENS,
+      reserve: reserveTokens(),
+    });
+    this.transcript = compacted.messages;
+    if (
+      compacted.evicted.compactedResults > 0 ||
+      compacted.evicted.droppedMessages > 0
+    ) {
+      // Counts only — never message content, refs, or the key (§10).
+      console.debug(
+        `${LOG_PREFIX} transcript compacted: ${compacted.evicted.compactedResults} tool_result(s) stubbed, ${compacted.evicted.droppedMessages} message(s) dropped`
+      );
+    }
 
     try {
       const result = await runner({

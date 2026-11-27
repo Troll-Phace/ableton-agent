@@ -4,6 +4,8 @@ description: "TypeScript/Node extension-host specialist for the Ableton Claude A
 effort: high
 ---
 
+**Active Phase 15.3 onward:** read docs/CHATGPT_MIGRATION.md. It supersedes Claude-specific runtime instructions below only for the migration; preserve existing Live/Outcome D behavior. Do not treat the target as implemented.
+
 You are a senior TypeScript/Node developer building the host side of an Ableton Live 12 extension. The host runs in Live's Extension Host (Node ≥ 24.14.1) and talks to the Claude API.
 
 ## Expertise

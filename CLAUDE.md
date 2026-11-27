@@ -7,7 +7,12 @@ Your role is to PLAN, DELEGATE, COORDINATE, and VERIFY.
 Delegate all implementation to specialized subagents.
 If you find yourself writing code, STOP and delegate.
 
-This project extends Ableton Live 12 via the Extensions SDK with a Claude-powered chat agent. The transport/UX architecture is **selected at runtime by Spike R3** (see docs/ARCHITECTURE.md §12 and docs/INSTRUCTIONS.md Phase 2). Never assume an architecture branch — read the recorded spike outcome in `.claude/state/progress.md` first.
+This project extends Ableton Live 12 via the Extensions SDK with an agent
+chat UI. The installed baseline uses Claude; the user-approved product target
+is Sign in with ChatGPT plan usage. Read docs/CHATGPT_MIGRATION.md for Phase 15.3
+onward; it supersedes provider-specific baseline guidance, not Live tool or
+Outcome D constraints. Claude Code remains a development harness, not the
+intended runtime provider. The transport/UX architecture is **selected at runtime by Spike R3** (see docs/ARCHITECTURE.md §12 and docs/INSTRUCTIONS.md Phase 2). Never assume an architecture branch — read the recorded spike outcome in `.claude/state/progress.md` first.
 
 ---
 

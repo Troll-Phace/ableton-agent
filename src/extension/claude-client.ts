@@ -327,6 +327,14 @@ export class ClaudeClient {
       });
 
       const message = await stream.finalMessage();
+      // Ground-truth token usage for §15 budget calibration and the §15.1 cache
+      // proof (cache_read_input_tokens > 0 from turn 2 confirms the cached
+      // system+tools prefix is reused). Counts only — never the key or any
+      // message content. SDK types these fields as `number | null`, so guard.
+      const usage = message.usage;
+      console.info(
+        `[claude] usage: input=${usage.input_tokens ?? 0} output=${usage.output_tokens} cache_read=${usage.cache_read_input_tokens ?? 0} cache_creation=${usage.cache_creation_input_tokens ?? 0}`
+      );
       return { ok: true, message };
     } catch (e) {
       // An abort can surface either as an APIUserAbortError or via the signal.

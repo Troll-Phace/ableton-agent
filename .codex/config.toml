@@ -1,0 +1,8 @@
+# Shared local Codex defaults. User/managed runtime choices can constrain these.
+# Model and effort intentionally inherit the session selection.
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
+[agents]
+enabled = true
+max_concurrent_threads_per_session = 3
