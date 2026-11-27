@@ -6,19 +6,28 @@ import {
   type ExtensionContext,
 } from "@ableton-extensions/sdk";
 
-import { createProbeCancellation, type ProbeResult } from "./contracts.js";
+import {
+  createProbeCancellation,
+  type ProbeResult,
+  type NativeCompatibilityReport,
+} from "./contracts.js";
 import {
   closeLoopback,
   listenLoopback,
-  nativeProbeDependencies,
   result,
-  runHostProbes,
   sanitizedFailure,
 } from "./host-probes.js";
+import { runNativeCompatibility } from "./native-compatibility.js";
 
 // Build injects the same static HTML included explicitly in the archive. No runtime
 // file read outside SDK storage; no production webview import.
 declare const __FEASIBILITY_WEBVIEW__: string;
+declare const __FEASIBILITY_BUILD_ID__: string;
+const VERSION = "0.0.2";
+const BUILD_ID =
+  typeof __FEASIBILITY_BUILD_ID__ === "string"
+    ? __FEASIBILITY_BUILD_ID__
+    : "unbuilt";
 const COMMAND = "feasibility.p15_3.open";
 const PREFIX = "[chatgpt-feasibility]";
 const MODAL_DEADLINE_MS = 120000;
@@ -28,18 +37,16 @@ function log(status: ProbeResult): void {
 }
 
 async function showFixture(ctx: ExtensionContext<"1.0.0">): Promise<void> {
-  const deps = nativeProbeDependencies();
   let server: Server | undefined;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let cancellation: ReturnType<typeof createProbeCancellation> | undefined;
-  let ongoing: Promise<ProbeResult[]> | undefined;
-  let statuses: ProbeResult[] = [];
-  let browserRequested = false;
+  let ongoing: Promise<NativeCompatibilityReport> | undefined;
+  let report: NativeCompatibilityReport | null = null;
+  let actionFailed = false;
   try {
-    const storageDirectory = ctx.environment.storageDirectory;
     const [{ createServer }, { randomBytes }] = await Promise.all([
-      deps.http(),
-      deps.crypto(),
+      import("node:http"),
+      import("node:crypto"),
     ]);
     const token = randomBytes(32).toString("hex");
     const root = `/${token}`;
@@ -66,32 +73,53 @@ async function showFixture(ctx: ExtensionContext<"1.0.0">): Promise<void> {
           })
           .end(__FEASIBILITY_WEBVIEW__);
       } else if (req.method === "GET" && req.url === `${root}/status`) {
-        send(res, { running: !!ongoing, results: statuses, browserRequested });
-      } else if (req.method === "POST" && req.url === `${root}/run`) {
-        if (!ongoing && !browserRequested) {
-          browserRequested = true;
+        send(res, {
+          running: !!ongoing,
+          report,
+          actionFailed,
+          version: VERSION,
+          buildId: BUILD_ID,
+        });
+      } else if (req.method === "POST" && req.url === `${root}/compatibility`) {
+        if (!ongoing && report?.restored !== false && !actionFailed) {
           cancellation = createProbeCancellation();
-          ongoing = runHostProbes(
-            { storageDirectory, includeBrowser: true, cancellation },
-            deps
-          );
+          report = null;
+          ongoing = runNativeCompatibility({ cancellation });
           void (async () => {
             try {
-              statuses = (await ongoing) ?? [];
+              report = (await ongoing) ?? null;
+              console.info(
+                PREFIX,
+                JSON.stringify({
+                  version: VERSION,
+                  buildId: BUILD_ID,
+                  compatibility: report,
+                })
+              );
             } catch (error) {
-              statuses = [
-                result("activation", "failed", sanitizedFailure(error)),
-              ];
+              actionFailed = true;
+              log(result("activation", "failed", sanitizedFailure(error)));
             } finally {
               ongoing = undefined;
-              for (const status of statuses) log(status);
             }
           })();
         }
-        send(res, { running: !!ongoing, results: statuses, browserRequested });
+        send(res, {
+          running: !!ongoing,
+          report,
+          actionFailed,
+          version: VERSION,
+          buildId: BUILD_ID,
+        });
       } else if (req.method === "POST" && req.url === `${root}/cancel`) {
         cancellation?.cancel();
-        send(res, { running: !!ongoing, results: statuses, browserRequested });
+        send(res, {
+          running: !!ongoing,
+          report,
+          actionFailed,
+          version: VERSION,
+          buildId: BUILD_ID,
+        });
       } else res.writeHead(404).end();
     });
     const port = await listenLoopback(server);
@@ -106,16 +134,8 @@ async function showFixture(ctx: ExtensionContext<"1.0.0">): Promise<void> {
     ]);
   } catch (error) {
     log(result("modal_ipc", "blocked", sanitizedFailure(error)));
-    // Missing HTTP/crypto must be observable even when no modal can be served.
-    try {
-      for (const status of await runHostProbes(
-        { storageDirectory: ctx.environment.storageDirectory },
-        deps
-      ))
-        log(status);
-    } catch (probeError) {
-      log(result("activation", "failed", sanitizedFailure(probeError)));
-    }
+    // Do not run the old browser/storage probes or automatically run a
+    // compatibility experiment if modal setup failed. Operator action only.
   } finally {
     if (timeout) clearTimeout(timeout);
     cancellation?.cancel();
@@ -140,7 +160,12 @@ async function showFixture(ctx: ExtensionContext<"1.0.0">): Promise<void> {
 export function activate(activation: ActivationContext): void {
   try {
     const ctx = initialize(activation, "1.0.0");
-    log(result("activation", "pass", "initialized"));
+    log(
+      result("activation", "pass", "initialized", {
+        version: VERSION,
+        buildId: BUILD_ID,
+      })
+    );
     let open = false;
     ctx.commands.registerCommand(COMMAND, () => {
       if (open) return;
@@ -159,7 +184,7 @@ export function activate(activation: ActivationContext): void {
       try {
         await ctx.ui.registerContextMenuAction(
           "AudioTrack",
-          "ChatGPT feasibility — temporary probe…",
+          "ChatGPT feasibility 0.0.2 — compatibility…",
           COMMAND
         );
         log(result("activation", "pass", "context_action_registered"));
