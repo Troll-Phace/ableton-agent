@@ -167,3 +167,8 @@ findings. Reviewer verified non-vacuous pre-EOF/abort evidence, restoration
 and cleanup gates, isolation from production/auth, exact build ID and
 archive SHA256, package integrity and preserved original artifact.
 No new installed or provider test was claimed by the reviewer.
+
+Owner merged [PR #6](https://github.com/Troll-Phace/ableton-agent/pull/6)
+on 2026-11-27; verified merge 998cbcb. F2C checkpoint reconciled on main.
+F3/F5 feasibility may begin; owner consent is required before real OAuth,
+and no inference or eligibility claim exists yet.
