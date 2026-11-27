@@ -97,3 +97,73 @@ synchronous denial cleanup, non-vacuous tests, archive contents and exact
 SHA256. Confirmed the native stream/abort blockers and unstarted F3/F5
 are reported accurately. This is not a migration GO, OAuth proof, or
 provider test. Owner merged [PR #5](https://github.com/Troll-Phace/ableton-agent/pull/5) on 2026-11-27 and authorized continuing with the recommended bounded compatibility spike. This does not clear the F3/F5 gate.
+
+
+## F2C follow-up (2026-11-27)
+
+Owner merged #5 and approved continuing. Dedicated Astra/low follow-up
+plan approved: [native compatibility](phase-15.3-native-compatibility-plan.md).
+The original raw outcome remains BLOCKED. F2C will test only permitted
+builtin constructors and existing native Fetch; no host permission edits,
+provider inference or OAuth. New results pending.
+
+
+F2C backend C2/C3 completed: separate local and supplemented lanes,
+bounded SSE/abort stage evidence, exact restoration checks, no production
+changes. New version 0.0.2 visible build f2c-eac1f698060668a6, SHA256
+82d904f7e3fd510a6d1091d83f39cd28f51dd2e6ac84ae0c325ea73f9a8828d8.
+Original 0.0.1 archive preserved. Backend reported full 990/990 baseline
+and build/lint/types plus guarded standalone loopback passes in both
+lanes. C4 independent tests assigned; no installed 0.0.2, OAuth, or
+provider evidence yet. Package hash subject to correction/rebuild.
+
+
+C4 independent test engineer added 51 tests in the two assigned files;
+51/51 and full 1041/1041 (28 files) passed, all 990 existing tests unchanged.
+TypeScript, lint, targeted formatting passed. Coordinator independently
+reran aggregate and configured framework 14/14 checks; archive hashes
+confirmed unchanged. No blocking backend finding in tested scope.
+C5 initial normal installed upgrade attempt: Live explicitly rejected
+existing installation directory (0.0.1 manifest still present);
+v0.0.2 not installed or run. Temporary fixture must be removed through
+normal Live extension settings then updated. Computer-use session
+timed out after the dialog; owner asked to release session. Awaiting
+reconnect; no transport or OAuth conclusion from this install conflict.
+
+
+### F2C actual installed evidence — 2026-11-27 23:29 and 23:30 UTC
+
+After reconnect, explicitly uninstalled only temporary 0.0.1 via Live
+Extensions settings, restarted, installed reviewed 0.0.2 and restarted
+again. Production Claude extension remained installed; no real Set was
+opened or changed. Normal installed Live 12.4.25b2, Node 24.22.1, pinned
+SDK 1.0.0-beta.0. Native modal verified visible version 0.0.2 and build
+f2c-eac1f698060668a6, artifact SHA256
+82d904f7e3fd510a6d1091d83f39cd28f51dd2e6ac84ae0c325ea73f9a8828d8.
+Ran compatibility checks twice, second after a fresh Live restart.
+Sanitized host report from 18:29:14 and 18:30:11 local time agrees:
+
+| Check | Both runs |
+| --- | --- |
+| Raw globals before lane | TextDecoder, URL, ReadableStream absent; native fetch and AbortController present (prior raw result unchanged) |
+| Independent builtin constructors | All three functional, node_builtin |
+| Local-only lane | PASS transport_verified, no global supplementation |
+| Synthetic SSE | PASS synthetic_sse_completed, 2 chunks / 39 bytes, read before EOF, exact payload and cleanup |
+| Native pending read abort | PASS pending_read_aborted_and_closed, 1 initial chunk / 13 bytes, pending read rejected AbortError, response closed before forced teardown and cleanup true |
+| Global state | Exact restoration/unchanged true; supplemented lane not needed or executed |
+
+No real credentials, external network, HTTP provider, browser launch,
+storage or Live Set operations in the compatibility action. User-initiated
+Cancel is independently covered headless; no manual cancel claimed.
+F2C transport gate passes for the local-constructors lane; directly
+addresses the raw F2 failure without changing host permissions or
+introducing Undici/global shims. Prior F2 evidence remains historical;
+HTTPS auth/provider functionality and actual account eligibility still
+unknown. Next: owner-reviewed compatibility checkpoint PR, then F3/F5
+official sign-in and bounded model/tool call with owner consent.
+
+Independent C6 review (2026-11-27): PASS for checkpoint PR, no blocking
+findings. Reviewer verified non-vacuous pre-EOF/abort evidence, restoration
+and cleanup gates, isolation from production/auth, exact build ID and
+archive SHA256, package integrity and preserved original artifact.
+No new installed or provider test was claimed by the reviewer.

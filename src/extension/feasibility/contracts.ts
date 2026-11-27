@@ -60,3 +60,60 @@ export function createProbeCancellation(): ProbeCancellation & {
     },
   };
 }
+
+/** Three optional standard constructors, independently measured and sourced. */
+export type CompatibilityConstructor = "TextDecoder" | "URL" | "ReadableStream";
+export type CompatibilitySource = "native" | "node_builtin" | "unavailable";
+export type CompatibilityLane = "local" | "supplemented";
+export type CompatibilityStage =
+  | "listen"
+  | "fetch_started"
+  | "headers_received"
+  | "reader_acquired"
+  | "first_chunk"
+  | "pending_read"
+  | "abort_requested"
+  | "read_settled"
+  | "server_closed"
+  | "cleanup";
+
+/** Fixed statuses only; no exception messages, URLs or payload text. */
+export interface CompatibilityStatus {
+  outcome: ProbeOutcome;
+  code: string;
+}
+export interface CompatibilityConstructorResult extends CompatibilityStatus {
+  constructor: CompatibilityConstructor;
+  source: CompatibilitySource;
+}
+export interface CompatibilityStageResult extends CompatibilityStatus {
+  stage: CompatibilityStage;
+}
+export interface CompatibilityTransportResult extends CompatibilityStatus {
+  stages: CompatibilityStageResult[];
+  measurements: Readonly<Record<string, boolean | number>>;
+}
+export interface CompatibilitySupplementResult extends CompatibilityStatus {
+  constructor: CompatibilityConstructor;
+  installed: boolean;
+}
+export interface CompatibilityLaneResult extends CompatibilityStatus {
+  lane: CompatibilityLane;
+  supplementation: CompatibilitySupplementResult[];
+  stream: CompatibilityTransportResult;
+  abort: CompatibilityTransportResult;
+  restored: boolean;
+}
+export interface NativeCompatibilityReport extends CompatibilityStatus {
+  raw: Readonly<
+    Record<CompatibilityConstructor | "fetch" | "AbortController", boolean>
+  >;
+  nodeVersion: string;
+  constructors: CompatibilityConstructorResult[];
+  lanes: CompatibilityLaneResult[];
+  /** Exact descriptor restoration is required before another run. */
+  restored: boolean;
+}
+export interface NativeCompatibilityOptions {
+  cancellation?: ProbeCancellation;
+}
