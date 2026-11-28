@@ -4,13 +4,13 @@
  *
  * Claude never touches Live directly (§1.1): it emits structured tool calls and
  * the extension executes them. This module is the **single source of truth** for
- * what those tools look like on the wire — one {@link Anthropic.Tool} definition
+ * what those tools look like on the wire — one {@link ToolDefinition}
  * (name + description + JSON `input_schema` + `strict`/`input_examples`) and a
  * matching exported TypeScript arg type per tool — plus the read/mutation
  * {@link classify classification} the agent loop partitions on (§8, §4 step 5c).
  *
- * It is a **pure** shared module: it imports ONLY the `Anthropic` *type* (for
- * `Tool`/`ToolUnion`) and the ref grammar from `./refs.ts`. It touches NO
+ * It is a **pure** shared module: it imports only the provider-neutral
+ * definition and ref grammar types. It touches NO provider SDK,
  * Extensions SDK and NO DOM, so it compiles under the strict shared tsconfig and
  * imports cleanly in the extension host, the (future) webview, and tests.
  *
@@ -24,11 +24,9 @@
  * the structured `ref_unresolved`/`ref_ambiguous` errors (§6).
  *
  * ## `strict` + `input_examples`
- * The installed `@anthropic-ai/sdk` (v0.100.1) types `strict?: boolean` and
- * `input_examples?: Array<{ [k: string]: unknown }>` directly on the **stable**
- * `Anthropic.Tool` interface (no beta type, no cast needed). Per §8 every
- * **mutating** tool sets `strict: true`; read tools omit it (they are cacheable
- * and not value-critical). `input_examples` are attached where the format is
+ * Definitions preserve the exact legacy strictness and examples for the
+ * adapter; most mutations set `strict: true`, while reads and the documented
+ * complexity-limit exceptions omit it. `input_examples` are attached where the format is
  * fiddly (ref strings, MIDI note arrays, loop settings, param targets).
  *
  * ## No `cache_control` here
@@ -37,8 +35,7 @@
  * own — adding it here would create a second, wrong breakpoint.
  */
 
-import type Anthropic from "@anthropic-ai/sdk";
-
+import type { ToolDefinition } from "./provider.js";
 import type { MixerParamSelector } from "./refs.js";
 
 // ---------------------------------------------------------------------------
@@ -838,8 +835,8 @@ function readTool(
   properties: Record<string, unknown>,
   required: string[],
   inputExamples?: Array<Record<string, unknown>>
-): Anthropic.Tool {
-  const tool: Anthropic.Tool = {
+): ToolDefinition {
+  const tool: ToolDefinition = {
     name,
     description,
     input_schema: {
@@ -886,8 +883,8 @@ function mutationTool(
   required: string[],
   inputExamples?: Array<Record<string, unknown>>,
   strict = true
-): Anthropic.Tool {
-  const tool: Anthropic.Tool = {
+): ToolDefinition {
+  const tool: ToolDefinition = {
     name,
     description,
     input_schema: {
@@ -1318,13 +1315,12 @@ const reportLimitation = readTool(
 /**
  * All tool definitions in §8 order. The registry in Task 2 returns this (with
  * the client's per-array `cache_control` stamp applied downstream, §15.1) from
- * `ToolRuntime.toolDefinitions()` as `Anthropic.ToolUnion[]` — `Tool` is a
- * member of that union, so this array is assignable without widening.
+ * `ToolRuntime.toolDefinitions()` as provider-neutral definitions.
  *
  * Order matters only cosmetically; the client stamps the LAST element's
  * `cache_control` (§15.1), so do not append non-tool entries here.
  */
-export const TOOL_DEFINITIONS: readonly Anthropic.Tool[] = [
+export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   // §8.1 read
   liveGetProject,
   liveGetTrack,
@@ -1350,12 +1346,12 @@ export const TOOL_DEFINITIONS: readonly Anthropic.Tool[] = [
 
 /**
  * Tool name → its definition, for O(1) lookup by the registry/executors. Keyed
- * by {@link ToolName} so every name resolves to its {@link Anthropic.Tool}.
+ * by {@link ToolName} so every name resolves to its {@link ToolDefinition}.
  */
-export const TOOL_BY_NAME: Readonly<Record<ToolName, Anthropic.Tool>> =
+export const TOOL_BY_NAME: Readonly<Record<ToolName, ToolDefinition>> =
   Object.fromEntries(
     TOOL_DEFINITIONS.map((tool) => [tool.name, tool])
-  ) as Record<ToolName, Anthropic.Tool>;
+  ) as Record<ToolName, ToolDefinition>;
 
 /**
  * Compile-time proof that {@link MixerParamArg} stays in lockstep with the ref

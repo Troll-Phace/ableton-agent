@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import type Anthropic from "@anthropic-ai/sdk";
 
@@ -6,6 +6,7 @@ import { ClaudeClient } from "../src/extension/claude-client.js";
 import {
   DEFAULT_MAX_ITERATIONS,
   runAgentLoop,
+  runProviderLoop,
   type AgentEvents,
   type RunLoopInput,
   type ToolCall,
@@ -18,6 +19,18 @@ import {
   type ScriptedTurn,
 } from "./fixtures/fake-anthropic-client.js";
 import { FakeToolRuntime } from "./fixtures/fake-tool-runtime.js";
+import type {
+  CompletedTurn,
+  CompletedTurnBlock,
+  ProviderTurnInput,
+  ProviderTurnResult,
+  ToolResultPayload as CanonicalToolResult,
+  ToolRuntime as CanonicalRuntime,
+  TurnProvider,
+} from "../src/shared/provider.js";
+import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
+import { LiveToolRuntime } from "../src/extension/tool-registry.js";
+import { makeFakeContext } from "./fixtures/fake-extension-context.js";
 
 /**
  * Phase 4 agent-loop suite — the tool-use engine in
@@ -1028,5 +1041,391 @@ describe("runAgentLoop — defensive guards (malformed runtime/model)", () => {
         expect(JSON.stringify(block.content)).toMatch(/tool_result_missing/);
       }
     }
+  });
+});
+
+/** Pure canonical fake provider, deliberately with no Anthropic transcript
+ * or SDK message shapes. Its opaque continuation stays provider-owned. */
+function canonicalTurn(
+  blocks: CompletedTurnBlock[],
+  stopReason = "tool_use"
+): ProviderTurnResult {
+  return {
+    ok: true,
+    turn: {
+      stopReason,
+      blocks,
+      continuation: {
+        type: "opaque",
+        provider: "synthetic_provider",
+        value: { synthetic: true },
+      },
+    },
+  };
+}
+function canonicalCalls(...calls: ToolCall[]): ProviderTurnResult {
+  return canonicalTurn(calls.map((call) => ({ type: "tool_call", call })));
+}
+function canonicalEnd(): ProviderTurnResult {
+  return canonicalTurn(
+    [
+      { type: "text", text: "synthetic " },
+      { type: "text", text: "done" },
+    ],
+    "end_turn"
+  );
+}
+function neutralProvider(
+  ...steps: (
+    | ProviderTurnResult
+    | ((
+        input: ProviderTurnInput
+      ) => ProviderTurnResult | Promise<ProviderTurnResult>)
+  )[]
+) {
+  const inputs: ProviderTurnInput[] = [];
+  const assistants: CompletedTurn[] = [];
+  const results: CanonicalToolResult[][] = [];
+  const provider: TurnProvider = {
+    async runTurn(input) {
+      const step = steps[inputs.length];
+      inputs.push(input);
+      if (!step) throw new Error("Unexpected synthetic canonical turn");
+      return typeof step === "function" ? await step(input) : step;
+    },
+    appendAssistant(turn) {
+      assistants.push(turn);
+    },
+    appendToolResults(result) {
+      results.push(result);
+    },
+  };
+  return { provider, inputs, assistants, results };
+}
+function canonicalRuntime(signal?: AbortSignal) {
+  const fake = makeFakeContext();
+  const runtime = new LiveToolRuntime(
+    fake as unknown as ExtensionContext<ApiVersion>,
+    undefined,
+    signal
+  );
+  return { fake, runtime };
+}
+
+describe("runProviderLoop — provider-neutral boundary (Phase 15.4A)", () => {
+  it("display-only fragments cannot execute tools or fabricate a completed assistant on subsequent provider failure", async () => {
+    const pending = Promise.withResolvers<ProviderTurnResult>();
+    const started = Promise.withResolvers<void>();
+    const f = neutralProvider((input) => {
+      input.onDelta?.('{"id":"fragment","name":"live_delete","input":{}}');
+      started.resolve();
+      return pending.promise;
+    });
+    const executeRead = vi.fn<CanonicalRuntime["executeRead"]>();
+    const flushMutations = vi.fn<CanonicalRuntime["flushMutations"]>();
+    const runtime: CanonicalRuntime = {
+      toolDefinitions: () => [],
+      classify: () => "mutation",
+      executeRead,
+      flushMutations,
+    };
+    const events = makeEvents();
+    const task = runProviderLoop({ provider: f.provider, runtime, events });
+    await started.promise;
+    expect(events.deltas).toEqual([
+      '{"id":"fragment","name":"live_delete","input":{}}',
+    ]);
+    expect(f.assistants).toEqual([]);
+    expect(f.results).toEqual([]);
+    expect(executeRead).not.toHaveBeenCalled();
+    expect(flushMutations).not.toHaveBeenCalled();
+    const err = {
+      error: "stream_error",
+      detail: "synthetic incomplete stream",
+      hint: "do not execute fragments",
+    } as const;
+    pending.resolve({ ok: false, err });
+    expect(await task).toEqual({ ok: false, err });
+    expect(f.assistants).toEqual([]);
+    expect(f.results).toEqual([]);
+    expect(executeRead).not.toHaveBeenCalled();
+    expect(flushMutations).not.toHaveBeenCalled();
+    expect(events.done).toEqual([]);
+    expect(events.errors).toEqual([err.detail]);
+  });
+
+  it("canonical completed turn executes actual reads first in order, flushes all writes once and returns matched results in original interleaved order", async () => {
+    const { fake, runtime } = canonicalRuntime();
+    const calls = [
+      { id: "read1", name: "live_get_project", input: {} },
+      {
+        id: "mut1",
+        name: "live_update_track",
+        input: { track: "track:0:Drums", name: "Beats" },
+      },
+      {
+        id: "read2",
+        name: "live_get_track",
+        input: { track: "track:99:Not present" },
+      },
+      {
+        id: "mut2",
+        name: "live_update_track",
+        input: { track: "track:1:Bass", mute: true },
+      },
+    ];
+    const first = canonicalCalls(...calls);
+    const f = neutralProvider(first, canonicalEnd());
+    const read = vi.spyOn(runtime, "executeRead");
+    const flush = vi.spyOn(runtime, "flushMutations");
+    const events = makeEvents();
+    const result = await runProviderLoop({
+      provider: f.provider,
+      runtime,
+      events,
+      snapshot: "synthetic snapshot",
+      model: "synthetic-model",
+      maxTokens: 123,
+    });
+    expect(result).toEqual({
+      ok: true,
+      stopReason: "end_turn",
+      text: "synthetic done",
+    });
+    expect(read.mock.calls.map(([call]) => call.id)).toEqual([
+      "read1",
+      "read2",
+    ]);
+    expect(flush).toHaveBeenCalledTimes(1);
+    expect(flush).toHaveBeenCalledWith([calls[1], calls[3]]);
+    expect(read.mock.invocationCallOrder[1]).toBeLessThan(
+      flush.mock.invocationCallOrder[0]
+    );
+    expect(fake.application.song.tracks[0].name).toBe("Beats");
+    expect(fake.application.song.tracks[1].mute).toBe(true);
+    expect(fake.transactions).toEqual([{ committed: true, rolledBack: false }]);
+    expect(f.results).toHaveLength(1);
+    expect(
+      f.results[0].map((row) => [row.toolUseId, row.isError ?? false])
+    ).toEqual([
+      ["read1", false],
+      ["mut1", false],
+      ["read2", true],
+      ["mut2", false],
+    ]);
+    expect(f.results[0][2].content).toContain("ref_");
+    if (first.ok) expect(f.assistants[0]).toBe(first.turn);
+    expect(
+      f.inputs.map((input) => [input.snapshot, input.model, input.maxTokens])
+    ).toEqual([
+      ["synthetic snapshot", "synthetic-model", 123],
+      [undefined, "synthetic-model", 123],
+    ]);
+    expect(events.done).toEqual(["end_turn"]);
+  });
+
+  it.each(["decline", "unavailable", "approve"] as const)(
+    "canonical destructive batch %s preserves real transaction and result semantics",
+    async (decision) => {
+      const { fake, runtime } = canonicalRuntime();
+      const before = fake.application.song.tracks.map((track) => track.name);
+      const calls = [
+        {
+          id: "rename",
+          name: "live_update_track",
+          input: { track: "track:0:Drums", name: "Beats" },
+        },
+        {
+          id: "delete",
+          name: "live_delete",
+          input: { target: "track:2:Keys" },
+        },
+      ];
+      const f = neutralProvider(canonicalCalls(...calls), canonicalEnd());
+      const flush = vi.spyOn(runtime, "flushMutations");
+      const confirm = vi.fn(() => Promise.resolve(decision === "approve"));
+      const result = await runProviderLoop({
+        provider: f.provider,
+        runtime,
+        events: makeEvents(),
+        requestConfirmation: decision === "unavailable" ? undefined : confirm,
+      });
+      expect(result.ok).toBe(true);
+      expect(f.results[0].map((row) => row.toolUseId)).toEqual([
+        "rename",
+        "delete",
+      ]);
+      if (decision === "approve") {
+        expect(confirm).toHaveBeenCalledTimes(1);
+        expect(flush).toHaveBeenCalledTimes(1);
+        expect(flush).toHaveBeenCalledWith([calls[0], calls[1]]);
+        expect(fake.application.song.tracks.map((track) => track.name)).toEqual(
+          ["Beats", "Bass", "Dup", "Dup"]
+        );
+        expect(fake.transactions).toEqual([
+          { committed: true, rolledBack: false },
+        ]);
+        expect(f.results[0].every((row) => !row.isError)).toBe(true);
+      } else {
+        if (decision === "decline") expect(confirm).toHaveBeenCalledTimes(1);
+        else expect(confirm).not.toHaveBeenCalled();
+        expect(flush).not.toHaveBeenCalled();
+        expect(fake.application.song.tracks.map((track) => track.name)).toEqual(
+          before
+        );
+        expect(fake.transactions).toEqual([]);
+        for (const result of f.results[0]) {
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain(
+            decision === "decline"
+              ? "user_declined"
+              : "confirmation_unavailable"
+          );
+        }
+      }
+    }
+  );
+
+  it("canonical cancel while confirmation is pending opens no mutation transaction and never starts the next provider turn", async () => {
+    const controller = new AbortController();
+    const { fake, runtime } = canonicalRuntime(controller.signal);
+    const before = fake.application.song.tracks.map((track) => track.name);
+    const f = neutralProvider(
+      canonicalCalls({
+        id: "delete",
+        name: "live_delete",
+        input: { target: "track:2:Keys" },
+      }),
+      canonicalEnd()
+    );
+    const entered = Promise.withResolvers<void>(),
+      decision = Promise.withResolvers<boolean>();
+    const events = makeEvents();
+    const task = runProviderLoop({
+      provider: f.provider,
+      runtime,
+      events,
+      signal: controller.signal,
+      requestConfirmation: () => {
+        entered.resolve();
+        return decision.promise;
+      },
+    });
+    await entered.promise;
+    controller.abort();
+    decision.resolve(false);
+    expect(await task).toMatchObject({ ok: false, err: { error: "aborted" } });
+    expect(fake.transactions).toEqual([]);
+    expect(fake.application.song.tracks.map((track) => track.name)).toEqual(
+      before
+    );
+    expect(f.inputs).toHaveLength(1);
+    expect(f.results).toEqual([]);
+    expect(events.done).toEqual([]);
+  });
+
+  it("canonical flush preserves atomic rollback for an SDK setter failure and returns an error for each original ID", async () => {
+    const { fake, runtime } = canonicalRuntime();
+    const initialMute = fake.application.song.tracks[0].mute;
+    fake.failNameSets("synthetic setter failure");
+    const f = neutralProvider(
+      canonicalCalls(
+        {
+          id: "m1",
+          name: "live_update_track",
+          input: { track: "track:0:Drums", mute: !initialMute },
+        },
+        {
+          id: "m2",
+          name: "live_update_track",
+          input: { track: "track:1:Bass", name: "Should not land" },
+        }
+      ),
+      canonicalEnd()
+    );
+    expect(
+      (
+        await runProviderLoop({
+          provider: f.provider,
+          runtime,
+          events: makeEvents(),
+        })
+      ).ok
+    ).toBe(true);
+    expect(fake.application.song.tracks[0].mute).toBe(initialMute);
+    expect(fake.application.song.tracks[1].name).toBe("Bass");
+    expect(fake.transactions).toEqual([{ committed: false, rolledBack: true }]);
+    expect(f.results[0].map((row) => [row.toolUseId, row.isError])).toEqual([
+      ["m1", true],
+      ["m2", true],
+    ]);
+    for (const row of f.results[0])
+      expect(row.content).toContain("transaction rolled back");
+  });
+
+  it("canonical next turn re-resolves fresh refs after live reorder instead of mutating the object now occupying stale index", async () => {
+    const { fake, runtime } = canonicalRuntime();
+    const f = neutralProvider(
+      canonicalCalls({
+        id: "read",
+        name: "live_get_track",
+        input: { track: "track:1:Bass" },
+      }),
+      () => {
+        fake.reorder("", "tracks", 1, 0);
+        return canonicalCalls({
+          id: "rename",
+          name: "live_update_track",
+          input: { track: "track:1:Bass", name: "Sub" },
+        });
+      },
+      canonicalEnd()
+    );
+    expect(
+      (
+        await runProviderLoop({
+          provider: f.provider,
+          runtime,
+          events: makeEvents(),
+        })
+      ).ok
+    ).toBe(true);
+    expect(
+      fake.application.song.tracks.slice(0, 2).map((track) => track.name)
+    ).toEqual(["Sub", "Drums"]);
+    expect(f.results[1][0]).toMatchObject({ toolUseId: "rename" });
+    expect(f.results[1][0].isError).toBeUndefined();
+    expect(f.results[1][0].content).toContain("track:0:Bass");
+    expect(fake.committedCount).toBe(1);
+  });
+
+  it("canonical named create retains the documented two create/configure transactions and final named reference", async () => {
+    const { fake, runtime } = canonicalRuntime();
+    const before = fake.application.song.tracks.length;
+    const f = neutralProvider(
+      canonicalCalls({
+        id: "create",
+        name: "live_create",
+        input: { kind: "audio_track", name: "Synthetic Vox" },
+      }),
+      canonicalEnd()
+    );
+    expect(
+      (
+        await runProviderLoop({
+          provider: f.provider,
+          runtime,
+          events: makeEvents(),
+        })
+      ).ok
+    ).toBe(true);
+    expect(fake.application.song.tracks.length).toBe(before + 1);
+    expect(fake.application.song.tracks[before].name).toBe("Synthetic Vox");
+    expect(fake.transactions).toEqual([
+      { committed: true, rolledBack: false },
+      { committed: true, rolledBack: false },
+    ]);
+    expect(f.results[0][0]).toMatchObject({ toolUseId: "create" });
+    expect(f.results[0][0].content).toContain(`track:${before}:Synthetic Vox`);
   });
 });

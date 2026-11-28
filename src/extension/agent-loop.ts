@@ -2,11 +2,11 @@
  * Agentic tool-use loop — the engine the whole product runs on (Phase 4,
  * ARCHITECTURE §4, §7, §8).
  *
- * Per the client-tool-use contract (§1.1) Claude emits structured tool calls and
- * the extension executes them. This loop drives that contract:
- *  - run one streamed turn ({@link ClaudeClient.runTurn});
- *  - while `stop_reason === "tool_use"`: collect ALL `tool_use` blocks of the
- *    assistant message, run **read** tools immediately/in-order, and **queue**
+ * Per the client-tool-use contract (§1.1) the provider emits structured tool
+ * calls and the extension executes them. This loop drives that contract:
+ *  - run one streamed turn ({@link TurnProvider.runTurn});
+ *  - while `stopReason === "tool_use"`: collect ALL completed tool calls,
+ *    run **read** tools immediately/in-order, and **queue**
  *    mutation tools to flush in ONE batch per iteration — the seam Phase 5 wraps
  *    in a single `withinTransaction` (§7, one undo step per agent action);
  *  - append `tool_result` blocks in the SAME order and with the SAME
@@ -25,8 +25,6 @@
  * re-resolves refs per call, §6): the loop only moves opaque tool payloads.
  */
 
-import type Anthropic from "@anthropic-ai/sdk";
-
 import {
   isDestructiveCall,
   summarizeDestructivePlan,
@@ -35,76 +33,30 @@ import {
 
 import type {
   AssistantDeltaSink,
-  ClaudeClient,
-  ClientError,
-  RunTurnInput,
-} from "./claude-client.js";
+  ProviderError,
+  ProviderTurnInput,
+  ToolCall,
+  ToolResultPayload,
+  ToolRuntime,
+  TurnProvider,
+} from "../shared/provider.js";
+import {
+  LegacyClaudeProvider,
+  type LegacyMessages,
+  type LegacyRunOptions,
+  type LegacyToolRuntime,
+} from "./providers/legacy-claude.js";
 
 // ---------------------------------------------------------------------------
-// Tool call / result shapes (thin views over the SDK blocks)
+// Legacy compatibility exports (the loop itself uses the canonical contracts)
 // ---------------------------------------------------------------------------
 
-/**
- * A single requested tool call — a thin, runtime-facing view of an
- * {@link Anthropic.ToolUseBlock}. `input` is `unknown` (the schema is the
- * runtime's concern); executors narrow it.
- */
-export interface ToolCall {
-  /** The `tool_use_id` that the matching `tool_result` MUST echo. */
-  id: string;
-  /** The tool name (e.g. `live_get_project`). */
-  name: string;
-  /** The model-supplied, coalesced input JSON (validated by the executor). */
-  input: unknown;
-}
-
-/**
- * The exact content shape a `tool_result` block accepts (a string, or the
- * narrow block union the SDK permits inside a tool result). Derived from the SDK
- * type so it can never drift from {@link Anthropic.ToolResultBlockParam}.
- */
-export type ToolResultContent = NonNullable<
-  Anthropic.ToolResultBlockParam["content"]
->;
-
-/**
- * The payload an executor returns for one tool call. Maps directly onto a
- * `tool_result` content block: a success `content` string/blocks, or a structured
- * error with `isError: true` (the §6/§9 contract — never a thrown error).
- */
-export interface ToolResultPayload {
-  /** The `tool_use_id` this result answers (must match the originating call). */
-  toolUseId: string;
-  /** The result content (success data, or a serialized structured error). */
-  content: ToolResultContent;
-  /** True when the content is a structured error (sets `is_error` on the block). */
-  isError?: boolean;
-  /** Optional human summary for `tool_activity` narration (Phase 7). */
-  summary?: string;
-}
-
-// ---------------------------------------------------------------------------
-// DI seams (extension-internal; Phases 5/6/7 fill these)
-// ---------------------------------------------------------------------------
-
-/**
- * What the loop needs from the (future) tool registry + executors. Phase 5/6
- * implement this against the real SDK; tests inject a fake capturing call order.
- */
-export interface ToolRuntime {
-  /** The tool definitions sent as the cacheable tools prefix (§15.1). */
-  toolDefinitions(): Anthropic.ToolUnion[];
-  /** Classify a tool as read (immediate) or mutation (batched, §8). */
-  classify(toolName: string): "read" | "mutation";
-  /** Execute one read tool immediately; never throws (returns a structured payload). */
-  executeRead(call: ToolCall): Promise<ToolResultPayload>;
-  /**
-   * Flush ALL queued mutations of one iteration in ONE batch — Phase 5 wraps
-   * this in a single `withinTransaction` (§7). Returns one payload per call, in
-   * the SAME order as `calls`. Never throws.
-   */
-  flushMutations(calls: ToolCall[]): Promise<ToolResultPayload[]>;
-}
+export type { ToolCall } from "../shared/provider.js";
+export type {
+  LegacyToolResultContent as ToolResultContent,
+  LegacyToolResultPayload as ToolResultPayload,
+  LegacyToolRuntime as ToolRuntime,
+} from "./providers/legacy-claude.js";
 
 /**
  * What the loop emits outward. Phase 7 maps these to the §13 socket messages
@@ -132,26 +84,16 @@ export interface AgentEvents {
 /** Default maximum number of tool-use iterations before the loop bails. */
 export const DEFAULT_MAX_ITERATIONS = 10;
 
-/** Inputs for one full agentic run (one user turn → assistant end). */
-export interface RunLoopInput {
-  /** The streamed Claude client (Task 1). */
-  client: ClaudeClient;
-  /** The tool registry/executor seam (Phase 5/6). */
+/** Provider-neutral inputs for one full agentic run. The provider owns history. */
+export interface ProviderLoopInput {
+  provider: TurnProvider;
   runtime: ToolRuntime;
   /** Outward event sink (Phase 7). */
   events: AgentEvents;
-  /** The system prompt blocks (Phase 6 fills; empty accepted). */
-  system: Anthropic.TextBlockParam[];
   /** The per-turn project snapshot (Phase 11 fills; optional). */
   snapshot?: string;
-  /**
-   * The running transcript. The loop appends the assistant message and the
-   * `tool_result` user message to this array as the turn progresses, and returns
-   * the updated array.
-   */
-  messages: Anthropic.MessageParam[];
   /** Optional model override (forwarded to the client). */
-  model?: Anthropic.Model;
+  model?: string;
   /** Optional max output tokens (forwarded to the client). */
   maxTokens?: number;
   /** Optional cancellation signal (checked before each mutation flush, §7). */
@@ -174,75 +116,43 @@ export interface RunLoopInput {
   }) => Promise<boolean>;
 }
 
-/** Successful loop result. */
-export interface RunLoopOk {
+/** Existing legacy entry point: still accepts and returns the same transcript. */
+export interface RunLoopInput
+  extends Omit<ProviderLoopInput, "provider" | "runtime">, LegacyRunOptions {
+  runtime: LegacyToolRuntime;
+}
+
+/** Successful provider-neutral loop result. */
+export interface ProviderLoopOk {
   ok: true;
   /** The final terminal `stop_reason`. */
   stopReason: string;
   /** The concatenated assistant text of the final (non-tool) message. */
   text: string;
-  /** The updated transcript (assistant + tool_result messages appended). */
-  messages: Anthropic.MessageParam[];
 }
 
 /** Failed loop result (client error, abort, or cap exceeded). */
-export interface RunLoopErr {
+export interface ProviderLoopErr {
   ok: false;
-  /** Structured error — `ClientError` from the client, or a loop-level error. */
+  /** Structured provider or loop-level error. */
   err:
-    | ClientError
+    | ProviderError
     | { error: "iteration_cap" | "aborted"; detail: string; hint: string };
-  /** The transcript as far as it progressed (for persistence/debugging). */
-  messages: Anthropic.MessageParam[];
 }
 
+export type ProviderLoopResult = ProviderLoopOk | ProviderLoopErr;
+export interface RunLoopOk extends ProviderLoopOk {
+  messages: LegacyMessages;
+}
+export interface RunLoopErr extends ProviderLoopErr {
+  messages: LegacyMessages;
+}
 /** Result of {@link runAgentLoop}. */
 export type RunLoopResult = RunLoopOk | RunLoopErr;
 
 // ---------------------------------------------------------------------------
 // Block helpers (pure)
 // ---------------------------------------------------------------------------
-
-/** Extract the `tool_use` blocks from an assistant message, in order. */
-function collectToolUseBlocks(
-  message: Anthropic.Messages.Message
-): Anthropic.ToolUseBlock[] {
-  const blocks: Anthropic.ToolUseBlock[] = [];
-  for (const block of message.content) {
-    if (block.type === "tool_use") {
-      blocks.push(block);
-    }
-  }
-  return blocks;
-}
-
-/** Concatenate the text of all `text` blocks in an assistant message. */
-function collectText(message: Anthropic.Messages.Message): string {
-  let text = "";
-  for (const block of message.content) {
-    if (block.type === "text") {
-      text += block.text;
-    }
-  }
-  return text;
-}
-
-/** A thin {@link ToolCall} view of a {@link Anthropic.ToolUseBlock}. */
-function toToolCall(block: Anthropic.ToolUseBlock): ToolCall {
-  return { id: block.id, name: block.name, input: block.input };
-}
-
-/** Build a `tool_result` content block from an executor payload. */
-function toToolResultBlock(
-  payload: ToolResultPayload
-): Anthropic.ToolResultBlockParam {
-  return {
-    type: "tool_result",
-    tool_use_id: payload.toolUseId,
-    content: payload.content,
-    ...(payload.isError ? { is_error: true } : {}),
-  };
-}
 
 /** Coerce an unknown structured-error field to a short single-line string. */
 function fieldStr(value: unknown, fallback: string): string {
@@ -312,13 +222,24 @@ function logToolError(toolName: string, payload: ToolResultPayload): void {
 export async function runAgentLoop(
   input: RunLoopInput
 ): Promise<RunLoopResult> {
+  const provider = new LegacyClaudeProvider(input);
+  const result = await runProviderLoop({
+    ...input,
+    provider,
+    runtime: provider.bindRuntime(input.runtime),
+  });
+  return { ...result, messages: input.messages };
+}
+
+/** Run the same local execution/confirmation loop over completed canonical turns. */
+export async function runProviderLoop(
+  input: ProviderLoopInput
+): Promise<ProviderLoopResult> {
   const {
-    client,
+    provider,
     runtime,
     events,
-    system,
     snapshot,
-    messages,
     model,
     maxTokens,
     signal,
@@ -338,35 +259,30 @@ export async function runAgentLoop(
         hint: "the user cancelled; the transcript is left consistent",
       };
       events.error(err.detail);
-      return { ok: false, err, messages };
+      return { ok: false, err };
     }
 
     // 1. Stream one turn. The snapshot only seeds the FIRST turn of a loop run;
     //    subsequent turns carry the accumulated tool_result context instead.
-    const turnInput: RunTurnInput = {
-      system,
+    const turnInput: ProviderTurnInput = {
       tools: runtime.toolDefinitions(),
       snapshot: iteration === 0 ? snapshot : undefined,
-      messages,
       model,
       maxTokens,
       signal,
       onDelta,
     };
-    const turn = await client.runTurn(turnInput);
+    const turn = await provider.runTurn(turnInput);
     if (!turn.ok) {
       events.error(turn.err.detail);
-      return { ok: false, err: turn.err, messages };
+      return { ok: false, err: turn.err };
     }
 
-    const assistantMessage = turn.message;
-    const stopReason = assistantMessage.stop_reason ?? "end_turn";
+    const completed = turn.turn;
+    const stopReason = completed.stopReason;
 
     // Append the assistant message to the transcript (content blocks as params).
-    messages.push({
-      role: "assistant",
-      content: assistantMessage.content,
-    });
+    provider.appendAssistant(completed);
 
     // 2. Terminal stop → done.
     if (stopReason !== "tool_use") {
@@ -374,28 +290,31 @@ export async function runAgentLoop(
       return {
         ok: true,
         stopReason,
-        text: collectText(assistantMessage),
-        messages,
+        text: completed.blocks
+          .filter((block) => block.type === "text")
+          .map((block) => block.text)
+          .join(""),
       };
     }
 
     // 3. Collect + partition tool_use blocks (preserve request order).
-    const toolUseBlocks = collectToolUseBlocks(assistantMessage);
+    const calls = completed.blocks
+      .filter((block) => block.type === "tool_call")
+      .map((block) => block.call);
     // Defensive: tool_use stop with no blocks would otherwise loop forever.
-    if (toolUseBlocks.length === 0) {
+    if (calls.length === 0) {
       const err = {
         error: "stream_error" as const,
         detail: "stop_reason was tool_use but no tool_use blocks were present",
         hint: "the model response was malformed; retry the turn",
       };
       events.error(err.detail);
-      return { ok: false, err, messages };
+      return { ok: false, err };
     }
 
     const readCalls: ToolCall[] = [];
     const mutationCalls: ToolCall[] = [];
-    for (const block of toolUseBlocks) {
-      const call = toToolCall(block);
+    for (const call of calls) {
       if (runtime.classify(call.name) === "read") {
         readCalls.push(call);
       } else {
@@ -429,7 +348,7 @@ export async function runAgentLoop(
           hint: "the user cancelled; no mutations were applied this iteration",
         };
         events.error(err.detail);
-        return { ok: false, err, messages };
+        return { ok: false, err };
       }
 
       // 3b-i. Confirmation gate (Phase 9, outcome D, §9/§13). If the batch
@@ -465,7 +384,7 @@ export async function runAgentLoop(
               hint: "the user cancelled; no mutations were applied this iteration",
             };
             events.error(err.detail);
-            return { ok: false, err, messages };
+            return { ok: false, err };
           }
 
           if (!approved) {
@@ -544,21 +463,20 @@ export async function runAgentLoop(
     }
 
     // 4. Append tool_result blocks in the SAME order/ids as requested.
-    const resultBlocks: Anthropic.ToolResultBlockParam[] = toolUseBlocks.map(
-      (block) => {
-        const payload = resultsById.get(block.id) ?? {
-          toolUseId: block.id,
+    const results: ToolResultPayload[] = calls.map((call) => {
+      return (
+        resultsById.get(call.id) ?? {
+          toolUseId: call.id,
           content: JSON.stringify({
             error: "tool_result_missing",
             detail: "no executor produced a result for this tool call",
             hint: "retry the action",
           }),
           isError: true,
-        };
-        return toToolResultBlock(payload);
-      }
-    );
-    messages.push({ role: "user", content: resultBlocks });
+        }
+      );
+    });
+    provider.appendToolResults(results);
     // Continue: next streamed turn consumes these tool_result blocks.
   }
 
@@ -569,7 +487,7 @@ export async function runAgentLoop(
     hint: "the request needs too many tool steps; simplify or split it",
   };
   events.error(capErr.detail);
-  return { ok: false, err: capErr, messages };
+  return { ok: false, err: capErr };
 }
 
 /**

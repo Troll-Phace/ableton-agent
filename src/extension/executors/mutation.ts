@@ -53,7 +53,10 @@ import {
   type NoteDescription,
 } from "@ableton-extensions/sdk";
 
-import type { ToolCall, ToolResultPayload } from "../agent-loop.js";
+import type {
+  ToolCall,
+  LocalToolResultPayload as ToolResultPayload,
+} from "../../shared/provider.js";
 import { ReferenceTable, type RefError } from "../references.js";
 import { parseRef, serializeRef, type RefSegment } from "../../shared/refs.js";
 import {
