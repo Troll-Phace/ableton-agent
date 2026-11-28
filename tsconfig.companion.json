@@ -5,8 +5,12 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "target": "esnext",
-    "lib": ["esnext"],
-    "types": ["node"],
+    "lib": [
+      "esnext"
+    ],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -22,6 +26,10 @@
     "src/extension/feasibility/credential-store.ts",
     "src/extension/feasibility/responses.ts",
     "src/extension/feasibility/signin-session.ts",
-    "src/extension/feasibility/contracts.ts"
+    "src/extension/feasibility/contracts.ts",
+    "src/companion/**/*",
+    "src/shared/provider.ts",
+    "src/shared/tools.ts",
+    "src/shared/refs.ts"
   ]
 }
