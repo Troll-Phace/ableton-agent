@@ -1,5 +1,22 @@
 # Phase 15.3 feasibility results
 
+Status: **PASS for standalone official SDK synthetic text and tool roundtrip, with actual owner-confirmed subscription-only use; direct installed-host durable credential storage remains blocked.** Latest owner-operated 0.0.8 SDK tool roundtrip succeeded (both completed HTTP 200 responses; validated fixed echo and final marker). No Live bridge or production migration; no additional requests authorized.
+
+| Gate | Current disposition |
+| --- | --- |
+| F1 plan / roles | Approved; owner authorized Dot to approve plans |
+| F2/F2C installed native transport | Original unshimmed transport blocked; permitted-builtin compatibility corrected native streaming/abort and local checks (PR #6) |
+| F3/F5 direct host | Credential durability blocked at file fsync; no actual direct-host OAuth/inference (PR #8) |
+| F3C standalone ordinary companion | Actual local durability/restart, official personal OAuth, persistence/refresh, plan scope/catalog PASS |
+| Actual text inference | PASS via official SDK 0.0.6, GPT-6.2 Sol, completed marker (PR #14); prior custom MIME-gated experiments failed |
+| Actual synthetic tool roundtrip | PASS via official SDK 0.0.8, two completed responses, fixed echo validated and result acknowledged (PR #16 package; results checkpoint pending) |
+| F4 regression / F6 review | 1549/1549 aggregate, 14/14 harness, lint/typecheck, independent close review PASS on reviewed 0.0.8 |
+| Remaining | Actual live cancellation not verified; direct-host durability denied, Live-facing bridge and production provider migration not started |
+
+All historical reservations remain frozen/exhausted. No additional actual request authorized.
+
+## Historical initial F2 checkpoint (superseded by table above)
+
 Status: F2 corrected and installed no-credential checks completed. Unshimmed native-stream/abort gate BLOCKED on Live 12.4.25b2; browser, local IPC and synthetic storage/restart passed. No OAuth or provider inference.
 
 | Gate | Status |
@@ -306,3 +323,13 @@ Offline tool roundtrip complete 2026-11-28. Fixed two synthetic requests through
 [PR #15](https://github.com/Troll-Phace/ableton-agent/pull/15) merged by Anthony, 5dd07b2 verified 2026-11-28. Owner explicitly authorized at most two additional synthetic SDK tool roundtrip requests, subscription only/no paid fallback, all prior reservations frozen. Dedicated plan approved for [separate operator allowance](phase-15.3-sdk-tool-live-probe-plan.md). No real dispatch until reviewed PR and personal operation; no production/Live change.
 
 Operator SDK tool allowance implemented 2026-11-28: paired distinct named authorization/Run, durable ordered cap two before each Fetch, second only in active same run after validated first completion; restart/failure/cancel/signout cannot resume, refund or replay. All historical records read-only, fixed SDK transport and echo/history unchanged. Independent 48 new tests, 392/392 focused; coordinator full 1549/1549 Vitest (41 files), lint/typecheck and 14/14 framework checks PASS. Exact 0.0.8 f3c-2347b2f669b4d207, entry SHA256 e0ae7569f1ff9f45eb3e173c1810792504629d8ce025142bbfb1118b99f85424, manifest d4b605c0371afb3abd06dc1997d3244905a711a41b2d57eaf70566f4c81cfbf8; five assets verified, independent close review PASS, prior package/input/production isolation confirmed. Await owner PR review and personal operation; no actual provider/auth/user-storage, Live bridge or production changes.
+
+### Owner-operated official SDK tool roundtrip — PASS (2026-11-28)
+
+[PR #16](https://github.com/Troll-Phace/ableton-agent/pull/16) merged by Anthony, fd1d2cd verified remotely. Exact companion 0.0.8 f3c-2347b2f669b4d207, SDK 7.65.0. Owner supplied sanitized status finished/roundtrip_complete, eligibility/preflight true, official plan scope, persisted connection/refresh true, catalog-selected gpt-6.2-sol, planOnlyConfirmed and creditFallbackDisabled true. All historical reservations preserved (original 1/3, custom diagnostic 1/1 exhausted, SDK text 1/1 exhausted). New tool cap 2/2 exhausted, allowance unavailable. Both reservations committed before Fetch, both HTTP 200, body present, locally missing MIME, completed terminal, stream settled and cleanup complete, no primary/cleanup error. First 10170 bytes/11 chunks/15 events; second 10218 bytes/12 chunks/13 events. Result pass, functionEchoValidated true, finalMarkerAcknowledged true. The actual harmless namespaced echo call and matching returned result with completed marker succeeded across two official requests under owner-confirmed subscription-only settings. No raw content, call IDs, tokens or account identity retained.
+
+This establishes actual standalone synthetic text and tool roundtrip feasibility (SDK transport), not direct-host credential durability, actual live cancellation, a Live-facing bridge, or production migration. No further request authorized. Owner asked to sign out and stop; cleanup/revocation not yet reported.
+
+Owner reported stopped. Coordinator metadata-only verified private root mode 0700, zero connection credential records and temporary obligations, all four reservation records present, and no companion listener. Local cleanup and process stop supported; remote revocation result remains unconfirmed. No record contents accessed. Standalone synthetic text and tool roundtrip PASS; actual cancellation remains unverified, direct-host credential durability denied, Live-facing bridge and production migration not started. Results-only checkpoint, no additional actual request authorized.
+
+Independent documentation close review PASS: supplied exact outcomes, budget and cleanup boundaries, startup-visible current status and current results table verified; all historical lines preserved and marked superseded. 14/14 framework tests and diff check passed. Owner PR review pending.
