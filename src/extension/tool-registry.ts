@@ -36,9 +36,12 @@
 
 import type { ApiVersion, ExtensionContext } from "@ableton-extensions/sdk";
 
-import type Anthropic from "@anthropic-ai/sdk";
-
-import type { ToolCall, ToolResultPayload, ToolRuntime } from "./agent-loop.js";
+import type {
+  ToolCall,
+  ToolDefinition,
+  LocalToolResultPayload as ToolResultPayload,
+  ToolRuntime,
+} from "../shared/provider.js";
 import { ReferenceTable } from "./references.js";
 import { classify, TOOL_DEFINITIONS } from "../shared/tools.js";
 import {
@@ -74,7 +77,10 @@ import { errorMessage, fail, sdkError } from "./executors/shared.js";
  *
  * @typeParam V The SDK API version (defaults to the host's; tests pass the fake's).
  */
-export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
+export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime<
+  ToolDefinition,
+  string
+> {
   /**
    * @param ctx   The SDK extension context (real host or the test fake).
    * @param refs  The turn-scoped reference table (mints created refs, shifts on
@@ -89,9 +95,8 @@ export class LiveToolRuntime<V extends ApiVersion> implements ToolRuntime {
   ) {}
 
   /** The shared tool definitions (the cacheable tools prefix; §15.1). */
-  toolDefinitions(): Anthropic.ToolUnion[] {
-    // `TOOL_DEFINITIONS` is `readonly Anthropic.Tool[]`; `Tool` is a member of the
-    // `ToolUnion`, so a shallow copy widens cleanly without `cache_control`.
+  toolDefinitions(): ToolDefinition[] {
+    // Shallow copy without adding any provider-specific cache metadata.
     return [...TOOL_DEFINITIONS];
   }
 

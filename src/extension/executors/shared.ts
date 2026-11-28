@@ -24,7 +24,7 @@ import type {
   ExtensionContext,
 } from "@ableton-extensions/sdk";
 
-import type { ToolResultPayload } from "../agent-loop.js";
+import type { LocalToolResultPayload as ToolResultPayload } from "../../shared/provider.js";
 import { resolveRef, type RefError } from "../references.js";
 
 // ---------------------------------------------------------------------------

@@ -26,7 +26,10 @@ import type {
   ExtensionContext,
 } from "@ableton-extensions/sdk";
 
-import type { ToolCall, ToolResultPayload } from "../agent-loop.js";
+import type {
+  ToolCall,
+  LocalToolResultPayload as ToolResultPayload,
+} from "../../shared/provider.js";
 import type {
   LiveGetClipArgs,
   LiveGetDeviceParamsArgs,
