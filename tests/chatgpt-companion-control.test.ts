@@ -25,6 +25,17 @@ import {
 import { SDK_EXPERIMENT } from "../src/companion-feasibility/sdk-responses.js";
 import { SDK_TOOL_EXPERIMENT } from "../src/companion-feasibility/sdk-tool-roundtrip.js";
 import {
+  SDK_TOOL_AUTHORIZATION_FILE,
+  SDK_TOOL_BUDGET_FILE,
+} from "../src/companion-feasibility/sdk-tool-budget.js";
+import {
+  callFragments,
+  echoCall,
+  markerMessage,
+  reasoning,
+  roundtripTerminal,
+} from "./fixtures/chatgpt-sdk-tool-roundtrip.js";
+import {
   SdkBudget,
   SDK_AUTHORIZATION_FILE,
   SDK_BUDGET_FILE,
@@ -39,6 +50,7 @@ import {
   sdkCompleted,
   sdkStream,
   SDK_MODEL,
+  stalledSdkStream,
 } from "./fixtures/chatgpt-sdk-responses.js";
 import {
   COMPANION_CONTROL_ORIGIN,
@@ -155,10 +167,10 @@ function assertError(reply: Reply, status: number, code: string) {
   expect(reply.headers["access-control-allow-origin"]).toBeUndefined();
   expect(reply.body).not.toContain(DETAIL);
 }
-function fixture(sdkMode = false) {
+function fixture(sdkMode = false, toolMode = false) {
   const home = companionHome();
   disposals.push(home.dispose);
-  if (sdkMode) {
+  if (sdkMode || toolMode) {
     const storage = createCompanionStorage(home.deps);
     storage.store.saveConnection(makeConnection());
     storage.store.reserveInferenceAttempt();
@@ -167,6 +179,13 @@ function fixture(sdkMode = false) {
     );
     old.authorize(true);
     old.reserve();
+    if (toolMode) {
+      const text = new SdkBudget(
+        createCompanionStorage(home.deps, true, true).sdkDiagnosticRecords()
+      );
+      text.authorize(true);
+      text.reserve();
+    }
     vi.spyOn(CompanionPreflight.prototype, "run").mockResolvedValue({
       nativeTransport: true,
       callbackBinding: true,
@@ -175,7 +194,11 @@ function fixture(sdkMode = false) {
     });
   }
   const f = runtimeFixture(home);
-  const runtime = createCompanionRuntime({ ...f.deps, sdkLiveProbe: sdkMode });
+  const runtime = createCompanionRuntime({
+    ...f.deps,
+    sdkLiveProbe: sdkMode,
+    sdkToolLiveProbe: toolMode,
+  });
   let now = NOW,
     serial = 0;
   const showPairingCode = vi.fn<(code: string) => void>();
@@ -249,6 +272,150 @@ function fixture(sdkMode = false) {
   };
 }
 describe("F3C owner-paired local control (in process only)", () => {
+  it("requires distinct paired and CSRF-protected authorization and Run for the SDK tool cap; concurrent actions cannot dispatch", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new Error("Unexpected non-injected Fetch")))
+    );
+    const f = fixture(false, true);
+    try {
+      const authorize = {
+        action: "authorize_sdk_tool_roundtrip",
+        operatorStarted: true,
+        ownerAuthorized: true,
+        experiment: SDK_TOOL_EXPERIMENT,
+      };
+      const run = { ...authorize, action: "run_sdk_tool_roundtrip" };
+      const auth = await f.pair(await f.start());
+      for (const payload of [authorize, run]) {
+        assertError(
+          await f.send(ACTION_PATH, payload),
+          401,
+          "session_required"
+        );
+        assertError(
+          await f.action(auth, payload, { [CSRF_HEADER]: undefined }),
+          403,
+          "csrf_rejected"
+        );
+        assertError(
+          await f.action(auth, { ...payload, ownerAuthorized: false }),
+          400,
+          "invalid_request"
+        );
+      }
+      const historical = [
+        "run-budget.json",
+        DIAGNOSTIC_AUTHORIZATION_FILE,
+        DIAGNOSTIC_BUDGET_FILE,
+        SDK_AUTHORIZATION_FILE,
+        SDK_BUDGET_FILE,
+      ].map((name) => ({ name, bytes: fs.readFileSync(f.home.file(name)) }));
+      const send = (action: string, extra: object = {}) =>
+        f.action(auth, { action, operatorStarted: true, ...extra });
+      f.network.enqueueDiscovery();
+      f.network.enqueueJwks();
+      expect(body(await send("preflight"))).toMatchObject({
+        snapshot: { preflightReady: true },
+      });
+      f.network.enqueue(
+        TOKEN_ENDPOINT,
+        json(tokenPayload({ id_token: undefined }))
+      );
+      expect(body(await send("refresh"))).toMatchObject({
+        snapshot: { refreshVerified: true },
+      });
+      f.network.enqueue(
+        MODELS_ENDPOINT,
+        json({
+          models: [
+            {
+              visibility: "list",
+              slug: SDK_MODEL,
+              display_name: "Synthetic model",
+            },
+          ],
+        })
+      );
+      expect(body(await send("load_models"))).toMatchObject({
+        snapshot: { code: "models_loaded" },
+      });
+      expect(
+        body(await send("select_model", { modelSlug: SDK_MODEL }))
+      ).toMatchObject({ snapshot: { selectedModelSlug: SDK_MODEL } });
+      expect(
+        body(
+          await send("confirm_plan_only", {
+            planOnlyConfirmed: true,
+            creditFallbackDisabled: true,
+          })
+        )
+      ).toMatchObject({
+        snapshot: { planOnlyConfirmed: true, creditFallbackDisabled: true },
+      });
+      assertError(await f.action(auth, run), 403, "invalid_request");
+      expect(fs.existsSync(f.home.file(SDK_TOOL_AUTHORIZATION_FILE))).toBe(
+        false
+      );
+      expect(fs.existsSync(f.home.file(SDK_TOOL_BUDGET_FILE))).toBe(false);
+      const authorized = await f.action(auth, authorize);
+      expect(authorized.status).toBe(200);
+      expect(body(authorized)).toMatchObject({
+        runtime: {
+          sdkToolRoundtrip: {
+            allowanceAvailable: true,
+            budget: { state: "ready", attempts: 0 },
+          },
+        },
+      });
+      assertError(await f.action(auth, authorize), 403, "invalid_request");
+      const first = stalledSdkStream(callFragments());
+      f.network.enqueue(RESPONSES_ENDPOINT, first.response);
+      f.network.enqueue(RESPONSES_ENDPOINT, () => {
+        expect(
+          JSON.parse(fs.readFileSync(f.home.file(SDK_TOOL_BUDGET_FILE), "utf8"))
+        ).toMatchObject({ attempts: 2 });
+        return sdkStream(roundtripTerminal([markerMessage()])).response;
+      });
+      const running = f.action(auth, run);
+      await first.readStarted;
+      expect(
+        JSON.parse(fs.readFileSync(f.home.file(SDK_TOOL_BUDGET_FILE), "utf8"))
+      ).toMatchObject({ attempts: 1 });
+      assertError(await f.action(auth, run), 409, "operation_busy");
+      assertError(await f.action(auth, authorize), 409, "operation_busy");
+      expect(
+        f.network.calls.filter((call) => call.url === RESPONSES_ENDPOINT)
+      ).toHaveLength(1);
+      first.completeLate(roundtripTerminal([reasoning(), echoCall()]));
+      const done = await running;
+      expect(body(done)).toMatchObject({
+        runtime: {
+          sdkToolRoundtrip: {
+            allowanceAvailable: false,
+            budget: { state: "exhausted", attempts: 2 },
+            result: {
+              outcome: "pass",
+              functionEchoValidated: true,
+              finalMarkerAcknowledged: true,
+            },
+          },
+        },
+      });
+      assertError(await f.action(auth, run), 403, "invalid_request");
+      expect(
+        f.network.calls.filter((call) => call.url === RESPONSES_ENDPOINT)
+      ).toHaveLength(2);
+      expect(f.network.unexpected).toEqual([]);
+      for (const { name, bytes } of historical)
+        expect(fs.readFileSync(f.home.file(name))).toEqual(bytes);
+    } finally {
+      await f.control.close?.();
+      await f.runtime.shutdown();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("authorizes and runs SDK only as separate paired and CSRF-protected actions, and prevents concurrent duplicate dispatch", async () => {
     vi.stubGlobal(
       "fetch",
@@ -643,12 +810,12 @@ describe("F3C owner-paired local control (in process only)", () => {
 async function actualPackageEntry() {
   const root = process.cwd();
   const script = fs.readFileSync("scripts/build-chatgpt-companion.ts", "utf8");
-  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.7");
+  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.8");
   const adapter = /const adapterEntry = `([\s\S]*?)`;/u.exec(script)?.[1];
   if (!adapter) throw Error("Missing companion entry adapter");
   const view = fs
     .readFileSync("src/companion-feasibility/control-view.html", "utf8")
-    .replaceAll("{{COMPANION_VERSION}}", "0.0.7")
+    .replaceAll("{{COMPANION_VERSION}}", "0.0.8")
     .replaceAll("{{BUILD_ID}}", "f3c-offline-test");
   return await build({
     absWorkingDir: root,
@@ -665,7 +832,7 @@ async function actualPackageEntry() {
     target: "node24",
     supported: { "dynamic-import": false },
     define: {
-      __COMPANION_VERSION__: JSON.stringify("0.0.7"),
+      __COMPANION_VERSION__: JSON.stringify("0.0.8"),
       __COMPANION_BUILD_ID__: JSON.stringify("f3c-offline-test"),
       __COMPANION_NODE__: JSON.stringify(">=24.14.1"),
       __COMPANION_VIEW__: JSON.stringify(view),
@@ -698,6 +865,7 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           "sdk-budget",
           "sdk-stream",
           "sdk-tool-roundtrip",
+          "sdk-tool-budget",
         ].map((x) => "src/companion-feasibility/" + x + ".ts"),
         ...[
           "contracts",
@@ -934,13 +1102,13 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     )
       throw Error("Missing launch export");
     expect(entry).toMatchObject({
-      version: "0.0.7",
+      version: "0.0.8",
       buildId: "f3c-offline-test",
       requiredNode: ">=24.14.1",
     });
     const launch = entry.launchCompanion as () => Promise<RunningCompanion>;
-    // Version 0.0.7 freezes all three historical budgets. Its new tool
-    // checkpoint has no usable native allowance. Seed only old accounting.
+    // Version 0.0.8 freezes all three historical budgets. It permits no new
+    // tool requests until separately authorized; seed only old accounting.
     const storage = createCompanionStorage(home.deps);
     expect(storage.store.reserveInferenceAttempt().attempts).toBe(1);
     const originalBudget = fs.readFileSync(home.file("run-budget.json"));
@@ -1008,6 +1176,22 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
         403,
         "csrf_rejected"
       );
+      const authorizeGesture = {
+        ...toolGesture,
+        action: "authorize_sdk_tool_roundtrip",
+      };
+      assertError(
+        await request(handler, ACTION_PATH, authorizeGesture).reply,
+        401,
+        "session_required"
+      );
+      assertError(
+        await request(handler, ACTION_PATH, authorizeGesture, {
+          headers: { cookie },
+        }).reply,
+        403,
+        "csrf_rejected"
+      );
       const initial = await action({ action: "status" });
       expect(body(initial)).toMatchObject({
         ok: true,
@@ -1026,7 +1210,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           },
           sdkToolRoundtrip: {
             experiment: SDK_TOOL_EXPERIMENT,
-            mode: "offline_only",
+            mode: "operator_test",
+            budget: { cap: 2, state: "not_authorized", attempts: null },
             allowanceAvailable: false,
           },
         },
@@ -1053,6 +1238,17 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
             storage: { code: "restart_required" },
             verifier: { outcome: "pass" },
             transport: { outcome: "pass" },
+          },
+        },
+      });
+      const blockedAuthorization = await action(authorizeGesture);
+      expect(body(blockedAuthorization)).toMatchObject({
+        ok: true,
+        snapshot: { code: "preflight_required" },
+        runtime: {
+          sdkToolRoundtrip: {
+            allowanceAvailable: false,
+            budget: { state: "not_authorized", attempts: null },
           },
         },
       });
@@ -1096,6 +1292,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       }
       expect(calls).toEqual(["/companion-stream", "/companion-abort"]);
       expect(external).toEqual([]);
+      expect(fs.existsSync(home.file(SDK_TOOL_AUTHORIZATION_FILE))).toBe(false);
+      expect(fs.existsSync(home.file(SDK_TOOL_BUDGET_FILE))).toBe(false);
       expect(fs.readFileSync(home.file(SDK_AUTHORIZATION_FILE))).toEqual(
         priorSdkAuthorization
       );

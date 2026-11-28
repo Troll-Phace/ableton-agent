@@ -480,6 +480,15 @@ export function createCompanionControl(
           throw new ControlFault(403, "invalid_request");
         await context.runtime.authorizeSdkDiagnostic(action.ownerAuthorized);
         break;
+      case "authorize_sdk_tool_roundtrip":
+        if (
+          runtime.sdkToolRoundtrip?.mode !== "operator_test" ||
+          runtime.sdkToolRoundtrip.budget?.state !== "not_authorized" ||
+          !context.runtime.authorizeSdkToolRoundtrip
+        )
+          throw new ControlFault(403, "invalid_request");
+        await context.runtime.authorizeSdkToolRoundtrip(action.ownerAuthorized);
+        break;
       case "run_sdk_tool_roundtrip":
         if (
           !runtime.sdkToolRoundtrip?.allowanceAvailable ||

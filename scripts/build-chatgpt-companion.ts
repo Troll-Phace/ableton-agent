@@ -14,7 +14,7 @@ import { build, type Metafile } from "esbuild";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const output = join(root, "dist", "chatgpt-companion");
-const version = "0.0.7";
+const version = "0.0.8";
 const entry = "companion.cjs";
 const requiredNode = ">=24.14.1";
 
@@ -116,6 +116,7 @@ const fixtureSources = [
     "sdk-responses.ts",
     "sdk-stream.ts",
     "sdk-tool-roundtrip.ts",
+    "sdk-tool-budget.ts",
     "sdk-budget.ts",
   ].map((name) => `src/companion-feasibility/${name}`),
 ];
@@ -132,7 +133,7 @@ export const version = __COMPANION_VERSION__;
 export const buildId = __COMPANION_BUILD_ID__;
 export const requiredNode = __COMPANION_NODE__;
 export function launchCompanion(options: {foreground?: ForegroundDependencies; control?: CompanionControlDependencies; runtime?: CompanionRuntimeDependencies} = {}) {
-  const foreground = options.runtime ? { ...(options.foreground ?? nativeForegroundDependencies()), createRuntime: () => createCompanionRuntime({ ...options.runtime, diagnosticMode: true, sdkMode: true, sdkLiveProbe: false, sdkToolRoundtripMode: true, sdkAuthorization: undefined, sdkToolRoundtripAuthorization: undefined }) } : options.foreground;
+  const foreground = options.runtime ? { ...(options.foreground ?? nativeForegroundDependencies()), createRuntime: () => createCompanionRuntime({ ...options.runtime, diagnosticMode: true, sdkMode: true, sdkLiveProbe: false, sdkToolRoundtripMode: true, sdkToolLiveProbe: true, sdkAuthorization: undefined, sdkToolRoundtripAuthorization: undefined }) } : options.foreground;
   return startForegroundCompanion(context => createCompanionControl(context, {view: __COMPANION_VIEW__, dependencies: options.control}), foreground);
 }
 async function main() {
