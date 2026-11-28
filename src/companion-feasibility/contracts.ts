@@ -37,7 +37,7 @@ export type ControlAction =
       experiment: typeof DIAGNOSTIC_EXPERIMENT;
     }
   | {
-      action: "run_sdk_diagnostic";
+      action: "authorize_sdk_diagnostic" | "run_sdk_diagnostic";
       operatorStarted: true;
       ownerAuthorized: true;
       experiment: typeof SDK_EXPERIMENT;
@@ -134,6 +134,7 @@ export function parseControlAction(value: unknown): ControlAction | undefined {
             experiment: DIAGNOSTIC_EXPERIMENT,
           }
         : undefined;
+    case "authorize_sdk_diagnostic":
     case "run_sdk_diagnostic":
       return exact(row, [...keys, "ownerAuthorized", "experiment"]) &&
         row.ownerAuthorized === true &&

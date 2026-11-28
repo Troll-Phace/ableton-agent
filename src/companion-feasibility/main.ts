@@ -200,7 +200,10 @@ export type CompanionRuntimeHandle = Pick<
   Partial<
     Pick<
       CompanionRuntime,
-      "authorizeTextDiagnostic" | "runTextDiagnostic" | "runSdkDiagnostic"
+      | "authorizeTextDiagnostic"
+      | "runTextDiagnostic"
+      | "authorizeSdkDiagnostic"
+      | "runSdkDiagnostic"
     >
   >;
 export interface CompanionControlContext {
@@ -210,6 +213,7 @@ export interface CompanionControlContext {
     | "status"
     | "authorizeTextDiagnostic"
     | "runTextDiagnostic"
+    | "authorizeSdkDiagnostic"
     | "runSdkDiagnostic"
   >;
   origin: typeof COMPANION_CONTROL_ORIGIN;

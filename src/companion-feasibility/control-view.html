@@ -297,20 +297,25 @@
             </p>
           </div>
           <div id="sdk-diagnostic" hidden>
-            <p>
+            <p id="sdk-summary">
               <strong>Official SDK offline checkpoint.</strong> No live model
               request is authorized or available in this package. The original
               and previous diagnostic budgets are frozen.
             </p>
             <p id="sdk-budget" class="muted">Previous budget: not checked.</p>
             <label
-              ><input type="checkbox" id="sdk-consent" disabled /> Confirm the
-              separate synthetic SDK test authorization.</label
+              ><input type="checkbox" id="sdk-consent" disabled />
+              <span id="sdk-consent-label"
+                >Confirm the separate synthetic SDK test authorization.</span
+              ></label
             >
+            <button id="authorize-sdk-diagnostic" disabled hidden>
+              Authorize named one-request SDK diagnostic
+            </button>
             <button id="run-sdk-diagnostic" disabled>
               Run fixed SDK text diagnostic
             </button>
-            <p class="muted">
+            <p class="muted" id="sdk-note">
               The native package cannot enable this action. No retry, budget
               reset, or fallback is available.
             </p>
@@ -360,6 +365,7 @@
         "authorize-diagnostic",
         "run-diagnostic",
         "run-sdk-diagnostic",
+        "authorize-sdk-diagnostic",
         "signout",
         "quit",
       ];
@@ -407,6 +413,7 @@
         const diagnostic = r.diagnostic;
         const sdk = r.sdk;
         const sdkMode = !!sdk;
+        const sdkLiveProbe = sdk?.mode === "operator_test" && !!sdk.budget;
         const diagnosticMode = !!diagnostic;
         const initialBudget = diagnosticMode
           ? s.attempts === 1 && diagnostic.originalAttempts === 1
@@ -414,7 +421,9 @@
         const diagnosticAvailable =
           diagnosticMode &&
           (sdkMode
-            ? sdk.allowanceAvailable &&
+            ? (sdkLiveProbe
+                ? ["not_authorized", "ready"].includes(sdk.budget.state)
+                : sdk.allowanceAvailable) &&
               diagnostic.budget.state === "exhausted" &&
               diagnostic.budget.attempts === 1
             : ["not_authorized", "ready"].includes(diagnostic.budget.state));
@@ -422,6 +431,16 @@
         $("legacy-budget-note").hidden = diagnosticMode;
         $("text-diagnostic").hidden = !diagnosticMode || sdkMode;
         $("sdk-diagnostic").hidden = !sdkMode;
+        $("authorize-sdk-diagnostic").hidden = !sdkLiveProbe;
+        $("sdk-summary").textContent = sdkLiveProbe
+          ? "Official SDK one-request operator test. Review the exact artifact and PR before personally operating this experiment. The original and previous diagnostic budgets are frozen."
+          : "Official SDK offline checkpoint. No live model request is authorized or available in this package. The original and previous diagnostic budgets are frozen.";
+        $("sdk-consent-label").textContent = sdkLiveProbe
+          ? "I reviewed this artifact and authorize exactly one additional synthetic text-only SDK request, using my ChatGPT plan only with credit fallback disabled. Preserve both previous budgets."
+          : "Confirm the separate synthetic SDK test authorization.";
+        $("sdk-note").textContent = sdkLiveProbe
+          ? "Authorization and Run are separate actions. The slot is durably consumed before dispatch. No retry, reset, alternate provider, fallback, or automatic continuation is available. Stop on failure or uncertainty."
+          : "The native package cannot enable this action. No retry, budget reset, or fallback is available.";
         message(
           s.code
             ? "Status: " + s.code.replaceAll("_", " ")
@@ -579,10 +598,21 @@
               ? "no verified allowance"
               : diagnostic.budget.attempts + "/1")
           : "Separate diagnostic unavailable.";
+        const canAuthorizeSdk =
+          sdkLiveProbe && canAuthorize && sdk.budget.state === "not_authorized";
         const canRunSdk =
-          sdkMode && sdk.allowanceAvailable === true && canAuthorize;
-        $("sdk-consent").disabled = !canRunSdk;
-        if (!canRunSdk && !busy) $("sdk-consent").checked = false;
+          sdkMode &&
+          sdk.allowanceAvailable === true &&
+          canAuthorize &&
+          (!sdkLiveProbe ||
+            (sdk.budget.state === "ready" && sdk.budget.attempts === 0));
+        $("sdk-consent").disabled = !canAuthorizeSdk && !canRunSdk;
+        if (!canAuthorizeSdk && !canRunSdk && !busy)
+          $("sdk-consent").checked = false;
+        disable(
+          "authorize-sdk-diagnostic",
+          !canAuthorizeSdk || !$("sdk-consent").checked
+        );
         disable("run-sdk-diagnostic", !canRunSdk || !$("sdk-consent").checked);
         $("sdk-budget").textContent = sdkMode
           ? "Previous diagnostic: " +
@@ -592,6 +622,19 @@
             " · SDK allowance: " +
             (sdk.allowanceAvailable ? "synthetic test only" : "none")
           : "SDK diagnostic unavailable.";
+        if (sdkLiveProbe) {
+          $("sdk-budget").textContent =
+            "Previous diagnostic: " +
+            (diagnostic?.budget.attempts == null
+              ? "unknown"
+              : diagnostic.budget.attempts + "/1 (frozen)") +
+            " · SDK diagnostic: " +
+            sdk.budget.state.replaceAll("_", " ") +
+            " · " +
+            (sdk.budget.attempts == null
+              ? "no verified allowance"
+              : sdk.budget.attempts + "/1");
+        }
         $("evidence").textContent = JSON.stringify(
           { snapshot: s, runtime: r },
           null,
@@ -731,6 +774,13 @@
       $("run-sdk-diagnostic").addEventListener("click", () => {
         if ($("sdk-consent").checked)
           void action("run_sdk_diagnostic", {
+            ownerAuthorized: true,
+            experiment: "p15_3_official_sdk_diagnostic",
+          });
+      });
+      $("authorize-sdk-diagnostic").addEventListener("click", () => {
+        if ($("sdk-consent").checked)
+          void action("authorize_sdk_diagnostic", {
             ownerAuthorized: true,
             experiment: "p15_3_official_sdk_diagnostic",
           });

@@ -17,11 +17,18 @@ import {
   type RequestBudget,
 } from "../extension/feasibility/signin-contracts.js";
 import {
+  DiagnosticBudget,
   DIAGNOSTIC_AUTHORIZATION_FILE,
   DIAGNOSTIC_BUDGET_FILE,
   type DiagnosticRecordName,
   type DiagnosticRecordStore,
 } from "./diagnostic-budget.js";
+import {
+  SDK_AUTHORIZATION_FILE,
+  SDK_BUDGET_FILE,
+  type SdkRecordName,
+  type SdkRecordStore,
+} from "./sdk-budget.js";
 
 export const COMPANION_ROOT_NAME = "Ableton Agent Feasibility Companion";
 const MAX_BYTES = 131072;
@@ -32,10 +39,10 @@ const ORIGINAL_BUDGET = "run-budget.json";
 const UUID =
   "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const RECORD_PATTERN = new RegExp(
-  `^(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json|response-diagnostic-(?:budget|authorization)\\.json)$`
+  `^(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json|response-diagnostic-(?:budget|authorization)\\.json|sdk-diagnostic-(?:budget|authorization)\\.json)$`
 );
 const TEMP_PATTERN = new RegExp(
-  `^\\.(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json|response-diagnostic-(?:budget|authorization)\\.json)\\.${UUID}\\.tmp$`
+  `^\\.(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json|response-diagnostic-(?:budget|authorization)\\.json|sdk-diagnostic-(?:budget|authorization)\\.json)\\.${UUID}\\.tmp$`
 );
 const SYNTHETIC_TEMP = new RegExp(
   `^\\.companion-preflight(?:-proof)?\\.json\\.${UUID}\\.tmp$`
@@ -43,11 +50,13 @@ const SYNTHETIC_TEMP = new RegExp(
 const ORIGINAL_TEMP = new RegExp(`^\\.run-budget\\.json\\.${UUID}\\.tmp$`);
 const DIAGNOSTIC_TEMP =
   /^\.response-diagnostic-(?:budget|authorization)\.json\./;
+const SDK_TEMP = /^\.sdk-diagnostic-(?:budget|authorization)\.json\./;
 type SmallRecordName =
   | typeof MARKER
   | typeof PROOF
   | typeof ORIGINAL_BUDGET
-  | DiagnosticRecordName;
+  | DiagnosticRecordName
+  | SdkRecordName;
 
 export type CompanionStorageIssue =
   | "storage_unsafe"
@@ -762,6 +771,43 @@ export class CompanionStorage {
         if (this.freezeDiagnosticBudget)
           throw new SigninFault("budget_exhausted");
         this.frozenOriginalBudget();
+        this.syntheticWrite(checked(name), value);
+      },
+    };
+  }
+  /** Only the new SDK experiment can write its two fixed records. Both earlier
+   * allowances are read-only and must verify exactly 1/3 and exhausted 1/1. */
+  sdkDiagnosticRecords(): SdkRecordStore {
+    if (!this.freezeOriginalBudget || !this.freezeDiagnosticBudget)
+      throw new SigninFault("storage_invalid");
+    const prior = new DiagnosticBudget(this.diagnosticRecords());
+    const assertHistoricalFrozen = () => {
+      this.frozenOriginalBudget();
+      const status = prior.status();
+      if (status.state !== "exhausted" || status.attempts !== 1)
+        throw new SigninFault("storage_invalid");
+    };
+    const assertNoSdkTemporaries = () => {
+      this.assertReady();
+      if (
+        this.adapter
+          .readdirSync(this.child.name)
+          .some((name) => SDK_TEMP.test(name))
+      )
+        throw new SigninFault("storage_invalid");
+    };
+    const checked = (name: SdkRecordName) => {
+      if (name !== SDK_AUTHORIZATION_FILE && name !== SDK_BUDGET_FILE)
+        throw new SigninFault("storage_invalid");
+      return name;
+    };
+    return {
+      assertHistoricalFrozen,
+      assertNoSdkTemporaries,
+      read: (name) => this.syntheticRead(checked(name)),
+      write: (name, value) => {
+        assertHistoricalFrozen();
+        assertNoSdkTemporaries();
         this.syntheticWrite(checked(name), value);
       },
     };

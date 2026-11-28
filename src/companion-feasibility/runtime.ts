@@ -20,9 +20,13 @@ import {
   type BrowserLauncher,
   type OAuthCrypto,
 } from "../extension/feasibility/oauth.js";
-import { SyntheticResponses } from "../extension/feasibility/responses.js";
+import {
+  SyntheticResponses,
+  type InferenceContext,
+} from "../extension/feasibility/responses.js";
 import { SigninSession } from "../extension/feasibility/signin-session.js";
 import { DiagnosticBudget } from "./diagnostic-budget.js";
+import { SdkBudget, type SdkBudgetStatus } from "./sdk-budget.js";
 import {
   SdkResponses,
   type SdkDiagnosticAuthorization,
@@ -35,6 +39,9 @@ import {
 import {
   systemSigninClock,
   SigninFault,
+  PLAN_SCOPE,
+  REQUESTED_SCOPES,
+  validToken,
   type SigninPersistence,
 } from "../extension/feasibility/signin-contracts.js";
 import {
@@ -61,8 +68,10 @@ export interface CompanionRuntimeDependencies extends OfficialHttpDependencies {
   eligibilityBasisReady: boolean;
   /** Legacy synthetic seams remain test-only. */
   diagnosticMode?: boolean;
-  /** Fixed on in 0.0.5; native and packaged launches have no usable allowance. */
+  /** Fixed on in SDK-mode packages. */
   sdkMode?: boolean;
+  /** 0.0.6: separate explicit durable owner-operated one-request experiment. */
+  sdkLiveProbe?: boolean;
   /** Synthetic direct-runtime tests only. Never configured by the packaged CLI. */
   sdkAuthorization?: SdkDiagnosticAuthorization;
   browser: BrowserLauncher;
@@ -93,6 +102,7 @@ export function nativeCompanionRuntimeDependencies(): CompanionRuntimeDependenci
     eligibilityBasisReady: true,
     diagnosticMode: true,
     sdkMode: true,
+    sdkLiveProbe: true,
     browser: (url, cancellation) =>
       launchAuthorizationBrowser(
         url,
@@ -111,7 +121,11 @@ export interface CompanionRuntimeStatus {
   storage: CompanionStorageHealth;
   preflight?: CompanionPreflightReport;
   diagnostic?: TextDiagnosticStatus;
-  sdk?: SdkDiagnosticStatus;
+  sdk?: SdkRuntimeStatus;
+}
+export interface SdkRuntimeStatus extends Omit<SdkDiagnosticStatus, "mode"> {
+  mode: "offline_only" | "operator_test";
+  budget?: SdkBudgetStatus;
 }
 export interface CompanionRuntimeShutdown {
   cleanup: "complete" | "pending";
@@ -127,13 +141,14 @@ export class CompanionRuntime {
   private readonly oauth: OAuthLifecycle;
   private readonly diagnostic?: ResponseDiagnostic;
   private readonly sdk?: SdkResponses;
+  private readonly sdkLiveBudget?: SdkBudget;
   private readonly priorDiagnosticBudget?: DiagnosticBudget;
   private readonly stopControl = createProbeCancellation();
   private readonly requests = new Set<Promise<unknown>>();
   private shutdownTask?: Promise<CompanionRuntimeShutdown>;
 
   constructor(private readonly deps: CompanionRuntimeDependencies) {
-    const sdkMode = deps.sdkMode === true;
+    const sdkMode = deps.sdkMode === true || deps.sdkLiveProbe === true;
     const diagnosticMode = sdkMode || deps.diagnosticMode === true;
     this.storage = createCompanionStorage(
       deps.storage,
@@ -144,7 +159,12 @@ export class CompanionRuntime {
     const store: SigninPersistence = diagnosticMode
       ? {
           ensureHostId: () => persisted.ensureHostId(),
-          selectedRegistration: () => persisted.selectedRegistration(),
+          selectedRegistration: () => {
+            const selected = persisted.selectedRegistration();
+            if (deps.sdkLiveProbe === true && !selected)
+              throw new SigninFault("reconnect_required");
+            return selected;
+          },
           loadSelectedConnection: () => persisted.loadSelectedConnection(),
           saveConnection: (connection) => persisted.saveConnection(connection),
           clearCredentials: (localId) => persisted.clearCredentials(localId),
@@ -234,6 +254,12 @@ export class CompanionRuntime {
     if (sdkMode) {
       const prior = new DiagnosticBudget(this.storage.diagnosticRecords());
       this.priorDiagnosticBudget = prior;
+      const liveBudget =
+        deps.sdkLiveProbe === true
+          ? new SdkBudget(this.storage.sdkDiagnosticRecords())
+          : undefined;
+      this.sdkLiveBudget = liveBudget;
+      let reservationConfirmed = false;
       this.sdk = new SdkResponses({
         fetch: deps.fetch,
         AbortController: deps.AbortController,
@@ -245,8 +271,28 @@ export class CompanionRuntime {
           const state = prior.status();
           if (state.state !== "exhausted" || state.attempts !== 1)
             throw new SigninFault("storage_invalid");
+          if (liveBudget) {
+            const current = liveBudget.status();
+            if (
+              reservationConfirmed
+                ? current.state !== "exhausted" || current.attempts !== 1
+                : current.state !== "ready" || current.attempts !== 0
+            )
+              throw new SigninFault("storage_invalid");
+          }
         },
-        authorization: deps.sdkAuthorization,
+        // The live-probe composition cannot use synthetic allowance injection.
+        authorization: liveBudget
+          ? {
+              isAuthorized: () => liveBudget.status().state === "ready",
+              reserve: () => {
+                const reserved = liveBudget.reserve();
+                reservationConfirmed =
+                  reserved.state === "exhausted" && reserved.attempts === 1;
+                return reservationConfirmed;
+              },
+            }
+          : deps.sdkAuthorization,
       });
     }
     this.session = new SigninSession({
@@ -284,7 +330,17 @@ export class CompanionRuntime {
         : prior
           ? { diagnostic: prior }
           : {}),
-      ...(this.sdk ? { sdk: this.sdk.status() } : {}),
+      ...(this.sdk
+        ? {
+            sdk: this.sdkLiveBudget
+              ? {
+                  ...this.sdk.status(),
+                  mode: "operator_test" as const,
+                  budget: this.sdkLiveBudget.status(),
+                }
+              : this.sdk.status(),
+          }
+        : {}),
     };
   }
 
@@ -309,7 +365,45 @@ export class CompanionRuntime {
     );
   }
 
-  /** Offline-only checkpoint. A valid control action cannot confer allowance. */
+  /** Separate durable authorization through the same session gates, no Fetch. */
+  async authorizeSdkDiagnostic(ownerAuthorized: boolean): Promise<void> {
+    const budget = this.sdkLiveBudget;
+    if (!budget || ownerAuthorized !== true)
+      throw new SigninFault("operator_required");
+    await this.session.authorizeTextDiagnostic(
+      { operatorStarted: true },
+      (context) => {
+        this.verifySdkAuthorizationConnection(context);
+        budget.authorize(ownerAuthorized);
+      }
+    );
+  }
+
+  private verifySdkAuthorizationConnection(context: InferenceContext): void {
+    if (this.stopControl.cancelled || context.cancellation?.cancelled)
+      throw new SigninFault("cancelled");
+    const saved = this.storage.store.loadSelectedConnection();
+    const expected = context.connection;
+    if (
+      !saved ||
+      saved.localId !== expected.localId ||
+      saved.clientId !== expected.clientId ||
+      saved.issuer !== expected.issuer ||
+      saved.subject !== expected.subject ||
+      saved.accessToken !== expected.accessToken ||
+      !validToken(saved.accessToken) ||
+      !Number.isSafeInteger(saved.expiresAt) ||
+      saved.expiresAt <= this.deps.clock.now()
+    )
+      throw new SigninFault("reconnect_required");
+    if (
+      !saved.scopes.includes(PLAN_SCOPE) ||
+      !REQUESTED_SCOPES.every((scope) => saved.scopes.includes(scope))
+    )
+      throw new SigninFault("plan_disabled");
+  }
+
+  /** Run requires the separate ready budget; the unchanged SDK adapter reserves it. */
   async runSdkDiagnostic(ownerAuthorized: boolean): Promise<void> {
     const sdk = this.sdk;
     if (!sdk || ownerAuthorized !== true)
