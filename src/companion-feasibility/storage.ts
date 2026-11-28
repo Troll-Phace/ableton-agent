@@ -14,24 +14,40 @@ import {
   errorCode,
   record,
   validUuid,
+  type RequestBudget,
 } from "../extension/feasibility/signin-contracts.js";
+import {
+  DIAGNOSTIC_AUTHORIZATION_FILE,
+  DIAGNOSTIC_BUDGET_FILE,
+  type DiagnosticRecordName,
+  type DiagnosticRecordStore,
+} from "./diagnostic-budget.js";
 
 export const COMPANION_ROOT_NAME = "Ableton Agent Feasibility Companion";
 const MAX_BYTES = 131072;
 const MAX_ENTRIES = 128;
 const MARKER = "companion-preflight.json";
 const PROOF = "companion-preflight-proof.json";
+const ORIGINAL_BUDGET = "run-budget.json";
 const UUID =
   "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const RECORD_PATTERN = new RegExp(
-  `^(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json)$`
+  `^(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json|response-diagnostic-(?:budget|authorization)\\.json)$`
 );
 const TEMP_PATTERN = new RegExp(
-  `^\\.(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json)\\.${UUID}\\.tmp$`
+  `^\\.(?:host\\.json|connections\\.json|run-budget\\.json|connection-${UUID}\\.json|companion-preflight(?:-proof)?\\.json|response-diagnostic-(?:budget|authorization)\\.json)\\.${UUID}\\.tmp$`
 );
 const SYNTHETIC_TEMP = new RegExp(
   `^\\.companion-preflight(?:-proof)?\\.json\\.${UUID}\\.tmp$`
 );
+const ORIGINAL_TEMP = new RegExp(`^\\.run-budget\\.json\\.${UUID}\\.tmp$`);
+const DIAGNOSTIC_TEMP =
+  /^\.response-diagnostic-(?:budget|authorization)\.json\./;
+type SmallRecordName =
+  | typeof MARKER
+  | typeof PROOF
+  | typeof ORIGINAL_BUDGET
+  | DiagnosticRecordName;
 
 export type CompanionStorageIssue =
   | "storage_unsafe"
@@ -296,7 +312,10 @@ export class CompanionStorage {
   private uncertain?: CompanionStorageIssue;
   private readonly adapter: typeof fs;
 
-  constructor(private readonly deps: CompanionStorageDependencies) {
+  constructor(
+    private readonly deps: CompanionStorageDependencies,
+    private readonly freezeOriginalBudget = false
+  ) {
     this.entries = prepareDirectories(deps);
     const root = this.entries[2];
     const child = this.entries[3];
@@ -426,6 +445,8 @@ export class CompanionStorage {
       mode === 0o600 &&
       TEMP_PATTERN.test(base)
     ) {
+      if (this.freezeOriginalBudget && ORIGINAL_TEMP.test(base))
+        throw new CompanionStorageFault("storage_unsafe");
       if (optionalStat(native, name))
         throw new CompanionStorageFault("storage_unsafe");
       descriptor = { file: name, mode: "write" };
@@ -504,6 +525,8 @@ export class CompanionStorage {
     this.verifyTree();
     const sourceName = this.file(from);
     const targetName = this.file(to);
+    if (this.freezeOriginalBudget && targetName === ORIGINAL_BUDGET)
+      throw new CompanionStorageFault("storage_unsafe");
     const native = this.deps.fs;
     const prepared = this.prepared.get(from);
     if (
@@ -557,7 +580,12 @@ export class CompanionStorage {
   private unlink(name: string): void {
     this.assertReady();
     this.verifyTree();
-    this.file(name);
+    const base = this.file(name);
+    if (
+      this.freezeOriginalBudget &&
+      (base === ORIGINAL_BUDGET || ORIGINAL_TEMP.test(base))
+    )
+      throw new CompanionStorageFault("storage_unsafe");
     const native = this.deps.fs;
     const initial = this.safeStat(name);
     try {
@@ -591,10 +619,12 @@ export class CompanionStorage {
     if (!validUuid(value)) throw new CompanionStorageFault("storage_failed");
     return value;
   }
-  private syntheticPath(name: typeof MARKER | typeof PROOF): string {
+  private syntheticPath(name: SmallRecordName): string {
     return this.deps.path.join(this.child.name, name);
   }
-  private syntheticRead(name: typeof MARKER | typeof PROOF): unknown {
+  private syntheticRead(name: SmallRecordName): unknown {
+    this.assertReady();
+    this.verifyTree();
     const target = this.syntheticPath(name);
     if (!optionalStat(this.deps.fs, target)) return undefined;
     const fd = this.adapter.openSync(
@@ -633,7 +663,7 @@ export class CompanionStorage {
     }
   }
   private syntheticWrite(
-    name: typeof MARKER | typeof PROOF,
+    name: Exclude<SmallRecordName, typeof ORIGINAL_BUDGET>,
     value: object
   ): void {
     const target = this.syntheticPath(name);
@@ -663,6 +693,60 @@ export class CompanionStorage {
       if (owned && !this.uncertain && optionalStat(this.deps.fs, temp))
         this.adapter.unlinkSync(temp);
     }
+  }
+  /** Read the existing original budget only. Missing, non-1/3 or orphaned
+   * reservations fail closed, with no creation, migration or reset. */
+  frozenOriginalBudget(): RequestBudget {
+    if (!this.freezeOriginalBudget) throw new SigninFault("storage_invalid");
+    this.assertReady();
+    this.verifyTree();
+    if (
+      this.adapter
+        .readdirSync(this.child.name)
+        .some((name) => name.startsWith(".run-budget.json."))
+    )
+      throw new SigninFault("storage_invalid");
+    const row = record(this.syntheticRead(ORIGINAL_BUDGET));
+    if (
+      !row ||
+      Object.keys(row).length !== 3 ||
+      row.version !== 1 ||
+      !validUuid(row.runId) ||
+      row.attempts !== 1
+    )
+      throw new SigninFault("storage_invalid");
+    return { version: 1, runId: row.runId, attempts: 1 };
+  }
+  /** Narrow record seam using the same checked write/fsync/rename/dir-sync path. */
+  diagnosticRecords(): DiagnosticRecordStore {
+    if (!this.freezeOriginalBudget) throw new SigninFault("storage_invalid");
+    const checked = (name: DiagnosticRecordName) => {
+      if (
+        name !== DIAGNOSTIC_AUTHORIZATION_FILE &&
+        name !== DIAGNOSTIC_BUDGET_FILE
+      )
+        throw new SigninFault("storage_invalid");
+      return name;
+    };
+    return {
+      assertOriginalFrozen: () => {
+        this.frozenOriginalBudget();
+      },
+      assertNoDiagnosticTemporaries: () => {
+        this.assertReady();
+        if (
+          this.adapter
+            .readdirSync(this.child.name)
+            .some((name) => DIAGNOSTIC_TEMP.test(name))
+        )
+          throw new SigninFault("storage_invalid");
+      },
+      read: (name) => this.syntheticRead(checked(name)),
+      write: (name, value) => {
+        this.frozenOriginalBudget();
+        this.syntheticWrite(checked(name), value);
+      },
+    };
   }
   /** Actual synthetic write/sync/replace/read/delete; first run leaves a private
    * synthetic marker, a distinct process validates it, persists proof and deletes it.
@@ -781,7 +865,8 @@ export class CompanionStorage {
 
 /** Call only after the fixed-port singleton is acquired. */
 export function createCompanionStorage(
-  deps: CompanionStorageDependencies = nativeCompanionStorageDependencies()
+  deps: CompanionStorageDependencies = nativeCompanionStorageDependencies(),
+  freezeOriginalBudget = false
 ): CompanionStorage {
-  return new CompanionStorage(deps);
+  return new CompanionStorage(deps, freezeOriginalBudget);
 }

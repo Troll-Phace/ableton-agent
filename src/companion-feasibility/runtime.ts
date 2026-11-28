@@ -22,9 +22,15 @@ import {
 } from "../extension/feasibility/oauth.js";
 import { SyntheticResponses } from "../extension/feasibility/responses.js";
 import { SigninSession } from "../extension/feasibility/signin-session.js";
+import { DiagnosticBudget } from "./diagnostic-budget.js";
+import {
+  ResponseDiagnostic,
+  type TextDiagnosticStatus,
+} from "./response-diagnostic.js";
 import {
   systemSigninClock,
   SigninFault,
+  type SigninPersistence,
 } from "../extension/feasibility/signin-contracts.js";
 import {
   createCompanionStorage,
@@ -48,6 +54,8 @@ export interface CompanionRuntimeDependencies extends OfficialHttpDependencies {
   jwt: CompanionJwt;
   pid: number;
   eligibilityBasisReady: boolean;
+  /** Fixed on in the 0.0.4 native package; legacy synthetic seams remain test-only. */
+  diagnosticMode?: boolean;
   browser: BrowserLauncher;
 }
 
@@ -74,6 +82,7 @@ export function nativeCompanionRuntimeDependencies(): CompanionRuntimeDependenci
     clock: systemSigninClock,
     // Reviewed MIT integration basis; not a claim about individual plan eligibility.
     eligibilityBasisReady: true,
+    diagnosticMode: true,
     browser: (url, cancellation) =>
       launchAuthorizationBrowser(
         url,
@@ -91,6 +100,7 @@ export function nativeCompanionRuntimeDependencies(): CompanionRuntimeDependenci
 export interface CompanionRuntimeStatus {
   storage: CompanionStorageHealth;
   preflight?: CompanionPreflightReport;
+  diagnostic?: TextDiagnosticStatus;
 }
 export interface CompanionRuntimeShutdown {
   cleanup: "complete" | "pending";
@@ -104,12 +114,31 @@ export class CompanionRuntime {
   private readonly storage: CompanionStorage;
   private readonly preflight: CompanionPreflight;
   private readonly oauth: OAuthLifecycle;
+  private readonly diagnostic?: ResponseDiagnostic;
   private readonly stopControl = createProbeCancellation();
   private readonly requests = new Set<Promise<unknown>>();
   private shutdownTask?: Promise<CompanionRuntimeShutdown>;
 
   constructor(private readonly deps: CompanionRuntimeDependencies) {
-    this.storage = createCompanionStorage(deps.storage);
+    this.storage = createCompanionStorage(
+      deps.storage,
+      deps.diagnosticMode === true
+    );
+    const persisted = this.storage.store;
+    const store: SigninPersistence = deps.diagnosticMode
+      ? {
+          ensureHostId: () => persisted.ensureHostId(),
+          selectedRegistration: () => persisted.selectedRegistration(),
+          loadSelectedConnection: () => persisted.loadSelectedConnection(),
+          saveConnection: (connection) => persisted.saveConnection(connection),
+          clearCredentials: (localId) => persisted.clearCredentials(localId),
+          clearAllCredentials: () => persisted.clearAllCredentials(),
+          getBudget: () => this.storage.frozenOriginalBudget(),
+          reserveInferenceAttempt: () => {
+            throw new SigninFault("budget_exhausted");
+          },
+        }
+      : persisted;
     const official = new OfficialHttp(deps);
     const scoped = async <T>(
       request: OfficialRequest,
@@ -117,6 +146,7 @@ export class CompanionRuntime {
     ): Promise<T> => {
       if (this.stopControl.cancelled) throw new SigninFault("cancelled");
       this.storage.assertReady();
+      if (deps.diagnosticMode) this.storage.frozenOriginalBudget();
       const combined = createProbeCancellation();
       const removeShutdown = this.stopControl.onCancel(() => combined.cancel());
       const removeAction = request.cancellation?.onCancel(() =>
@@ -125,6 +155,7 @@ export class CompanionRuntime {
       const task = Promise.resolve().then(() => {
         if (combined.cancelled) throw new SigninFault("cancelled");
         this.storage.assertReady();
+        if (deps.diagnosticMode) this.storage.frozenOriginalBudget();
         return run({ ...request, cancellation: combined });
       });
       this.requests.add(task);
@@ -141,12 +172,14 @@ export class CompanionRuntime {
         scoped(request, (bounded) => official.requestJson(route, bounded)),
       requestEmpty: (route, request) =>
         scoped(request, (bounded) => official.requestEmpty(route, bounded)),
-      requestStream: (request, consume) =>
-        scoped(request, (bounded) => official.requestStream(bounded, consume)),
+      requestStream: (request, consume, diagnostics) =>
+        scoped(request, (bounded) =>
+          official.requestStream(bounded, consume, diagnostics)
+        ),
     };
     this.oauth = new OAuthLifecycle({
       http: client,
-      store: this.storage.store,
+      store,
       idTokens: new OidcIdTokenVerifier({
         http: client,
         crypto: deps.crypto,
@@ -166,18 +199,33 @@ export class CompanionRuntime {
     });
     const responses = new SyntheticResponses({
       http: client,
-      store: this.storage.store,
+      store,
       TextDecoder: deps.TextDecoder,
       clock: deps.clock,
     });
     this.preflight = new CompanionPreflight({ ...deps, storage: this.storage });
+    if (deps.diagnosticMode)
+      this.diagnostic = new ResponseDiagnostic({
+        budget: new DiagnosticBudget(this.storage.diagnosticRecords()),
+        http: client,
+        loadConnection: () => this.storage.store.loadSelectedConnection(),
+        assertOriginalFrozen: () => {
+          this.storage.frozenOriginalBudget();
+        },
+        clock: deps.clock,
+        TextDecoder: deps.TextDecoder,
+      });
     this.session = new SigninSession({
       eligibilityBasisReady: deps.eligibilityBasisReady,
+      diagnosticMode: deps.diagnosticMode,
       clock: deps.clock,
       oauth: this.oauth,
       responses,
-      store: this.storage.store,
-      hostPreflight: (cancellation) => this.preflight.run(cancellation),
+      store,
+      hostPreflight: (cancellation) => {
+        if (deps.diagnosticMode) this.storage.frozenOriginalBudget();
+        return this.preflight.run(cancellation);
+      },
     });
   }
 
@@ -186,7 +234,29 @@ export class CompanionRuntime {
     return {
       storage: this.storage.health(),
       ...(preflight ? { preflight } : {}),
+      ...(this.diagnostic ? { diagnostic: this.diagnostic.status() } : {}),
     };
+  }
+
+  /** Paired explicit owner authorization, distinct from plan-only confirmation. */
+  async authorizeTextDiagnostic(ownerAuthorized: boolean): Promise<void> {
+    const diagnostic = this.diagnostic;
+    if (!diagnostic || ownerAuthorized !== true)
+      throw new SigninFault("operator_required");
+    await this.session.authorizeTextDiagnostic(
+      { operatorStarted: true },
+      (context) => diagnostic.authorize(context, ownerAuthorized)
+    );
+  }
+  async runTextDiagnostic(ownerAuthorized: boolean): Promise<void> {
+    const diagnostic = this.diagnostic;
+    if (!diagnostic || ownerAuthorized !== true)
+      throw new SigninFault("operator_required");
+    await this.session.runTextDiagnostic(
+      { operatorStarted: true },
+      (context) => diagnostic.run(context, ownerAuthorized),
+      (result) => diagnostic.publish(result)
+    );
   }
 
   /** Stops operations without implicitly revoking, clearing or re-registering. */

@@ -257,17 +257,45 @@
           >
           <button id="confirm" disabled>Confirm plan-only usage</button>
           <p id="attempts" class="muted">Durable attempts: not checked.</p>
-          <div class="actions">
+          <div class="actions" id="legacy-probes">
             <button id="roundtrip" disabled>
               Run fixed synthetic function round trip (2 attempts)</button
             ><button id="cancellation" disabled>
               Run final cancellation check (1 attempt)
             </button>
           </div>
-          <p class="muted">
+          <p class="muted" id="legacy-budget-note">
             Failed or uncertain sends consume their durable attempt. There is no
             fourth request and no automatic replay.
           </p>
+          <div id="text-diagnostic" hidden>
+            <p>
+              The original three-request experiment is frozen at 1/3. Its two
+              remaining slots are unavailable in this package.
+            </p>
+            <p id="diagnostic-attempts" class="muted">
+              Separate diagnostic: not checked.
+            </p>
+            <label
+              ><input type="checkbox" id="diagnostic-consent" disabled /> I have
+              separately authorized one additional synthetic text-only Responses
+              request after reviewing this artifact. Preserve the original 1/3
+              budget and do not use its remaining slots.</label
+            >
+            <div class="actions">
+              <button id="authorize-diagnostic" disabled>
+                Authorize named one-request diagnostic
+              </button>
+              <button id="run-diagnostic" disabled>
+                Run fixed text diagnostic (one request)
+              </button>
+            </div>
+            <p class="muted">
+              Authorization and reservation are durable. No reset, retry, tool
+              call, or auto-continuation is available. Stop and seek review on
+              failure or uncertainty.
+            </p>
+          </div>
         </section>
         <section>
           <h2>5 · Stop or sign out</h2>
@@ -310,6 +338,8 @@
         "confirm",
         "roundtrip",
         "cancellation",
+        "authorize-diagnostic",
+        "run-diagnostic",
         "signout",
         "quit",
       ];
@@ -326,6 +356,7 @@
         $("model").disabled =
           $("plan-only").disabled =
           $("credits-off").disabled =
+          $("diagnostic-consent").disabled =
             true;
         $("control").hidden = true;
         $("pair-panel").hidden = false;
@@ -352,6 +383,17 @@
           r = data.runtime,
           healthy = r.storage.state === "ready",
           busy = s.busy || posting;
+        const diagnostic = r.diagnostic;
+        const diagnosticMode = !!diagnostic;
+        const initialBudget = diagnosticMode
+          ? s.attempts === 1 && diagnostic.originalAttempts === 1
+          : s.attempts === 0;
+        const diagnosticAvailable =
+          diagnosticMode &&
+          ["not_authorized", "ready"].includes(diagnostic.budget.state);
+        $("legacy-probes").hidden = diagnosticMode;
+        $("legacy-budget-note").hidden = diagnosticMode;
+        $("text-diagnostic").hidden = !diagnosticMode;
         message(
           s.code
             ? "Status: " + s.code.replaceAll("_", " ")
@@ -403,7 +445,11 @@
         );
         disable(
           "models",
-          busy || !healthy || !s.refreshVerified || s.attempts !== 0
+          busy ||
+            !healthy ||
+            !s.refreshVerified ||
+            !initialBudget ||
+            (diagnosticMode && !diagnosticAvailable)
         );
         disable("cancel", !s.busy && !posting);
         disable("signout", false);
@@ -422,12 +468,14 @@
           selectedKey = s.selectedModelSlug || "";
           $("model").value = selectedKey;
           $("plan-only").checked = $("credits-off").checked = false;
+          $("diagnostic-consent").checked = false;
         }
         const canSelect =
           !busy &&
           healthy &&
           s.refreshVerified &&
-          s.attempts === 0 &&
+          initialBudget &&
+          (!diagnosticMode || diagnosticAvailable) &&
           list.length > 0;
         $("model").disabled = !canSelect;
         disable("select-model", !canSelect || !$("model").value);
@@ -435,7 +483,8 @@
           !busy &&
           healthy &&
           s.selectedModelSlug &&
-          s.attempts === 0 &&
+          initialBudget &&
+          (!diagnosticMode || diagnosticAvailable) &&
           s.planScopeGranted;
         $("plan-only").disabled = $("credits-off").disabled = !canConfirm;
         disable(
@@ -444,7 +493,8 @@
         );
         disable(
           "roundtrip",
-          !canConfirm ||
+          diagnosticMode ||
+            !canConfirm ||
             !s.planOnlyConfirmed ||
             !s.creditFallbackDisabled ||
             !$("plan-only").checked ||
@@ -452,7 +502,8 @@
         );
         disable(
           "cancellation",
-          busy ||
+          diagnosticMode ||
+            busy ||
             !healthy ||
             s.state !== "roundtrip_complete" ||
             s.attempts !== 2 ||
@@ -460,8 +511,43 @@
             !s.creditFallbackDisabled
         );
         $("attempts").textContent =
-          "Durable attempts: " +
+          (diagnosticMode
+            ? "Original durable attempts (frozen): "
+            : "Durable attempts: ") +
           (s.attempts == null ? "not checked" : s.attempts + "/3");
+        const canAuthorize =
+          diagnosticAvailable &&
+          canConfirm &&
+          s.preflightReady &&
+          s.refreshVerified &&
+          s.planOnlyConfirmed &&
+          s.creditFallbackDisabled &&
+          $("plan-only").checked &&
+          $("credits-off").checked;
+        $("diagnostic-consent").disabled = !canAuthorize;
+        if (!diagnosticAvailable || !s.selectedModelSlug)
+          $("diagnostic-consent").checked = false;
+        disable(
+          "authorize-diagnostic",
+          !canAuthorize ||
+            !$("diagnostic-consent").checked ||
+            diagnostic?.budget.state !== "not_authorized"
+        );
+        disable(
+          "run-diagnostic",
+          !canAuthorize ||
+            !$("diagnostic-consent").checked ||
+            diagnostic?.budget.state !== "ready" ||
+            diagnostic?.budget.attempts !== 0
+        );
+        $("diagnostic-attempts").textContent = diagnosticMode
+          ? "Separate diagnostic: " +
+            diagnostic.budget.state.replaceAll("_", " ") +
+            " · " +
+            (diagnostic.budget.attempts == null
+              ? "no verified allowance"
+              : diagnostic.budget.attempts + "/1")
+          : "Separate diagnostic unavailable.";
         $("evidence").textContent = JSON.stringify(
           { snapshot: s, runtime: r },
           null,
@@ -584,10 +670,25 @@
             creditFallbackDisabled: true,
           });
       });
-      ["model", "plan-only", "credits-off"].forEach((id) =>
-        $(id).addEventListener("change", () => {
-          if (current) render(current);
-        })
+      $("authorize-diagnostic").addEventListener("click", () => {
+        if ($("diagnostic-consent").checked)
+          void action("authorize_text_diagnostic", {
+            ownerAuthorized: true,
+            experiment: "p15_3_text_response_diagnostic",
+          });
+      });
+      $("run-diagnostic").addEventListener("click", () => {
+        if ($("diagnostic-consent").checked)
+          void action("run_text_diagnostic", {
+            ownerAuthorized: true,
+            experiment: "p15_3_text_response_diagnostic",
+          });
+      });
+      ["model", "plan-only", "credits-off", "diagnostic-consent"].forEach(
+        (id) =>
+          $(id).addEventListener("change", () => {
+            if (current) render(current);
+          })
       );
       setInterval(() => void status(), 1500);
       (async () => {

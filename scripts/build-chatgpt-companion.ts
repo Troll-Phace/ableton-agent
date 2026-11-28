@@ -14,7 +14,7 @@ import { build, type Metafile } from "esbuild";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const output = join(root, "dist", "chatgpt-companion");
-const version = "0.0.3";
+const version = "0.0.4";
 const entry = "companion.cjs";
 const requiredNode = ">=24.14.1";
 
@@ -96,6 +96,7 @@ const fixtureSources = [
     "contracts.ts",
     "signin-contracts.ts",
     "official-http.ts",
+    "response-diagnostics.ts",
     "credential-store.ts",
     "oauth.ts",
     "id-token.ts",
@@ -109,6 +110,8 @@ const fixtureSources = [
     "preflight.ts",
     "contracts.ts",
     "control-server.ts",
+    "diagnostic-budget.ts",
+    "response-diagnostic.ts",
   ].map((name) => `src/companion-feasibility/${name}`),
 ];
 const viewSource = "src/companion-feasibility/control-view.html";
@@ -124,7 +127,7 @@ export const version = __COMPANION_VERSION__;
 export const buildId = __COMPANION_BUILD_ID__;
 export const requiredNode = __COMPANION_NODE__;
 export function launchCompanion(options: {foreground?: ForegroundDependencies; control?: CompanionControlDependencies; runtime?: CompanionRuntimeDependencies} = {}) {
-  const foreground = options.runtime ? { ...(options.foreground ?? nativeForegroundDependencies()), createRuntime: () => createCompanionRuntime(options.runtime) } : options.foreground;
+  const foreground = options.runtime ? { ...(options.foreground ?? nativeForegroundDependencies()), createRuntime: () => createCompanionRuntime({ ...options.runtime, diagnosticMode: true }) } : options.foreground;
   return startForegroundCompanion(context => createCompanionControl(context, {view: __COMPANION_VIEW__, dependencies: options.control}), foreground);
 }
 async function main() {

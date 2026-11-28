@@ -16,6 +16,7 @@
     "src/companion-feasibility/**/*",
     "src/extension/feasibility/signin-contracts.ts",
     "src/extension/feasibility/official-http.ts",
+    "src/extension/feasibility/response-diagnostics.ts",
     "src/extension/feasibility/id-token.ts",
     "src/extension/feasibility/oauth.ts",
     "src/extension/feasibility/credential-store.ts",

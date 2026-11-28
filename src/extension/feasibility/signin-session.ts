@@ -4,6 +4,7 @@ import {
 } from "./contracts.js";
 import type { OAuthLifecycle } from "./oauth.js";
 import { SigninDeadline } from "./official-http.js";
+import { safeResponseDiagnostics } from "./response-diagnostics.js";
 import {
   PLAN_SCOPE,
   REQUESTED_SCOPES,
@@ -64,6 +65,8 @@ export type HostPreflightCheck = (
 export interface SigninSessionDependencies {
   /** Host-owned documented integration eligibility basis, never a webview input. */
   eligibilityBasisReady: boolean;
+  /** Separate companion-only experiment; the original three slots stay frozen. */
+  diagnosticMode?: boolean;
   clock: SigninClock;
   oauth: Pick<
     OAuthLifecycle,
@@ -280,9 +283,12 @@ function safeEvidence(
   return {
     terminal,
     code: safeCode(value.code) as ResponsesCode,
-    events: counted(value.events, 10001) ?? 0,
-    bytes: counted(value.bytes, 1048577) ?? 0,
+    events: counted(value.events, 10001) ?? null,
+    bytes: counted(value.bytes, 1048577) ?? null,
     ...(counts ? { usage: counts } : {}),
+    ...(value.diagnostics
+      ? { diagnostics: safeResponseDiagnostics(value.diagnostics) }
+      : {}),
   };
 }
 function safeRoundtrip(value: RoundTripResult): RoundTripResult {
@@ -539,7 +545,7 @@ export class SigninSession {
       this.requirePreflight();
       const connection = this.requireInferenceConnection();
       const before = this.updateBudget();
-      if (before !== 0)
+      if (before !== (this.deps.diagnosticMode ? 1 : 0))
         throw new SessionFault(
           before === 3 ? "budget_exhausted" : "attempt_order_invalid"
         );
@@ -586,7 +592,7 @@ export class SigninSession {
       this.creditFallbackDisabled = false;
       this.selectedModel = undefined;
       this.updateBudget();
-      if (this.attemptCount !== 0)
+      if (this.attemptCount !== (this.deps.diagnosticMode ? 1 : 0))
         throw new SessionFault(
           this.attemptCount === 3 ? "budget_exhausted" : "attempt_order_invalid"
         );
@@ -615,7 +621,7 @@ export class SigninSession {
       )
         throw new SessionFault("model_not_selected");
       this.updateBudget();
-      if (this.attemptCount !== 0)
+      if (this.attemptCount !== (this.deps.diagnosticMode ? 1 : 0))
         throw new SessionFault(
           this.attemptCount === 3 ? "budget_exhausted" : "attempt_order_invalid"
         );
@@ -635,6 +641,8 @@ export class SigninSession {
 
   async runRoundTrip(action: OperatorAction): Promise<SigninSnapshot> {
     return await this.perform(ROUNDTRIP_TIMEOUT, async (operation) => {
+      if (this.deps.diagnosticMode)
+        throw new SessionFault("attempt_order_invalid");
       const context = this.inferenceContext(action, operation);
       this.updateBudget();
       if (this.attemptCount !== 0)
@@ -667,6 +675,8 @@ export class SigninSession {
 
   async runCancellation(action: OperatorAction): Promise<SigninSnapshot> {
     return await this.perform(CANCELLATION_TIMEOUT, async (operation) => {
+      if (this.deps.diagnosticMode)
+        throw new SessionFault("attempt_order_invalid");
       const context = this.inferenceContext(action, operation);
       this.updateBudget();
       if (this.attemptCount === 3) throw new SigninFault("budget_exhausted");
@@ -694,6 +704,47 @@ export class SigninSession {
         reserved === 3
       )
         this.set("finished", "cancellation_demonstrated");
+      else
+        this.fail(result.outcome === "pass" ? "invalid_response" : result.code);
+    });
+  }
+
+  /** The companion's named one-request experiment uses the same verified
+   * connection, catalog, owner gates and operation generation, never the old slots. */
+  async authorizeTextDiagnostic(
+    action: OperatorAction,
+    authorize: (context: InferenceContext) => void
+  ): Promise<SigninSnapshot> {
+    return await this.perform(ACTION_TIMEOUT, (operation) => {
+      if (!this.deps.diagnosticMode || this.updateBudget() !== 1)
+        throw new SessionFault("attempt_order_invalid");
+      const context = this.inferenceContext(action, operation);
+      authorize(context);
+      operation.check();
+      this.set("model_selected", "plan_only_confirmed");
+      return Promise.resolve();
+    });
+  }
+
+  /** Publish only after the session generation survives cancellation/sign-out. */
+  async runTextDiagnostic<
+    T extends { outcome: "pass" | "blocked" | "failed"; code: ResponsesCode },
+  >(
+    action: OperatorAction,
+    run: (context: InferenceContext) => Promise<T>,
+    publish: (result: T) => void
+  ): Promise<SigninSnapshot> {
+    return await this.perform(CANCELLATION_TIMEOUT, async (operation) => {
+      if (!this.deps.diagnosticMode || this.updateBudget() !== 1)
+        throw new SessionFault("attempt_order_invalid");
+      const context = this.inferenceContext(action, operation);
+      this.set("validating");
+      const result = await run(context);
+      operation.check();
+      this.updateBudget();
+      publish(result);
+      if (result.outcome === "pass" && result.code === "response_completed")
+        this.set("finished", "response_completed");
       else
         this.fail(result.outcome === "pass" ? "invalid_response" : result.code);
     });

@@ -1,6 +1,10 @@
 import type { ProbeCancellation } from "./contracts.js";
 import type { OfficialBody, OfficialHttpClient } from "./official-http.js";
 import {
+  ResponseDiagnostics,
+  type ResponseDiagnosticSnapshot,
+} from "./response-diagnostics.js";
+import {
   PLAN_SCOPE,
   systemSigninClock,
   SigninFault,
@@ -105,9 +109,10 @@ export type EvidenceTerminal =
 export interface ResponseEvidence {
   terminal: EvidenceTerminal;
   code: ResponsesCode;
-  events: number;
-  bytes: number;
+  events: number | null;
+  bytes: number | null;
   usage?: UsageCounts;
+  diagnostics?: ResponseDiagnosticSnapshot;
 }
 export interface RoundTripResult {
   outcome: "pass" | "blocked" | "failed";
@@ -187,8 +192,14 @@ export class SseFramer {
   private skipLf = false;
   private total = 0;
   private count = 0;
-  constructor(TextDecoderCtor: typeof globalThis.TextDecoder) {
+  constructor(
+    TextDecoderCtor: typeof globalThis.TextDecoder,
+    private readonly diagnostics?: ResponseDiagnostics
+  ) {
+    diagnostics?.start("decoding");
     this.decoder = new TextDecoderCtor("utf-8", { fatal: true });
+    diagnostics?.pass("decoding");
+    diagnostics?.parser(0, 0);
   }
   get bytes(): number {
     return this.total;
@@ -197,13 +208,16 @@ export class SseFramer {
     return this.count;
   }
   push(chunk: Uint8Array): SseEvent[] {
+    this.diagnostics?.start("framing");
     if (!ArrayBuffer.isView(chunk) || typeof chunk.length !== "number")
       throw new ResponsesFault("malformed_sse");
     if (this.total + chunk.byteLength > MAX_TOTAL) {
       this.total = MAX_TOTAL + 1;
+      this.diagnostics?.parser(this.total, this.count);
       throw new ResponsesFault("response_limit");
     }
     this.total += chunk.byteLength;
+    this.diagnostics?.parser(this.total, this.count);
     const events: SseEvent[] = [];
     for (const byte of chunk) {
       if (this.skipLf) {
@@ -220,19 +234,25 @@ export class SseFramer {
         if (event) events.push(event);
       } else this.line.push(byte);
     }
+    this.diagnostics?.pass("framing");
     return events;
   }
   finish(): void {
+    this.diagnostics?.start("framing");
     if (this.line.length || this.data.length || this.eventName !== undefined)
       throw new ResponsesFault("premature_eof");
+    this.diagnostics?.pass("framing");
   }
   private consumeLine(): SseEvent | undefined {
     let line: string;
+    this.diagnostics?.start("decoding");
     try {
       line = this.decoder.decode(new Uint8Array(this.line));
     } catch {
       throw new ResponsesFault("malformed_sse");
     }
+    this.diagnostics?.pass("decoding");
+    this.diagnostics?.start("framing");
     this.line = [];
     if (line === "") {
       const data = this.data.join("\n");
@@ -243,13 +263,16 @@ export class SseFramer {
       this.eventBytes = 0;
       if (!present) return undefined;
       this.count++;
+      this.diagnostics?.parser(this.total, this.count);
       if (this.count > MAX_EVENTS) throw new ResponsesFault("response_limit");
       if (data.trim() === "[DONE]") {
         if (eventName && eventName !== "message")
           throw new ResponsesFault("malformed_sse");
+        this.diagnostics?.observeEvent("[DONE]");
         return { type: "[DONE]" };
       }
       let payload: Record<string, unknown> | undefined;
+      this.diagnostics?.start("decoding");
       try {
         payload = record(JSON.parse(data) as unknown);
       } catch {
@@ -264,6 +287,9 @@ export class SseFramer {
           eventName !== payload.type)
       )
         throw new ResponsesFault("malformed_sse");
+      this.diagnostics?.pass("decoding");
+      this.diagnostics?.start("framing");
+      this.diagnostics?.observeEvent(payload.type);
       return { type: payload.type, payload };
     }
     if (line.startsWith(":")) return undefined;
@@ -619,15 +645,52 @@ function evidence(
   framer: SseFramer | undefined,
   terminal: EvidenceTerminal,
   code: ResponsesCode,
-  usage?: UsageCounts
+  usage?: UsageCounts,
+  diagnostics?: ResponseDiagnostics
 ): ResponseEvidence {
+  const snapshot = diagnostics?.snapshot();
   return {
     terminal,
     code,
-    events: Math.min(framer?.events ?? 0, MAX_EVENTS + 1),
-    bytes: Math.min(framer?.bytes ?? 0, MAX_TOTAL + 1),
+    events: framer
+      ? Math.min(framer.events, MAX_EVENTS + 1)
+      : (snapshot?.framedEvents ?? null),
+    bytes: framer
+      ? Math.min(framer.bytes, MAX_TOTAL + 1)
+      : (snapshot?.parserBytes ?? null),
     ...(usage ? { usage } : {}),
+    ...(snapshot ? { diagnostics: snapshot } : {}),
   };
+}
+/** Attach final transport/cleanup observations after requestStream settles. */
+export function finalizeResponseEvidence(
+  value: ResponseEvidence,
+  diagnostics: ResponseDiagnostics
+): ResponseEvidence {
+  const snapshot = diagnostics.snapshot();
+  return {
+    ...value,
+    events: snapshot.framedEvents ?? value.events,
+    bytes: snapshot.parserBytes ?? value.bytes,
+    diagnostics: snapshot,
+  };
+}
+
+/** Keep the request's observations if the outer wrapper throws after consumption. */
+export function failedResponseEvidence(
+  code: ResponsesCode,
+  diagnostics: ResponseDiagnostics,
+  prior?: ResponseEvidence
+): ResponseEvidence {
+  if (code !== "cleanup_failed" || !diagnostics.snapshot().cleanupFailureCode)
+    diagnostics.fail(code);
+  return evidence(
+    undefined,
+    terminalFor(code),
+    code,
+    prior?.usage,
+    diagnostics
+  );
 }
 export interface CapturedResponse {
   evidence: ResponseEvidence;
@@ -636,10 +699,13 @@ export interface CapturedResponse {
   callId?: string;
   acknowledgement: boolean;
 }
-/** Preserve the actual failed stream terminal. Only code literals already
- * recognized by the HTTP seam are reused here; never classify message text or
- * infer an unsupported refresh/retry policy from an unknown provider error. */
-function structuredStreamFailure(event: SseEvent): ResponsesCode {
+/** Preserve the actual failed stream terminal. Recognize only fixed codes,
+ * including the documented sharing usage failures; never classify message
+ * text or infer a refresh/retry policy from an unknown provider error. */
+function structuredStreamFailure(
+  event: SseEvent,
+  diagnostics?: ResponseDiagnostics
+): ResponsesCode {
   const responseError = record(event.payload?.response)?.error;
   const topError = event.payload?.error;
   const value = (error: unknown): unknown =>
@@ -651,6 +717,11 @@ function structuredStreamFailure(event: SseEvent): ResponsesCode {
   ].filter((code): code is string => typeof code === "string");
   if (new Set(codes).size !== 1) return "response_failed";
   const code = codes[0];
+  diagnostics?.providerCode(code);
+  if (code === "subscription_sharing_usage_limit_exceeded")
+    return "usage_limited";
+  if (code === "subscription_sharing_usage_unavailable")
+    return "temporary_failure";
   if (code === "invalid_scope" || code === "insufficient_scope")
     return "plan_disabled";
   if (code === "temporarily_unavailable") return "temporary_failure";
@@ -660,10 +731,12 @@ function failedCapture(
   code: ResponsesCode,
   framer?: SseFramer,
   usage?: UsageCounts,
-  terminal = terminalFor(code)
+  terminal = terminalFor(code),
+  diagnostics?: ResponseDiagnostics
 ): CapturedResponse {
+  diagnostics?.fail(code);
   return {
-    evidence: evidence(framer, terminal, code, usage),
+    evidence: evidence(framer, terminal, code, usage, diagnostics),
     acknowledgement: false,
   };
 }
@@ -677,7 +750,8 @@ export async function collectCompletedResponse(
   body: OfficialBody,
   TextDecoderCtor: typeof globalThis.TextDecoder,
   mode: "call" | "acknowledgement",
-  cancellation?: ProbeCancellation
+  cancellation?: ProbeCancellation,
+  diagnostics = new ResponseDiagnostics()
 ): Promise<CapturedResponse> {
   let framer: SseFramer | undefined;
   let terminal:
@@ -691,33 +765,46 @@ export async function collectCompletedResponse(
   let sawDone = false;
   const assembler = new CallAssembly(mode === "call");
   try {
-    framer = new SseFramer(TextDecoderCtor);
+    diagnostics.start("consumer");
+    diagnostics.initConsumer();
+    framer = new SseFramer(TextDecoderCtor, diagnostics);
     while (true) {
       cancelled(cancellation);
       const row = await body.read();
       cancelled(cancellation);
       if (row.done) break;
       for (const event of framer.push(row.value)) {
+        diagnostics.event(event.type);
+        diagnostics.start("semantic");
         if (event.type === "[DONE]") {
           if (!terminal || sawDone) throw new ResponsesFault("premature_eof");
           sawDone = true;
+          diagnostics.pass("semantic");
           continue;
         }
         if (terminal || sawDone) throw new ResponsesFault("malformed_sse");
-        if (event.type === "response.failed" || event.type === "error")
+        if (event.type === "response.failed" || event.type === "error") {
+          diagnostics.start("terminal");
           return failedCapture(
-            structuredStreamFailure(event),
+            structuredStreamFailure(event, diagnostics),
             framer,
             usageCounts(record(event.payload?.response)?.usage),
-            "failed"
+            "failed",
+            diagnostics
           );
-        if (event.type === "response.incomplete")
+        }
+        if (event.type === "response.incomplete") {
+          diagnostics.start("terminal");
           return failedCapture(
             "response_incomplete",
             framer,
-            usageCounts(record(event.payload?.response)?.usage)
+            usageCounts(record(event.payload?.response)?.usage),
+            "incomplete",
+            diagnostics
           );
+        }
         if (event.type === "response.completed") {
+          diagnostics.start("terminal");
           const response = record(event.payload?.response);
           if (!response || response.status !== "completed")
             throw new ResponsesFault("invalid_response");
@@ -728,17 +815,28 @@ export async function collectCompletedResponse(
             acknowledgement: done.acknowledgement,
             usage: usageCounts(response.usage),
           };
+          diagnostics.pass("terminal");
         } else assembler.observe(event);
+        diagnostics.pass("semantic");
       }
     }
     framer.finish();
-    if (!terminal) return failedCapture("premature_eof", framer);
+    if (!terminal)
+      return failedCapture(
+        "premature_eof",
+        framer,
+        undefined,
+        "interrupted",
+        diagnostics
+      );
+    diagnostics.pass("consumer");
     return {
       evidence: evidence(
         framer,
         "completed",
         "response_completed",
-        terminal.usage
+        terminal.usage,
+        diagnostics
       ),
       output: terminal.output,
       callId: terminal.callId,
@@ -747,7 +845,10 @@ export async function collectCompletedResponse(
   } catch (error) {
     return failedCapture(
       cancellation?.cancelled ? "cancelled" : responsesErrorCode(error),
-      framer
+      framer,
+      undefined,
+      undefined,
+      diagnostics
     );
   }
 }
@@ -777,7 +878,8 @@ export async function collectCancellation(
   TextDecoderCtor: typeof globalThis.TextDecoder,
   cancellation?: ProbeCancellation,
   onProgress?: (value: CancellationCapture) => void,
-  clock: SigninClock = systemSigninClock
+  clock: SigninClock = systemSigninClock,
+  diagnostics = new ResponseDiagnostics()
 ): Promise<CancellationCapture> {
   let framer: SseFramer | undefined;
   let textDeltaObserved = false;
@@ -787,15 +889,25 @@ export async function collectCancellation(
     terminal: EvidenceTerminal,
     code: ResponsesCode,
     usage?: UsageCounts
-  ): CancellationCapture => ({
-    evidence: evidence(framer, terminal, code, usage),
-    textDeltaObserved,
-    abortRequested,
-    pendingReadRejected,
-  });
+  ): CancellationCapture => {
+    if (
+      terminal !== "not_observed" &&
+      terminal !== "completed" &&
+      code !== "cancellation_demonstrated"
+    )
+      diagnostics.fail(code);
+    return {
+      evidence: evidence(framer, terminal, code, usage, diagnostics),
+      textDeltaObserved,
+      abortRequested,
+      pendingReadRejected,
+    };
+  };
   const assembler = new CallAssembly(false);
   try {
-    framer = new SseFramer(TextDecoderCtor);
+    diagnostics.start("consumer");
+    diagnostics.initConsumer();
+    framer = new SseFramer(TextDecoderCtor, diagnostics);
     while (true) {
       cancelled(cancellation);
       const row = await body.read();
@@ -808,10 +920,12 @@ export async function collectCancellation(
       // Inspect the complete already-buffered batch before abort. Completion in
       // that batch is not evidence of a meaningful cancellation.
       for (const event of events) {
+        diagnostics.event(event.type);
+        diagnostics.start("semantic");
         if (event.type === "response.failed" || event.type === "error")
           return capture(
             "failed",
-            structuredStreamFailure(event),
+            structuredStreamFailure(event, diagnostics),
             usageCounts(record(event.payload?.response)?.usage)
           );
         if (event.type === "response.incomplete")
@@ -823,6 +937,7 @@ export async function collectCancellation(
         if (event.type === "[DONE]")
           return capture("interrupted", "premature_eof");
         if (event.type === "response.completed") {
+          diagnostics.start("terminal");
           const response = record(event.payload?.response);
           if (
             !response ||
@@ -833,6 +948,7 @@ export async function collectCancellation(
             )
           )
             throw new ResponsesFault("invalid_response");
+          diagnostics.pass("terminal");
           return capture(
             "completed",
             "cancellation_not_demonstrated",
@@ -840,6 +956,7 @@ export async function collectCancellation(
           );
         }
         assembler.observe(event);
+        diagnostics.pass("semantic");
         if (
           event.type === "response.output_text.delta" &&
           typeof event.payload?.delta === "string" &&
@@ -893,6 +1010,8 @@ export async function collectCancellation(
       if (result.ok && !result.value.done) {
         // A completed response already buffered in the reader is not cancelled.
         for (const event of framer.push(result.value.value)) {
+          diagnostics.event(event.type);
+          diagnostics.start("semantic");
           if (
             event.type === "response.completed" &&
             record(event.payload?.response)?.status === "completed"
@@ -905,7 +1024,7 @@ export async function collectCancellation(
           if (event.type === "response.failed" || event.type === "error")
             return capture(
               "failed",
-              structuredStreamFailure(event),
+              structuredStreamFailure(event, diagnostics),
               usageCounts(record(event.payload?.response)?.usage)
             );
           if (event.type === "response.incomplete")
@@ -1157,7 +1276,8 @@ export class SyntheticResponses {
       const one = this.reserve(budget, 1);
       attempts = one.attempts;
       this.active(generation, context.cancellation);
-      let firstCapture: CapturedResponse;
+      const firstDiagnostics = new ResponseDiagnostics();
+      let firstCapture: CapturedResponse | undefined;
       try {
         firstCapture = await this.deps.http.requestStream(
           {
@@ -1165,20 +1285,28 @@ export class SyntheticResponses {
             cancellation: context.cancellation,
             json: requestBody(context.modelSlug, input, fixedTools()),
           },
-          (body) =>
-            collectCompletedResponse(
+          async (body) => {
+            firstCapture = await collectCompletedResponse(
               body,
               this.deps.TextDecoder,
               "call",
-              context.cancellation
-            )
+              context.cancellation,
+              firstDiagnostics
+            );
+            return firstCapture;
+          },
+          firstDiagnostics
         );
       } catch (error) {
         const code = responsesErrorCode(error);
-        first = evidence(undefined, terminalFor(code), code);
+        first = failedResponseEvidence(
+          code,
+          firstDiagnostics,
+          firstCapture?.evidence
+        );
         throw error;
       }
-      first = firstCapture.evidence;
+      first = finalizeResponseEvidence(firstCapture.evidence, firstDiagnostics);
       this.active(generation, context.cancellation);
       if (first.code !== "response_completed")
         return result(blocked(first.code) ? "blocked" : "failed", first.code);
@@ -1206,7 +1334,8 @@ export class SyntheticResponses {
       const two = this.reserve(one, 2);
       attempts = two.attempts;
       this.active(generation, context.cancellation);
-      let secondCapture: CapturedResponse;
+      const secondDiagnostics = new ResponseDiagnostics();
+      let secondCapture: CapturedResponse | undefined;
       try {
         secondCapture = await this.deps.http.requestStream(
           {
@@ -1214,20 +1343,31 @@ export class SyntheticResponses {
             cancellation: context.cancellation,
             json: requestBody(context.modelSlug, secondInput, fixedTools()),
           },
-          (body) =>
-            collectCompletedResponse(
+          async (body) => {
+            secondCapture = await collectCompletedResponse(
               body,
               this.deps.TextDecoder,
               "acknowledgement",
-              context.cancellation
-            )
+              context.cancellation,
+              secondDiagnostics
+            );
+            return secondCapture;
+          },
+          secondDiagnostics
         );
       } catch (error) {
         const code = responsesErrorCode(error);
-        second = evidence(undefined, terminalFor(code), code);
+        second = failedResponseEvidence(
+          code,
+          secondDiagnostics,
+          secondCapture?.evidence
+        );
         throw error;
       }
-      second = secondCapture.evidence;
+      second = finalizeResponseEvidence(
+        secondCapture.evidence,
+        secondDiagnostics
+      );
       this.active(generation, context.cancellation);
       if (second.code !== "response_completed")
         return result(blocked(second.code) ? "blocked" : "failed", second.code);
@@ -1259,6 +1399,7 @@ export class SyntheticResponses {
   ): Promise<CancellationResult> {
     let attempts: number | null = null;
     let captured: CancellationCapture | undefined;
+    let diagnostics: ResponseDiagnostics | undefined;
     let cleanupVerified = false;
     const result = (
       outcome: CancellationResult["outcome"],
@@ -1267,7 +1408,23 @@ export class SyntheticResponses {
       outcome,
       code,
       attempts,
-      ...(captured ? { evidence: captured.evidence } : {}),
+      ...(captured
+        ? {
+            evidence: diagnostics
+              ? finalizeResponseEvidence(captured.evidence, diagnostics)
+              : captured.evidence,
+          }
+        : diagnostics
+          ? {
+              evidence: evidence(
+                undefined,
+                terminalFor(code),
+                code,
+                undefined,
+                diagnostics
+              ),
+            }
+          : {}),
       textDeltaObserved: captured?.textDeltaObserved ?? false,
       abortRequested: captured?.abortRequested ?? false,
       pendingReadRejected: captured?.pendingReadRejected ?? false,
@@ -1298,6 +1455,8 @@ export class SyntheticResponses {
       attempts = three.attempts;
       this.active(generation, context.cancellation);
       // Preserve bounded evidence even if transport cleanup subsequently fails.
+      const requestDiagnostics = new ResponseDiagnostics();
+      diagnostics = requestDiagnostics;
       await this.deps.http.requestStream(
         {
           bearer: connection.accessToken,
@@ -1312,10 +1471,12 @@ export class SyntheticResponses {
             (progress) => {
               captured = progress;
             },
-            this.deps.clock
+            this.deps.clock,
+            requestDiagnostics
           );
           return captured;
-        }
+        },
+        requestDiagnostics
       );
       cleanupVerified = true;
       this.active(generation, context.cancellation);
@@ -1335,6 +1496,12 @@ export class SyntheticResponses {
         context.cancellation?.cancelled || generation !== this.generation
           ? "cancelled"
           : responsesErrorCode(error);
+      if (
+        diagnostics &&
+        (code !== "cleanup_failed" ||
+          !diagnostics.snapshot().cleanupFailureCode)
+      )
+        diagnostics.fail(code);
       return result(blocked(code) ? "blocked" : "failed", code);
     } finally {
       this.busy = false;

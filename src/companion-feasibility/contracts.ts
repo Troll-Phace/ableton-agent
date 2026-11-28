@@ -1,5 +1,6 @@
 import type { SigninSnapshot } from "../extension/feasibility/signin-session.js";
 import type { CompanionRuntimeStatus } from "./runtime.js";
+import { DIAGNOSTIC_EXPERIMENT } from "./diagnostic-budget.js";
 
 export const CONTROL_PATH = "/" as const;
 export const PAIR_PATH = "/pair" as const;
@@ -28,6 +29,12 @@ export type ControlAction =
     }
   | { action: "sign_in"; operatorStarted: true; newRegistration?: boolean }
   | { action: "select_model"; operatorStarted: true; modelSlug: string }
+  | {
+      action: "authorize_text_diagnostic" | "run_text_diagnostic";
+      operatorStarted: true;
+      ownerAuthorized: true;
+      experiment: typeof DIAGNOSTIC_EXPERIMENT;
+    }
   | {
       action: "confirm_plan_only";
       operatorStarted: true;
@@ -108,6 +115,18 @@ export function parseControlAction(value: unknown): ControlAction | undefined {
     case "sign_out":
     case "quit":
       return exact(row, keys) ? { action, operatorStarted: true } : undefined;
+    case "authorize_text_diagnostic":
+    case "run_text_diagnostic":
+      return exact(row, [...keys, "ownerAuthorized", "experiment"]) &&
+        row.ownerAuthorized === true &&
+        row.experiment === DIAGNOSTIC_EXPERIMENT
+        ? {
+            action,
+            operatorStarted: true,
+            ownerAuthorized: true,
+            experiment: DIAGNOSTIC_EXPERIMENT,
+          }
+        : undefined;
     case "sign_in":
       if (exact(row, keys)) return { action, operatorStarted: true };
       if (

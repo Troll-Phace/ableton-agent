@@ -1,4 +1,5 @@
 import type { ProbeCancellation } from "./contracts.js";
+import { ResponseDiagnostics } from "./response-diagnostics.js";
 import {
   AUTH_ORIGIN,
   DISCOVERY_ENDPOINT,
@@ -83,7 +84,8 @@ export interface OfficialHttpClient {
   ): Promise<void>;
   requestStream<T>(
     request: OfficialRequest,
-    consume: (body: OfficialBody) => Promise<T>
+    consume: (body: OfficialBody) => Promise<T>,
+    diagnostics?: ResponseDiagnostics
   ): Promise<T>;
 }
 
@@ -269,7 +271,8 @@ export class OfficialHttp implements OfficialHttpClient {
   /** Native SSE only. Consumer owns SSE framing, not the connection resources. */
   async requestStream<T>(
     request: OfficialRequest,
-    consume: (body: OfficialBody) => Promise<T>
+    consume: (body: OfficialBody) => Promise<T>,
+    diagnostics = new ResponseDiagnostics()
   ): Promise<T> {
     return await this.run(
       "responses",
@@ -277,23 +280,44 @@ export class OfficialHttp implements OfficialHttpClient {
       STREAM_TIMEOUT,
       async (body, status, contentType) => {
         if (status < 200 || status >= 300) {
-          const payload = await this.readError(body);
-          throw new SigninFault(classifyHttp(status, payload, "responses"));
+          const payload = await this.readError(body, diagnostics);
+          const code = classifyHttp(status, payload, "responses");
+          diagnostics.fail(code, "status");
+          throw new SigninFault(code);
         }
         if (
           contentType?.split(";")[0]?.trim().toLowerCase() !==
           "text/event-stream"
-        )
+        ) {
+          diagnostics.fail("invalid_response", "headers");
           throw new SigninFault("invalid_response");
-        return await consume(body);
-      }
+        }
+        diagnostics.start("consumer");
+        const value = await consume(body);
+        diagnostics.pass("consumer");
+        return value;
+      },
+      diagnostics
     );
   }
 
-  private async readError(body: OfficialBody): Promise<unknown> {
+  private async readError(
+    body: OfficialBody,
+    diagnostics?: ResponseDiagnostics
+  ): Promise<unknown> {
     try {
-      return await this.readJson(body);
+      const payload = await this.readJson(body);
+      const root = record(payload);
+      diagnostics?.errorShape(
+        root && "error" in root
+          ? "error"
+          : root && "detail" in root
+            ? "detail"
+            : "other"
+      );
+      return payload;
     } catch (error) {
+      diagnostics?.errorShape("unreadable");
       if (errorCode(error) !== "invalid_response")
         throw new SigninFault(errorCode(error));
       return undefined;
@@ -338,11 +362,22 @@ export class OfficialHttp implements OfficialHttpClient {
       body: OfficialBody,
       status: number,
       contentType: string | undefined
-    ) => Promise<T>
+    ) => Promise<T>,
+    diagnostics?: ResponseDiagnostics
   ): Promise<T> {
-    if (this.busy) throw new SigninFault("operation_busy");
-    if (this.tainted) throw new SigninFault("cleanup_failed");
-    if (request.cancellation?.cancelled) throw new SigninFault("cancelled");
+    diagnostics?.start("requestPreparation");
+    if (this.busy) {
+      diagnostics?.fail("operation_busy");
+      throw new SigninFault("operation_busy");
+    }
+    if (this.tainted) {
+      diagnostics?.fail("cleanup_failed");
+      throw new SigninFault("cleanup_failed");
+    }
+    if (request.cancellation?.cancelled) {
+      diagnostics?.fail("cancelled");
+      throw new SigninFault("cancelled");
+    }
     this.busy = true;
     let controller: AbortController | undefined;
     let deadline: SigninDeadline | undefined;
@@ -401,6 +436,8 @@ export class OfficialHttp implements OfficialHttpClient {
       );
       const activeDeadline = deadline;
       activeDeadline.check();
+      diagnostics?.pass("requestPreparation");
+      diagnostics?.start("fetch");
       const pending = this.deps.fetch(url, {
         method,
         headers,
@@ -430,8 +467,15 @@ export class OfficialHttp implements OfficialHttpClient {
         )
         .catch(() => undefined);
       const response = await activeDeadline.wait(pending);
+      if (response) diagnostics?.received();
+      diagnostics?.pass("fetch");
+      diagnostics?.start("body");
       responseBody = response?.body;
+      diagnostics?.body(Boolean(responseBody));
+      diagnostics?.pass("body");
       activeDeadline.check();
+      diagnostics?.start("status");
+      diagnostics?.status(response?.status);
       if (
         !response ||
         !Number.isInteger(response.status) ||
@@ -445,7 +489,9 @@ export class OfficialHttp implements OfficialHttpClient {
         (response.status >= 300 && response.status < 400)
       )
         throw new SigninFault("redirect_rejected");
+      diagnostics?.pass("status");
       if (responseBody) {
+        diagnostics?.start("reader");
         if (typeof responseBody.getReader !== "function")
           throw new SigninFault("invalid_response");
         reader = responseBody.getReader();
@@ -456,6 +502,8 @@ export class OfficialHttp implements OfficialHttpClient {
           typeof reader.releaseLock !== "function"
         )
           throw new SigninFault("invalid_response");
+        diagnostics?.initTransport();
+        diagnostics?.pass("reader");
       }
       const activeReader = reader;
       const wrapped: OfficialBody = {
@@ -473,22 +521,33 @@ export class OfficialHttp implements OfficialHttpClient {
         async read() {
           activeDeadline.check();
           if (!activeReader) return { done: true, value: undefined };
+          diagnostics?.readStarted();
           try {
             const row = await activeDeadline.wait(activeReader.read());
             activeDeadline.check();
-            if (row.done) return row;
+            if (row.done) {
+              diagnostics?.readSettled("eof");
+              diagnostics?.pass("read");
+              return row;
+            }
             if (
               !ArrayBuffer.isView(row.value) ||
               typeof row.value.byteLength !== "number"
-            )
+            ) {
+              diagnostics?.readSettled("invalid");
               throw new SigninFault("invalid_response");
+            }
             bytes += row.value.byteLength;
             chunks++;
+            diagnostics?.readSettled("bytes");
+            diagnostics?.transport(bytes, chunks);
             if (bytes > JSON_LIMIT || chunks > 10000)
               throw new SigninFault("response_limit");
+            diagnostics?.pass("read");
             return row;
           } catch (error) {
             activeDeadline.check();
+            diagnostics?.readSettled("rejected");
             if (
               manuallyAborted &&
               activeController.signal.aborted &&
@@ -499,12 +558,18 @@ export class OfficialHttp implements OfficialHttpClient {
           }
         },
       };
+      diagnostics?.start("headers");
+      let contentType: string | undefined;
+      try {
+        contentType = response.headers?.get("content-type") ?? undefined;
+      } catch (error) {
+        diagnostics?.mime(false);
+        throw error;
+      }
+      diagnostics?.mime(contentType);
+      diagnostics?.pass("headers");
       const value = await activeDeadline.wait(
-        consume(
-          wrapped,
-          response.status,
-          response.headers?.get("content-type") ?? undefined
-        )
+        consume(wrapped, response.status, contentType)
       );
       activeDeadline.check();
       settled = { value };
@@ -515,53 +580,84 @@ export class OfficialHttp implements OfficialHttpClient {
       } catch (interruption) {
         failed = new SigninFault(errorCode(interruption));
       }
+      diagnostics?.fail(failed.code);
     } finally {
       finished = true;
       deadline?.close();
       const cleanup = new SigninDeadline(this.deps.clock, CLEANUP_TIMEOUT);
       let cleanupOk = true;
+      diagnostics?.start("cleanup");
       try {
         try {
-          if (controller && !controller.signal.aborted) controller.abort();
+          if (controller && !controller.signal.aborted) {
+            diagnostics?.start("abort");
+            controller.abort();
+            diagnostics?.pass("abort");
+          }
         } catch {
+          diagnostics?.cleanupFailed("abort");
           cleanupOk = false;
         }
         let pending: Promise<unknown> | undefined;
         try {
-          if (reader && typeof reader.cancel === "function")
+          if (reader && typeof reader.cancel === "function") {
+            diagnostics?.start("readerCancel");
             pending = reader.cancel();
-          else if (responseBody && typeof responseBody.cancel === "function")
+          } else if (
+            responseBody &&
+            typeof responseBody.cancel === "function"
+          ) {
+            diagnostics?.start("readerCancel");
             pending = responseBody.cancel();
+          }
         } catch (error) {
-          if (!isAbort(error)) cleanupOk = false;
+          if (!isAbort(error)) {
+            diagnostics?.cleanupFailed("readerCancel");
+            cleanupOk = false;
+          } else diagnostics?.pass("readerCancel");
         }
         if (reader) {
           try {
+            diagnostics?.start("readerRelease");
             reader.releaseLock();
+            diagnostics?.pass("readerRelease");
           } catch {
+            diagnostics?.cleanupFailed("readerRelease");
             cleanupOk = false;
           }
         }
         if (pending) {
           try {
             await cleanup.wait(pending);
+            diagnostics?.pass("readerCancel");
           } catch (error) {
-            if (!isAbort(error)) cleanupOk = false;
+            if (!isAbort(error)) {
+              diagnostics?.cleanupFailed("readerCancel");
+              cleanupOk = false;
+            } else diagnostics?.pass("readerCancel");
           }
         }
       } finally {
         cleanup.close();
         this.busy = false;
       }
+      if (cleanupOk) diagnostics?.pass("cleanup");
+      else diagnostics?.cleanupFailed();
       if (!cleanupOk) {
         this.tainted = true;
         failed = new SigninFault("cleanup_failed");
       }
-      if (!failed && request.cancellation?.cancelled)
+      if (!failed && request.cancellation?.cancelled) {
+        diagnostics?.fail("cancelled", "settlement");
         failed = new SigninFault("cancelled");
+      }
     }
     if (failed) throw failed;
-    if (!settled) throw new SigninFault("invalid_response");
+    if (!settled) {
+      diagnostics?.fail("invalid_response", "settlement");
+      throw new SigninFault("invalid_response");
+    }
+    diagnostics?.pass("settlement");
     return settled.value;
   }
 }

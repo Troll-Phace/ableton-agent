@@ -10,7 +10,7 @@ The offline build command in the repository root is:
 npx --no-install tsx scripts/build-chatgpt-companion.ts
 ```
 
-The package is produced in `dist/chatgpt-companion/0.0.3/`. Copy or keep that directory as a unit. It contains `companion.cjs` (including the static control HTML), this runbook, project license, exact third-party notices, dependency inventory, and `SHA256SUMS`. It does not contain the Ableton SDK, account credentials, a Node installer, or production extension files. The package requires Node **24.14.1 or later** on macOS and a controlling interactive terminal. No permission, Gatekeeper or sandbox changes are part of this test.
+The package is produced in `dist/chatgpt-companion/0.0.4/`. Copy or keep that directory as a unit. It contains `companion.cjs` (including the static control HTML), this runbook, project license, exact third-party notices, dependency inventory, and `SHA256SUMS`. It does not contain the Ableton SDK, account credentials, a Node installer, or production extension files. The package requires Node **24.14.1 or later** on macOS and a controlling interactive terminal. No permission, Gatekeeper or sandbox changes are part of this test. Retained 0.0.1–0.0.3 packages are historical evidence; do not launch them for this diagnostic.
 
 Before running, Dot and Anthony review the exact version/build ID and digest. From the package directory:
 
@@ -50,16 +50,19 @@ Version 0.0.3 corrects the official authorization host-ID format. The [OpenAI ho
 
 Do not open, copy or edit credential files or reset the budget. A synchronization failure after a rename is an uncertain commit; stop and review rather than assuming rollback. The validated persisted record and counter are reconciled on restart.
 
-## Explicit plan-only synthetic experiment
+## Explicit plan-only one-request diagnostic (0.0.4 only)
+
+**Offline checkpoint only until the owner separately approves the reviewed PR and the exact additional one-request scope.** The previous 0.0.3 synthetic roundtrip consumed its first attempt, returned `invalid_response`, and did not establish provider completion. The displayed zero counters were not reliable. This package cannot replay the original roundtrip or run its cancellation action; `run-budget.json` must already be valid at exactly 1/3 and is read-only, with no recreation, reset or use of its remaining slots. Missing, invalid or uncertain original accounting blocks the new experiment.
 
 After successful restart/refresh:
 
 1. Load the account-specific model catalog and explicitly choose an available model; no default model is selected.
 2. Open the fixed **Manage usage** link (ChatGPT settings) and independently verify plan-only use and disabled credit fallback. In the companion confirm both statements. The application confirmation does not itself control provider billing settings.
-3. Run the fixed synthetic function round trip. It uses two durable attempts, first for `feasibility.echo({value:"p15_3"})` and second for its constant output/acknowledgment.
-4. Only if the round trip completes, run the final synthetic cancellation check. It uses the third durable attempt. If cancellation loses the race, record "not demonstrated" and stop; do not send a fourth request.
+3. Only after separate owner authorization for this exact experiment, check the new authorization statement and select **Authorize named one-request diagnostic**. This creates a separate fixed authorization marker and `response-diagnostic-budget.json` with cap 1 and attempts 0. It makes no inference request. Missing half-records, unexpected temporaries or uncertain commits block; neither record is ever reset or replaced with a new experiment. Do not delete or edit either file.
+4. With the original 1/3 frozen and separate diagnostic 0/1 ready, select **Run fixed text diagnostic (one request)** once. The companion durably records intent and reserves 1/1 before Fetch. It uses the current catalog model, fixed `p15_3` text, explicit history, `store:false`, `stream:true`, and no tools. It accepts only the existing complete terminal/acknowledgment validation. A text-only success does not prove the previous function call works.
+5. Record only sanitized fixed stages, status/MIME category, nullable byte/chunk/event counts, observed terminal, allowlisted error/cleanup codes, and marker acknowledgment. Unknown counts are not zero. On failure, uncertain state, or cancellation, stop for review. Do not retry, run the original function/cancellation experiment, alter storage, or use alternate billing. There is no automatic continuation or diagnostic renewal.
 
-Each reservation is persisted before dispatch. Failed or uncertain sends count; no automatic replay, model substitution, counter reset, alternate provider or paid fallback exists. Denial, invalid identity, missing plan scope, account/eligibility rejection, usage limits or unsupported capability block dependent work.
+The original count remains 1/3 across sign-in, sign-out and restart; the separate cap is exactly 1. Failed or uncertain dispatch counts; an unfinished reservation intent blocks rather than restoring availability. No automatic replay, model substitution, counter reset, alternate provider or paid fallback exists. Denial, invalid identity, missing plan scope, account/eligibility rejection, usage limits or unsupported capability block dependent work. Manual Cancel is available only as an emergency interruption, not a cancellation experiment.
 
 ## Cleanup and evidence
 
