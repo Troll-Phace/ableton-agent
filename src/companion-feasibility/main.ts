@@ -196,9 +196,15 @@ export type CompanionStopReason =
 export type CompanionRuntimeHandle = Pick<
   CompanionRuntime,
   "session" | "status" | "shutdown"
->;
+> &
+  Partial<
+    Pick<CompanionRuntime, "authorizeTextDiagnostic" | "runTextDiagnostic">
+  >;
 export interface CompanionControlContext {
-  runtime: Pick<CompanionRuntimeHandle, "session" | "status">;
+  runtime: Pick<
+    CompanionRuntimeHandle,
+    "session" | "status" | "authorizeTextDiagnostic" | "runTextDiagnostic"
+  >;
   origin: typeof COMPANION_CONTROL_ORIGIN;
   /** Invoke only for authenticated operator activity, not background polling. */
   touch(): void;

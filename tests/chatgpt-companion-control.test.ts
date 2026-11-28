@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createCompanionControl } from "../src/companion-feasibility/control-server.js";
 import { createCompanionRuntime } from "../src/companion-feasibility/runtime.js";
+import { createCompanionStorage } from "../src/companion-feasibility/storage.js";
 import {
   COMPANION_CONTROL_ORIGIN,
   type RunningCompanion,
@@ -479,12 +480,12 @@ describe("F3C owner-paired local control (in process only)", () => {
 async function actualPackageEntry() {
   const root = process.cwd();
   const script = fs.readFileSync("scripts/build-chatgpt-companion.ts", "utf8");
-  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.3");
+  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.4");
   const adapter = /const adapterEntry = `([\s\S]*?)`;/u.exec(script)?.[1];
   if (!adapter) throw Error("Missing companion entry adapter");
   const view = fs
     .readFileSync("src/companion-feasibility/control-view.html", "utf8")
-    .replaceAll("{{COMPANION_VERSION}}", "0.0.3")
+    .replaceAll("{{COMPANION_VERSION}}", "0.0.4")
     .replaceAll("{{BUILD_ID}}", "f3c-offline-test");
   return await build({
     absWorkingDir: root,
@@ -501,7 +502,7 @@ async function actualPackageEntry() {
     target: "node24",
     supported: { "dynamic-import": false },
     define: {
-      __COMPANION_VERSION__: JSON.stringify("0.0.3"),
+      __COMPANION_VERSION__: JSON.stringify("0.0.4"),
       __COMPANION_BUILD_ID__: JSON.stringify("f3c-offline-test"),
       __COMPANION_NODE__: JSON.stringify(">=24.14.1"),
       __COMPANION_VIEW__: JSON.stringify(view),
@@ -528,6 +529,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           "preflight",
           "contracts",
           "control-server",
+          "diagnostic-budget",
+          "response-diagnostic",
         ].map((x) => "src/companion-feasibility/" + x + ".ts"),
         ...[
           "contracts",
@@ -537,6 +540,7 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           "oauth",
           "id-token",
           "responses",
+          "response-diagnostics",
           "signin-session",
         ].map((x) => "src/extension/feasibility/" + x + ".ts"),
       ].sort()
@@ -755,17 +759,22 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     )
       throw Error("Missing launch export");
     expect(entry).toMatchObject({
-      version: "0.0.3",
+      version: "0.0.4",
       buildId: "f3c-offline-test",
       requiredNode: ">=24.14.1",
     });
     const launch = entry.launchCompanion as () => Promise<RunningCompanion>;
+    // Version 0.0.4 is a checkpoint for a frozen original 1/3 budget only.
+    // Seed that one synthetic accounting record; still no credentials/consent.
+    const storage = createCompanionStorage(home.deps);
+    expect(storage.store.reserveInferenceAttempt().attempts).toBe(1);
+    const originalBudget = fs.readFileSync(home.file("run-budget.json"));
     const running = await launch();
     try {
       expect(panel).toHaveBeenCalledTimes(1);
       expect(fakeFetch).not.toHaveBeenCalled();
       expect(external).toEqual([]);
-      expect(fs.readdirSync(home.directory)).toEqual([]);
+      expect(fs.readdirSync(home.directory)).toEqual(["run-budget.json"]);
       expect(terminal).toHaveLength(1);
       const pairing = /([A-Za-z0-9_-]{43})\s*$/u.exec(terminal[0] ?? "")?.[1];
       if (!pairing || !singleton)
@@ -784,7 +793,13 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       expect(body(initial)).toMatchObject({
         ok: true,
         snapshot: { state: "idle", preflightReady: false },
-        runtime: { storage: { state: "ready" } },
+        runtime: {
+          storage: { state: "ready" },
+          diagnostic: {
+            originalAttempts: 1,
+            budget: { state: "not_authorized", attempts: null, cap: 1 },
+          },
+        },
       });
       const checked = await action({
         action: "preflight",
@@ -828,6 +843,9 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       expect(signals.size).toBe(0);
       expect(ephemeral.every((server) => !server.listening)).toBe(true);
       expect(logs.mock.calls).toEqual([]);
+      expect(fs.readFileSync(home.file("run-budget.json"))).toEqual(
+        originalBudget
+      );
       expect(fs.lstatSync(legacy)).toMatchObject({
         ino: priorLegacy.ino,
         mode: priorLegacy.mode,
