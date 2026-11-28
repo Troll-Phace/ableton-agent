@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <title>Ableton Agent — temporary ChatGPT feasibility</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font:
+          14px/1.45 system-ui,
+          -apple-system,
+          sans-serif;
+        color: #f5f5f5;
+        background: #202124;
+      }
+      body {
+        margin: 0;
+        padding: 18px;
+      }
+      main {
+        max-width: 560px;
+        margin: auto;
+      }
+      h1 {
+        font-size: 21px;
+        margin: 0 0 4px;
+        font-weight: 650;
+      }
+      h2 {
+        font-size: 15px;
+        margin: 0 0 8px;
+      }
+      p {
+        margin: 7px 0;
+      }
+      .muted {
+        color: #c1c5cc;
+        font-size: 12px;
+      }
+      .panel {
+        border: 1px solid #484b50;
+        border-radius: 12px;
+        padding: 13px;
+        margin: 12px 0;
+        background: #292b2f;
+      }
+      .status {
+        font-weight: 600;
+        overflow-wrap: anywhere;
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin: 10px 0 0;
+      }
+      button,
+      select {
+        font: inherit;
+        border: 1px solid #646870;
+        border-radius: 8px;
+        padding: 8px 12px;
+        color: #f5f5f5;
+        background: #393c41;
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled,
+      select:disabled {
+        opacity: 0.42;
+        cursor: not-allowed;
+      }
+      button:focus-visible,
+      select:focus-visible,
+      a:focus-visible,
+      input:focus-visible {
+        outline: 2px solid #a8d5ff;
+        outline-offset: 3px;
+      }
+      .chatgpt-button {
+        background: #fff;
+        color: #0d0d0d;
+        border: 1px solid #fff;
+        font-weight: 600;
+        min-height: 44px;
+        width: 100%;
+        border-radius: 10px;
+      }
+      select {
+        flex: 1;
+        min-width: 170px;
+        max-width: 100%;
+      }
+      .indicator {
+        display: inline-flex;
+        color: #d6ffe4;
+        background: #254237;
+        border: 1px solid #4c8c6a;
+        padding: 3px 8px;
+        border-radius: 20px;
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .welcome {
+        border-color: #70b68c;
+        background: #243b31;
+      }
+      label {
+        display: flex;
+        align-items: flex-start;
+        gap: 7px;
+        margin: 8px 0;
+      }
+      label input {
+        flex: 0 0 auto;
+        margin-top: 3px;
+      }
+      a {
+        color: #b8ddff;
+      }
+      pre {
+        margin: 8px 0 0;
+        padding: 10px;
+        max-height: 180px;
+        overflow: auto;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        border: 1px solid #45484d;
+        border-radius: 8px;
+        background: #1b1c1e;
+        font-size: 11px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>ChatGPT sign-in feasibility</h1>
+      <p class="muted" id="identity">
+        Fixture {{FIXTURE_VERSION}} · Build {{BUILD_ID}}
+      </p>
+      <p>
+        This temporary fixture tests only the official ChatGPT plan-use route.
+        It never reads or changes your Live Set. No API-key or paid-credit
+        fallback.
+      </p>
+      <section class="panel" aria-labelledby="status-heading">
+        <h2 id="status-heading">Connection and preflight</h2>
+        <div class="status" id="status" role="status" aria-live="polite">
+          Waiting for the host…
+        </div>
+        <p class="muted" id="guidance">
+          Run the no-credential checks before starting personal consent.
+        </p>
+        <div class="actions">
+          <button id="preflight" disabled>Run no-credential preflight</button
+          ><button id="cancel" disabled>Cancel current check</button>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="consent-heading">
+        <h2 id="consent-heading">Connect your account</h2>
+        <p>
+          Continue in your system browser and personally review sign-in and plan
+          permission. Account entitlement is not presumed.
+        </p>
+        <button
+          class="chatgpt-button"
+          id="signin"
+          data-oai-siwc-button
+          disabled
+        >
+          Continue with ChatGPT
+        </button>
+        <p id="account" class="muted">No verified connection.</p>
+        <div class="actions">
+          <button id="refresh" disabled>
+            Verify persisted connection and refresh</button
+          ><button id="signout" disabled>
+            Sign out and clear local credentials
+          </button>
+        </div>
+        <p id="usage-row" hidden>
+          <a
+            href="https://chatgpt.com/settings/usage"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Manage usage</a
+          >
+        </p>
+      </section>
+      <section
+        class="panel welcome"
+        id="welcome"
+        hidden
+        aria-labelledby="welcome-heading"
+      >
+        <h2 id="welcome-heading">Use your ChatGPT plan in Ableton Agent</h2>
+        <p>
+          Your connection granted ChatGPT plan-use permission. This fixture will
+          use that plan only. Plan limits still apply; there is no paid fallback
+          or purchase action.
+        </p>
+        <div class="actions">
+          <a
+            href="https://chatgpt.com/settings/usage"
+            target="_blank"
+            rel="noopener noreferrer"
+            >Manage usage</a
+          ><button id="dismiss">Got it</button>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="model-heading">
+        <h2 id="model-heading">Select an account-available model</h2>
+        <span id="plan-indicator" class="indicator" hidden
+          >ChatGPT plan use</span
+        >
+        <div class="actions">
+          <button id="models" disabled>Load model catalog</button>
+        </div>
+        <div class="actions">
+          <select id="model" aria-label="Account model" disabled>
+            <option value="">Choose a model</option></select
+          ><button id="select-model" disabled>Use selected model</button>
+        </div>
+      </section>
+      <section class="panel" aria-labelledby="confirm-heading">
+        <h2 id="confirm-heading">Confirm plan-only usage</h2>
+        <p>
+          The experiment permits at most three provider attempts: two for the
+          fixed synthetic function round trip and one for cancellation. Failed
+          or uncertain sends consume their slot.
+        </p>
+        <label
+          ><input type="checkbox" id="plan-only" disabled />I confirm this run
+          must use my ChatGPT plan only.</label
+        >
+        <label
+          ><input type="checkbox" id="credits-off" disabled />I verified credit
+          fallback is disabled. Do not spend extra credits.</label
+        >
+        <button id="confirm" disabled>Confirm plan-only usage</button>
+        <div class="actions">
+          <button id="roundtrip" disabled>
+            Run synthetic function round trip</button
+          ><button id="cancellation" disabled>
+            Run final cancellation check
+          </button>
+        </div>
+        <p class="muted" id="attempts">Durable attempts: not checked.</p>
+      </section>
+      <section class="panel" aria-labelledby="evidence-heading">
+        <h2 id="evidence-heading">Sanitized host evidence</h2>
+        <pre id="evidence">No results yet.</pre>
+      </section>
+    </main>
+    <script>
+      "use strict";
+      const byId = (id) => document.getElementById(id);
+      const buttons = Array.from(document.querySelectorAll("button"));
+      const model = byId("model"),
+        planOnly = byId("plan-only"),
+        creditsOff = byId("credits-off");
+      let current = null,
+        posting = false,
+        polling = false,
+        choicesKey = "",
+        selectedKey = "";
+      const messages = {
+        eligibility_pending:
+          "Integration eligibility is not cleared. No OAuth or inference.",
+        host_preflight_failed:
+          "A host capability was not verified. Stop before OAuth.",
+        restart_required:
+          "Restart Live before the explicit persistence and refresh check.",
+        reconnect_required:
+          "Reconnect or use the authorized refresh action. No automatic replay.",
+        plan_disabled:
+          "ChatGPT plan use was not granted or is unavailable. No paid fallback.",
+        denied: "Personal consent was denied. No automatic retry.",
+        access_denied: "Personal consent was denied. No automatic retry.",
+        usage_limited:
+          "ChatGPT plan usage is limited. Manage usage in ChatGPT; no paid fallback.",
+        plan_only_required:
+          "Explicitly confirm plan-only usage AND disabled credit fallback.",
+        budget_exhausted:
+          "All three durable attempts are consumed. No fourth attempt.",
+        attempt_order_invalid:
+          "A prior attempt was consumed. Do not replay the experiment.",
+        cancellation_not_demonstrated:
+          "Cancellation was not demonstrated. No additional request is permitted.",
+        cleanup_failed:
+          "Cleanup was not verified. Stop and review the host evidence.",
+        storage_failed:
+          "Protected storage or cleanup was not verified. Stop before inference.",
+      };
+      function disable(id, value) {
+        byId(id).disabled = !!value;
+      }
+      function render(data) {
+        current = data;
+        const s = data.snapshot;
+        if (!s) {
+          byId("status").textContent =
+            "Blocked: " + (data.startupCode || "host unavailable");
+          byId("guidance").textContent =
+            "No sign-in or provider request is available.";
+          buttons.forEach((button) => (button.disabled = true));
+          return;
+        }
+        byId("identity").textContent =
+          "Fixture " + data.version + " · Build " + data.buildId;
+        const busy = s.busy || posting;
+        byId("status").textContent =
+          s.state +
+          (s.code ? " · " + s.code : "") +
+          (data.actionCode ? " · " + data.actionCode : "");
+        byId("guidance").textContent =
+          messages[s.code] ||
+          (s.hasConnection && !s.persistedConnectionLoaded
+            ? "Restart Live and reopen this fixture before the refresh check."
+            : s.preflightReady
+              ? "Continue only with explicit operator actions."
+              : "Run the no-credential checks before personal consent.");
+        byId("account").textContent = s.hasConnection
+          ? "Connection 1" +
+            (s.planScopeGranted
+              ? " · plan permission granted"
+              : " · plan permission not granted")
+          : "No verified connection.";
+        byId("usage-row").hidden = !(
+          s.hasConnection || s.code === "usage_limited"
+        );
+        byId("welcome").hidden = !data.welcomeVisible;
+        byId("plan-indicator").hidden = !(
+          s.hasConnection && s.planScopeGranted
+        );
+        disable(
+          "preflight",
+          busy || s.preflightReady || !s.eligibilityBasisReady
+        );
+        disable(
+          "signin",
+          busy ||
+            !s.preflightReady ||
+            !s.eligibilityBasisReady ||
+            (s.hasConnection &&
+              s.state !== "plan_disabled" &&
+              s.state !== "reconnect_required")
+        );
+        disable(
+          "refresh",
+          busy ||
+            !s.preflightReady ||
+            !s.persistedConnectionLoaded ||
+            !s.hasConnection ||
+            s.refreshVerified
+        );
+        disable("models", busy || !s.refreshVerified || s.attempts !== 0);
+        disable("cancel", !s.busy || posting);
+        disable(
+          "signout",
+          posting ||
+            (!s.hasConnection && !s.preflightReady && s.state === "idle")
+        );
+        disable("dismiss", posting);
+        const list = Array.isArray(s.models) ? s.models : [];
+        const nextKey = JSON.stringify(list);
+        if (nextKey !== choicesKey) {
+          choicesKey = nextKey;
+          model.replaceChildren(new Option("Choose a model", ""));
+          list.forEach((choice) =>
+            model.append(new Option(choice.displayName, choice.slug))
+          );
+          model.value = s.selectedModelSlug || "";
+        }
+        if (selectedKey !== (s.selectedModelSlug || "")) {
+          selectedKey = s.selectedModelSlug || "";
+          model.value = selectedKey;
+          planOnly.checked = false;
+          creditsOff.checked = false;
+        }
+        const canSelect =
+          !busy && s.refreshVerified && s.attempts === 0 && list.length > 0;
+        model.disabled = !canSelect;
+        disable("select-model", !canSelect || !model.value);
+        const canConfirm =
+          !busy &&
+          s.selectedModelSlug &&
+          s.attempts === 0 &&
+          s.planScopeGranted;
+        planOnly.disabled = !canConfirm;
+        creditsOff.disabled = !canConfirm;
+        disable(
+          "confirm",
+          !canConfirm || !planOnly.checked || !creditsOff.checked
+        );
+        disable(
+          "roundtrip",
+          busy ||
+            !canConfirm ||
+            !s.planOnlyConfirmed ||
+            !s.creditFallbackDisabled ||
+            !planOnly.checked ||
+            !creditsOff.checked
+        );
+        disable(
+          "cancellation",
+          busy ||
+            s.state !== "roundtrip_complete" ||
+            s.attempts !== 2 ||
+            !s.planOnlyConfirmed ||
+            !s.creditFallbackDisabled
+        );
+        byId("attempts").textContent =
+          "Durable attempts: " +
+          (s.attempts == null ? "not checked" : s.attempts + "/3");
+        byId("evidence").textContent = JSON.stringify(s, null, 2);
+      }
+      function schedule() {
+        if (polling || !current?.snapshot?.busy) return;
+        polling = true;
+        setTimeout(async () => {
+          polling = false;
+          await update("status");
+        }, 400);
+      }
+      async function update(route, method = "GET") {
+        if (method === "POST") {
+          if (posting) return;
+          posting = true;
+          if (current) render(current);
+        }
+        try {
+          const response = await fetch(route, { method, cache: "no-store" });
+          if (!response.ok && response.status !== 409) throw Error();
+          const data = await response.json();
+          if (method === "POST") posting = false;
+          render(data);
+          schedule();
+        } catch {
+          if (method === "POST") posting = false;
+          byId("status").textContent =
+            "Host IPC unavailable. Check the sanitized host evidence.";
+          buttons.forEach((button) => (button.disabled = true));
+          model.disabled = planOnly.disabled = creditsOff.disabled = true;
+        }
+      }
+      const action = (id, route) =>
+        byId(id).addEventListener("click", () => void update(route, "POST"));
+      action("preflight", "preflight");
+      action("signin", "signin");
+      action("refresh", "refresh");
+      action("models", "models");
+      action("roundtrip", "roundtrip");
+      action("cancellation", "cancellation");
+      action("cancel", "cancel");
+      action("signout", "signout");
+      action("dismiss", "dismiss-welcome");
+      byId("select-model").addEventListener("click", () => {
+        if (model.value)
+          void update("model/" + encodeURIComponent(model.value), "POST");
+      });
+      byId("confirm").addEventListener("click", () => {
+        if (planOnly.checked && creditsOff.checked)
+          void update("confirm-plan-only", "POST");
+      });
+      [model, planOnly, creditsOff].forEach((element) =>
+        element.addEventListener("change", () => {
+          if (current) render(current);
+        })
+      );
+      void update("status");
+    </script>
+  </body>
+</html>
