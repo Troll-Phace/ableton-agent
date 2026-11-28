@@ -396,6 +396,7 @@ export function createCompanionControl(
     const diagnosticMode = !!runtime.diagnostic;
     const sdkMode = !!runtime.sdk;
     const sdkLiveProbe = runtime.sdk?.mode === "operator_test";
+    const sdkToolMode = !!runtime.sdkToolRoundtrip;
     if (
       diagnosticMode &&
       (action.action === "run_roundtrip" ||
@@ -403,9 +404,15 @@ export function createCompanionControl(
     )
       throw new ControlFault(403, "invalid_request");
     if (
-      sdkLiveProbe &&
+      (sdkLiveProbe || sdkToolMode) &&
       action.action === "sign_in" &&
       action.newRegistration === true
+    )
+      throw new ControlFault(403, "invalid_request");
+    if (
+      sdkToolMode &&
+      (action.action === "authorize_sdk_diagnostic" ||
+        action.action === "run_sdk_diagnostic")
     )
       throw new ControlFault(403, "invalid_request");
     if (
@@ -472,6 +479,14 @@ export function createCompanionControl(
         )
           throw new ControlFault(403, "invalid_request");
         await context.runtime.authorizeSdkDiagnostic(action.ownerAuthorized);
+        break;
+      case "run_sdk_tool_roundtrip":
+        if (
+          !runtime.sdkToolRoundtrip?.allowanceAvailable ||
+          !context.runtime.runSdkToolRoundtrip
+        )
+          throw new ControlFault(403, "invalid_request");
+        await context.runtime.runSdkToolRoundtrip(action.ownerAuthorized);
         break;
       case "sign_out":
         await s.signOut(operator);

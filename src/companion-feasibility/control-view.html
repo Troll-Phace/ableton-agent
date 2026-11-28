@@ -320,6 +320,29 @@
               reset, or fallback is available.
             </p>
           </div>
+          <div id="sdk-tool-roundtrip" hidden>
+            <p>
+              <strong
+                >SDK synthetic tool roundtrip — offline checkpoint.</strong
+              >
+              No live tool request is authorized or available. All three
+              previous allowances remain frozen.
+            </p>
+            <p id="sdk-tool-budget" class="muted">
+              Historical budgets: not checked.
+            </p>
+            <label
+              ><input type="checkbox" id="sdk-tool-consent" disabled /> Confirm
+              the separate synthetic-only two-step test allowance.</label
+            >
+            <button id="run-sdk-tool-roundtrip" disabled>
+              Run fixed SDK echo roundtrip (synthetic only)
+            </button>
+            <p class="muted">
+              The native package has no usable allowance. No new budget,
+              arbitrary tools, replay, retry, or Live bridge.
+            </p>
+          </div>
         </section>
         <section>
           <h2>5 · Stop or sign out</h2>
@@ -366,6 +389,7 @@
         "run-diagnostic",
         "run-sdk-diagnostic",
         "authorize-sdk-diagnostic",
+        "run-sdk-tool-roundtrip",
         "signout",
         "quit",
       ];
@@ -384,6 +408,7 @@
           $("credits-off").disabled =
           $("diagnostic-consent").disabled =
           $("sdk-consent").disabled =
+          $("sdk-tool-consent").disabled =
             true;
         $("control").hidden = true;
         $("pair-panel").hidden = false;
@@ -413,6 +438,8 @@
         const diagnostic = r.diagnostic;
         const sdk = r.sdk;
         const sdkMode = !!sdk;
+        const sdkTool = r.sdkToolRoundtrip;
+        const sdkToolMode = !!sdkTool;
         const sdkLiveProbe = sdk?.mode === "operator_test" && !!sdk.budget;
         const diagnosticMode = !!diagnostic;
         const initialBudget = diagnosticMode
@@ -421,16 +448,21 @@
         const diagnosticAvailable =
           diagnosticMode &&
           (sdkMode
-            ? (sdkLiveProbe
-                ? ["not_authorized", "ready"].includes(sdk.budget.state)
-                : sdk.allowanceAvailable) &&
+            ? (sdkToolMode
+                ? sdkTool.allowanceAvailable === true &&
+                  sdk?.budget?.state === "exhausted" &&
+                  sdk.budget.attempts === 1
+                : sdkLiveProbe
+                  ? ["not_authorized", "ready"].includes(sdk.budget.state)
+                  : sdk.allowanceAvailable) &&
               diagnostic.budget.state === "exhausted" &&
               diagnostic.budget.attempts === 1
             : ["not_authorized", "ready"].includes(diagnostic.budget.state));
         $("legacy-probes").hidden = diagnosticMode;
         $("legacy-budget-note").hidden = diagnosticMode;
         $("text-diagnostic").hidden = !diagnosticMode || sdkMode;
-        $("sdk-diagnostic").hidden = !sdkMode;
+        $("sdk-diagnostic").hidden = !sdkMode || sdkToolMode;
+        $("sdk-tool-roundtrip").hidden = !sdkToolMode;
         $("authorize-sdk-diagnostic").hidden = !sdkLiveProbe;
         $("sdk-summary").textContent = sdkLiveProbe
           ? "Official SDK one-request operator test. Review the exact artifact and PR before personally operating this experiment. The original and previous diagnostic budgets are frozen."
@@ -517,6 +549,7 @@
           $("plan-only").checked = $("credits-off").checked = false;
           $("diagnostic-consent").checked = false;
           $("sdk-consent").checked = false;
+          $("sdk-tool-consent").checked = false;
         }
         const canSelect =
           !busy &&
@@ -635,6 +668,30 @@
               ? "no verified allowance"
               : sdk.budget.attempts + "/1");
         }
+        const canRunTool =
+          sdkToolMode && sdkTool.allowanceAvailable === true && canAuthorize;
+        $("sdk-tool-consent").disabled = !canRunTool;
+        if (!canRunTool && !busy) $("sdk-tool-consent").checked = false;
+        disable(
+          "run-sdk-tool-roundtrip",
+          !canRunTool || !$("sdk-tool-consent").checked
+        );
+        $("sdk-tool-budget").textContent = sdkToolMode
+          ? "Original: " +
+            (diagnostic?.originalAttempts == null
+              ? "unknown"
+              : diagnostic.originalAttempts + "/3 (frozen)") +
+            " · Prior diagnostic: " +
+            (diagnostic?.budget.attempts == null
+              ? "unknown"
+              : diagnostic.budget.attempts + "/1 (frozen)") +
+            " · SDK text: " +
+            (sdk?.budget?.attempts == null
+              ? "unknown"
+              : sdk.budget.attempts + "/1 (frozen)") +
+            " · Tool allowance: " +
+            (sdkTool.allowanceAvailable ? "synthetic test only" : "none")
+          : "SDK tool roundtrip unavailable.";
         $("evidence").textContent = JSON.stringify(
           { snapshot: s, runtime: r },
           null,
@@ -785,12 +842,20 @@
             experiment: "p15_3_official_sdk_diagnostic",
           });
       });
+      $("run-sdk-tool-roundtrip").addEventListener("click", () => {
+        if ($("sdk-tool-consent").checked)
+          void action("run_sdk_tool_roundtrip", {
+            ownerAuthorized: true,
+            experiment: "p15_3_official_sdk_tool_roundtrip",
+          });
+      });
       [
         "model",
         "plan-only",
         "credits-off",
         "diagnostic-consent",
         "sdk-consent",
+        "sdk-tool-consent",
       ].forEach((id) =>
         $(id).addEventListener("change", () => {
           if (current) render(current);
