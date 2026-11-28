@@ -23,7 +23,9 @@ import {
   DIAGNOSTIC_BUDGET_FILE,
 } from "../src/companion-feasibility/diagnostic-budget.js";
 import { SDK_EXPERIMENT } from "../src/companion-feasibility/sdk-responses.js";
+import { SDK_TOOL_EXPERIMENT } from "../src/companion-feasibility/sdk-tool-roundtrip.js";
 import {
+  SdkBudget,
   SDK_AUTHORIZATION_FILE,
   SDK_BUDGET_FILE,
 } from "../src/companion-feasibility/sdk-budget.js";
@@ -641,12 +643,12 @@ describe("F3C owner-paired local control (in process only)", () => {
 async function actualPackageEntry() {
   const root = process.cwd();
   const script = fs.readFileSync("scripts/build-chatgpt-companion.ts", "utf8");
-  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.6");
+  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.7");
   const adapter = /const adapterEntry = `([\s\S]*?)`;/u.exec(script)?.[1];
   if (!adapter) throw Error("Missing companion entry adapter");
   const view = fs
     .readFileSync("src/companion-feasibility/control-view.html", "utf8")
-    .replaceAll("{{COMPANION_VERSION}}", "0.0.6")
+    .replaceAll("{{COMPANION_VERSION}}", "0.0.7")
     .replaceAll("{{BUILD_ID}}", "f3c-offline-test");
   return await build({
     absWorkingDir: root,
@@ -663,7 +665,7 @@ async function actualPackageEntry() {
     target: "node24",
     supported: { "dynamic-import": false },
     define: {
-      __COMPANION_VERSION__: JSON.stringify("0.0.6"),
+      __COMPANION_VERSION__: JSON.stringify("0.0.7"),
       __COMPANION_BUILD_ID__: JSON.stringify("f3c-offline-test"),
       __COMPANION_NODE__: JSON.stringify(">=24.14.1"),
       __COMPANION_VIEW__: JSON.stringify(view),
@@ -694,6 +696,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           "response-diagnostic",
           "sdk-responses",
           "sdk-budget",
+          "sdk-stream",
+          "sdk-tool-roundtrip",
         ].map((x) => "src/companion-feasibility/" + x + ".ts"),
         ...[
           "contracts",
@@ -930,13 +934,13 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     )
       throw Error("Missing launch export");
     expect(entry).toMatchObject({
-      version: "0.0.6",
+      version: "0.0.7",
       buildId: "f3c-offline-test",
       requiredNode: ">=24.14.1",
     });
     const launch = entry.launchCompanion as () => Promise<RunningCompanion>;
-    // Version 0.0.6 freezes both exhausted experiment records and permits no
-    // SDK request until explicitly authorized. Seed only old accounting.
+    // Version 0.0.7 freezes all three historical budgets. Its new tool
+    // checkpoint has no usable native allowance. Seed only old accounting.
     const storage = createCompanionStorage(home.deps);
     expect(storage.store.reserveInferenceAttempt().attempts).toBe(1);
     const originalBudget = fs.readFileSync(home.file("run-budget.json"));
@@ -949,6 +953,15 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     const diagnosticAuthorization = fs.readFileSync(
       home.file(DIAGNOSTIC_AUTHORIZATION_FILE)
     );
+    const sdkBudget = new SdkBudget(
+      createCompanionStorage(home.deps, true, true).sdkDiagnosticRecords()
+    );
+    sdkBudget.authorize(true);
+    sdkBudget.reserve();
+    const priorSdkBudget = fs.readFileSync(home.file(SDK_BUDGET_FILE));
+    const priorSdkAuthorization = fs.readFileSync(
+      home.file(SDK_AUTHORIZATION_FILE)
+    );
     const running = await launch();
     try {
       expect(panel).toHaveBeenCalledTimes(1);
@@ -958,6 +971,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
         [
           DIAGNOSTIC_AUTHORIZATION_FILE,
           DIAGNOSTIC_BUDGET_FILE,
+          SDK_BUDGET_FILE,
+          SDK_AUTHORIZATION_FILE,
           "run-budget.json",
         ].sort()
       );
@@ -975,6 +990,24 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
         request(handler, ACTION_PATH, payload, {
           headers: { cookie, [CSRF_HEADER]: csrf },
         }).reply;
+      const toolGesture = {
+        action: "run_sdk_tool_roundtrip",
+        operatorStarted: true,
+        ownerAuthorized: true,
+        experiment: SDK_TOOL_EXPERIMENT,
+      };
+      assertError(
+        await request(handler, ACTION_PATH, toolGesture).reply,
+        401,
+        "session_required"
+      );
+      assertError(
+        await request(handler, ACTION_PATH, toolGesture, {
+          headers: { cookie },
+        }).reply,
+        403,
+        "csrf_rejected"
+      );
       const initial = await action({ action: "status" });
       expect(body(initial)).toMatchObject({
         ok: true,
@@ -987,8 +1020,13 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           },
           sdk: {
             experiment: SDK_EXPERIMENT,
-            mode: "operator_test",
-            budget: { cap: 1, state: "not_authorized", attempts: null },
+            mode: "offline_only",
+            budget: { cap: 1, state: "exhausted", attempts: 1 },
+            allowanceAvailable: false,
+          },
+          sdkToolRoundtrip: {
+            experiment: SDK_TOOL_EXPERIMENT,
+            mode: "offline_only",
             allowanceAvailable: false,
           },
         },
@@ -1020,6 +1058,18 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       });
       for (const payload of [
         {
+          action: "run_sdk_tool_roundtrip",
+          operatorStarted: true,
+          ownerAuthorized: true,
+          experiment: SDK_TOOL_EXPERIMENT,
+        },
+        {
+          action: "authorize_sdk_diagnostic",
+          operatorStarted: true,
+          ownerAuthorized: true,
+          experiment: SDK_EXPERIMENT,
+        },
+        {
           action: "run_sdk_diagnostic",
           operatorStarted: true,
           ownerAuthorized: true,
@@ -1046,8 +1096,12 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       }
       expect(calls).toEqual(["/companion-stream", "/companion-abort"]);
       expect(external).toEqual([]);
-      expect(fs.existsSync(home.file(SDK_AUTHORIZATION_FILE))).toBe(false);
-      expect(fs.existsSync(home.file(SDK_BUDGET_FILE))).toBe(false);
+      expect(fs.readFileSync(home.file(SDK_AUTHORIZATION_FILE))).toEqual(
+        priorSdkAuthorization
+      );
+      expect(fs.readFileSync(home.file(SDK_BUDGET_FILE))).toEqual(
+        priorSdkBudget
+      );
       expect(panel).toHaveBeenCalledTimes(1);
       expect(checked.body).not.toContain(pairing);
       expect(checked.body).not.toContain(csrf);
@@ -1071,6 +1125,12 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       );
       expect(fs.readFileSync(home.file(DIAGNOSTIC_AUTHORIZATION_FILE))).toEqual(
         diagnosticAuthorization
+      );
+      expect(fs.readFileSync(home.file(SDK_AUTHORIZATION_FILE))).toEqual(
+        priorSdkAuthorization
+      );
+      expect(fs.readFileSync(home.file(SDK_BUDGET_FILE))).toEqual(
+        priorSdkBudget
       );
       expect(fs.lstatSync(legacy)).toMatchObject({
         ino: priorLegacy.ino,

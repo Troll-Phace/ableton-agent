@@ -324,7 +324,8 @@ export class CompanionStorage {
   constructor(
     private readonly deps: CompanionStorageDependencies,
     private readonly freezeOriginalBudget = false,
-    private readonly freezeDiagnosticBudget = false
+    private readonly freezeDiagnosticBudget = false,
+    private readonly freezeSdkBudget = false
   ) {
     this.entries = prepareDirectories(deps);
     const root = this.entries[2];
@@ -459,6 +460,8 @@ export class CompanionStorage {
         throw new CompanionStorageFault("storage_unsafe");
       if (this.freezeDiagnosticBudget && DIAGNOSTIC_TEMP.test(base))
         throw new CompanionStorageFault("storage_unsafe");
+      if (this.freezeSdkBudget && SDK_TEMP.test(base))
+        throw new CompanionStorageFault("storage_unsafe");
       if (optionalStat(native, name))
         throw new CompanionStorageFault("storage_unsafe");
       descriptor = { file: name, mode: "write" };
@@ -538,6 +541,11 @@ export class CompanionStorage {
     const sourceName = this.file(from);
     const targetName = this.file(to);
     if (
+      this.freezeSdkBudget &&
+      (targetName === SDK_AUTHORIZATION_FILE || targetName === SDK_BUDGET_FILE)
+    )
+      throw new CompanionStorageFault("storage_unsafe");
+    if (
       this.freezeDiagnosticBudget &&
       (targetName === DIAGNOSTIC_AUTHORIZATION_FILE ||
         targetName === DIAGNOSTIC_BUDGET_FILE)
@@ -599,6 +607,13 @@ export class CompanionStorage {
     this.assertReady();
     this.verifyTree();
     const base = this.file(name);
+    if (
+      this.freezeSdkBudget &&
+      (base === SDK_AUTHORIZATION_FILE ||
+        base === SDK_BUDGET_FILE ||
+        SDK_TEMP.test(base))
+    )
+      throw new CompanionStorageFault("storage_unsafe");
     if (
       this.freezeDiagnosticBudget &&
       (base === DIAGNOSTIC_AUTHORIZATION_FILE ||
@@ -808,6 +823,7 @@ export class CompanionStorage {
       write: (name, value) => {
         assertHistoricalFrozen();
         assertNoSdkTemporaries();
+        if (this.freezeSdkBudget) throw new SigninFault("budget_exhausted");
         this.syntheticWrite(checked(name), value);
       },
     };
@@ -931,11 +947,13 @@ export class CompanionStorage {
 export function createCompanionStorage(
   deps: CompanionStorageDependencies = nativeCompanionStorageDependencies(),
   freezeOriginalBudget = false,
-  freezeDiagnosticBudget = false
+  freezeDiagnosticBudget = false,
+  freezeSdkBudget = false
 ): CompanionStorage {
   return new CompanionStorage(
     deps,
     freezeOriginalBudget,
-    freezeDiagnosticBudget
+    freezeDiagnosticBudget,
+    freezeSdkBudget
   );
 }

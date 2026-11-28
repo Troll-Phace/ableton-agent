@@ -28,10 +28,16 @@ import { SigninSession } from "../extension/feasibility/signin-session.js";
 import { DiagnosticBudget } from "./diagnostic-budget.js";
 import { SdkBudget, type SdkBudgetStatus } from "./sdk-budget.js";
 import {
+  SDK_EXPERIMENT,
   SdkResponses,
   type SdkDiagnosticAuthorization,
   type SdkDiagnosticStatus,
 } from "./sdk-responses.js";
+import {
+  SdkToolRoundtrip,
+  type SdkToolRoundtripAuthorization,
+  type SdkToolRoundtripStatus,
+} from "./sdk-tool-roundtrip.js";
 import {
   ResponseDiagnostic,
   type TextDiagnosticStatus,
@@ -72,6 +78,9 @@ export interface CompanionRuntimeDependencies extends OfficialHttpDependencies {
   sdkMode?: boolean;
   /** 0.0.6: separate explicit durable owner-operated one-request experiment. */
   sdkLiveProbe?: boolean;
+  /** 0.0.7 offline tool proof; no live allowance or durable new budget. */
+  sdkToolRoundtripMode?: boolean;
+  sdkToolRoundtripAuthorization?: SdkToolRoundtripAuthorization;
   /** Synthetic direct-runtime tests only. Never configured by the packaged CLI. */
   sdkAuthorization?: SdkDiagnosticAuthorization;
   browser: BrowserLauncher;
@@ -102,7 +111,7 @@ export function nativeCompanionRuntimeDependencies(): CompanionRuntimeDependenci
     eligibilityBasisReady: true,
     diagnosticMode: true,
     sdkMode: true,
-    sdkLiveProbe: true,
+    sdkToolRoundtripMode: true,
     browser: (url, cancellation) =>
       launchAuthorizationBrowser(
         url,
@@ -122,6 +131,7 @@ export interface CompanionRuntimeStatus {
   preflight?: CompanionPreflightReport;
   diagnostic?: TextDiagnosticStatus;
   sdk?: SdkRuntimeStatus;
+  sdkToolRoundtrip?: SdkToolRoundtripStatus;
 }
 export interface SdkRuntimeStatus extends Omit<SdkDiagnosticStatus, "mode"> {
   mode: "offline_only" | "operator_test";
@@ -142,18 +152,23 @@ export class CompanionRuntime {
   private readonly diagnostic?: ResponseDiagnostic;
   private readonly sdk?: SdkResponses;
   private readonly sdkLiveBudget?: SdkBudget;
+  private readonly priorSdkBudget?: SdkBudget;
+  private readonly sdkToolRoundtrip?: SdkToolRoundtrip;
   private readonly priorDiagnosticBudget?: DiagnosticBudget;
   private readonly stopControl = createProbeCancellation();
   private readonly requests = new Set<Promise<unknown>>();
   private shutdownTask?: Promise<CompanionRuntimeShutdown>;
 
   constructor(private readonly deps: CompanionRuntimeDependencies) {
-    const sdkMode = deps.sdkMode === true || deps.sdkLiveProbe === true;
+    const sdkToolMode = deps.sdkToolRoundtripMode === true;
+    const sdkLiveProbe = deps.sdkLiveProbe === true && !sdkToolMode;
+    const sdkMode = deps.sdkMode === true || sdkLiveProbe || sdkToolMode;
     const diagnosticMode = sdkMode || deps.diagnosticMode === true;
     this.storage = createCompanionStorage(
       deps.storage,
       diagnosticMode,
-      sdkMode
+      sdkMode,
+      sdkToolMode
     );
     const persisted = this.storage.store;
     const store: SigninPersistence = diagnosticMode
@@ -161,7 +176,7 @@ export class CompanionRuntime {
           ensureHostId: () => persisted.ensureHostId(),
           selectedRegistration: () => {
             const selected = persisted.selectedRegistration();
-            if (deps.sdkLiveProbe === true && !selected)
+            if ((sdkLiveProbe || sdkToolMode) && !selected)
               throw new SigninFault("reconnect_required");
             return selected;
           },
@@ -254,46 +269,70 @@ export class CompanionRuntime {
     if (sdkMode) {
       const prior = new DiagnosticBudget(this.storage.diagnosticRecords());
       this.priorDiagnosticBudget = prior;
-      const liveBudget =
-        deps.sdkLiveProbe === true
-          ? new SdkBudget(this.storage.sdkDiagnosticRecords())
-          : undefined;
+      const liveBudget = sdkLiveProbe
+        ? new SdkBudget(this.storage.sdkDiagnosticRecords())
+        : undefined;
       this.sdkLiveBudget = liveBudget;
       let reservationConfirmed = false;
-      this.sdk = new SdkResponses({
-        fetch: deps.fetch,
-        AbortController: deps.AbortController,
-        clock: deps.clock,
-        loadConnection: () => this.storage.store.loadSelectedConnection(),
-        assertFrozenBudgets: () => {
-          if (this.stopControl.cancelled) throw new SigninFault("cancelled");
-          this.storage.frozenOriginalBudget();
-          const state = prior.status();
-          if (state.state !== "exhausted" || state.attempts !== 1)
-            throw new SigninFault("storage_invalid");
-          if (liveBudget) {
-            const current = liveBudget.status();
+      if (!sdkToolMode)
+        this.sdk = new SdkResponses({
+          fetch: deps.fetch,
+          AbortController: deps.AbortController,
+          clock: deps.clock,
+          loadConnection: () => this.storage.store.loadSelectedConnection(),
+          assertFrozenBudgets: () => {
+            if (this.stopControl.cancelled) throw new SigninFault("cancelled");
+            this.storage.frozenOriginalBudget();
+            const state = prior.status();
+            if (state.state !== "exhausted" || state.attempts !== 1)
+              throw new SigninFault("storage_invalid");
+            if (liveBudget) {
+              const current = liveBudget.status();
+              if (
+                reservationConfirmed
+                  ? current.state !== "exhausted" || current.attempts !== 1
+                  : current.state !== "ready" || current.attempts !== 0
+              )
+                throw new SigninFault("storage_invalid");
+            }
+          },
+          // The live-probe composition cannot use synthetic allowance injection.
+          authorization: liveBudget
+            ? {
+                isAuthorized: () => liveBudget.status().state === "ready",
+                reserve: () => {
+                  const reserved = liveBudget.reserve();
+                  reservationConfirmed =
+                    reserved.state === "exhausted" && reserved.attempts === 1;
+                  return reservationConfirmed;
+                },
+              }
+            : deps.sdkAuthorization,
+        });
+      if (sdkToolMode) {
+        const priorSdk = new SdkBudget(this.storage.sdkDiagnosticRecords());
+        this.priorSdkBudget = priorSdk;
+        this.sdkToolRoundtrip = new SdkToolRoundtrip({
+          fetch: deps.fetch,
+          AbortController: deps.AbortController,
+          clock: deps.clock,
+          loadConnection: () => this.storage.store.loadSelectedConnection(),
+          assertFrozenBudgets: () => {
+            if (this.stopControl.cancelled) throw new SigninFault("cancelled");
+            this.storage.frozenOriginalBudget();
+            const previous = prior.status();
+            const sdkText = priorSdk.status();
             if (
-              reservationConfirmed
-                ? current.state !== "exhausted" || current.attempts !== 1
-                : current.state !== "ready" || current.attempts !== 0
+              previous.state !== "exhausted" ||
+              previous.attempts !== 1 ||
+              sdkText.state !== "exhausted" ||
+              sdkText.attempts !== 1
             )
               throw new SigninFault("storage_invalid");
-          }
-        },
-        // The live-probe composition cannot use synthetic allowance injection.
-        authorization: liveBudget
-          ? {
-              isAuthorized: () => liveBudget.status().state === "ready",
-              reserve: () => {
-                const reserved = liveBudget.reserve();
-                reservationConfirmed =
-                  reserved.state === "exhausted" && reserved.attempts === 1;
-                return reservationConfirmed;
-              },
-            }
-          : deps.sdkAuthorization,
-      });
+          },
+          authorization: deps.sdkToolRoundtripAuthorization,
+        });
+      }
     }
     this.session = new SigninSession({
       eligibilityBasisReady: deps.eligibilityBasisReady,
@@ -340,6 +379,18 @@ export class CompanionRuntime {
                 }
               : this.sdk.status(),
           }
+        : this.priorSdkBudget
+          ? {
+              sdk: {
+                experiment: SDK_EXPERIMENT,
+                mode: "offline_only" as const,
+                allowanceAvailable: false,
+                budget: this.priorSdkBudget.status(),
+              },
+            }
+          : {}),
+      ...(this.sdkToolRoundtrip
+        ? { sdkToolRoundtrip: this.sdkToolRoundtrip.status() }
         : {}),
     };
   }
@@ -422,6 +473,28 @@ export class CompanionRuntime {
         }
       },
       (result) => sdk.publish(result)
+    );
+  }
+
+  /** One session generation spans both fixed SDK requests. No native allowance. */
+  async runSdkToolRoundtrip(ownerAuthorized: boolean): Promise<void> {
+    const tool = this.sdkToolRoundtrip;
+    if (!tool || ownerAuthorized !== true)
+      throw new SigninFault("operator_required");
+    if (!tool.status().allowanceAvailable)
+      throw new SigninFault("budget_exhausted");
+    await this.session.runSdkToolRoundtrip(
+      { operatorStarted: true },
+      async (context) => {
+        const task = tool.run(context, ownerAuthorized);
+        this.requests.add(task);
+        try {
+          return await task;
+        } finally {
+          this.requests.delete(task);
+        }
+      },
+      (result) => tool.publish(result)
     );
   }
 

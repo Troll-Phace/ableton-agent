@@ -204,6 +204,7 @@ export type CompanionRuntimeHandle = Pick<
       | "runTextDiagnostic"
       | "authorizeSdkDiagnostic"
       | "runSdkDiagnostic"
+      | "runSdkToolRoundtrip"
     >
   >;
 export interface CompanionControlContext {
@@ -215,6 +216,7 @@ export interface CompanionControlContext {
     | "runTextDiagnostic"
     | "authorizeSdkDiagnostic"
     | "runSdkDiagnostic"
+    | "runSdkToolRoundtrip"
   >;
   origin: typeof COMPANION_CONTROL_ORIGIN;
   /** Invoke only for authenticated operator activity, not background polling. */

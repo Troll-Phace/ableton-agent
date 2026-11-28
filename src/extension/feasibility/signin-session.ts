@@ -750,6 +750,31 @@ export class SigninSession {
     });
   }
 
+  /** Companion-only two-request synthetic SDK proof. The same verified session
+   * generation spans both requests; the original three-request cap is frozen. */
+  async runSdkToolRoundtrip<
+    T extends { outcome: "pass" | "blocked" | "failed"; code: ResponsesCode },
+  >(
+    action: OperatorAction,
+    run: (context: InferenceContext) => Promise<T>,
+    publish: (result: T) => void
+  ): Promise<SigninSnapshot> {
+    return await this.perform(ROUNDTRIP_TIMEOUT, async (operation) => {
+      if (!this.deps.diagnosticMode || this.updateBudget() !== 1)
+        throw new SessionFault("attempt_order_invalid");
+      const context = this.inferenceContext(action, operation);
+      this.set("validating");
+      const result = await run(context);
+      operation.check();
+      this.updateBudget();
+      publish(result);
+      if (result.outcome === "pass" && result.code === "roundtrip_complete")
+        this.set("finished", "roundtrip_complete");
+      else
+        this.fail(result.outcome === "pass" ? "invalid_response" : result.code);
+    });
+  }
+
   /** Cancels promptly, invalidates all late state and discards transient catalog/proof. */
   cancel(): SigninSnapshot {
     if (this.signingOut) return this.snapshot();
