@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "noEmit": true,
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "esnext",
+    "lib": ["esnext"],
+    "types": ["node"],
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": [
+    "src/companion-feasibility/**/*",
+    "src/extension/feasibility/signin-contracts.ts",
+    "src/extension/feasibility/official-http.ts",
+    "src/extension/feasibility/id-token.ts",
+    "src/extension/feasibility/oauth.ts",
+    "src/extension/feasibility/credential-store.ts",
+    "src/extension/feasibility/responses.ts",
+    "src/extension/feasibility/signin-session.ts",
+    "src/extension/feasibility/contracts.ts"
+  ]
+}

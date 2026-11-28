@@ -8,6 +8,8 @@ import {
   errorCode,
   record,
   validUuid,
+  validHostId,
+  hostIdFromUuid,
   type Registration,
   type RequestBudget,
   type SigninPersistence,
@@ -326,17 +328,23 @@ export class CredentialStore implements SigninPersistence {
     this.directory = deps.path.join(storageDirectory, SIGNIN_STORAGE_DIRECTORY);
   }
 
-  /** Creates/validates a persisted UUID host identifier. */
+  /** Persist canonical UUIDv4 URI; atomically upgrade an exact legacy raw v4
+   * record without generating a new host identity or touching the budget. */
   ensureHostId(): string {
     return this.protected(() => {
       const existing = this.read(HOST_FILE);
       if (existing !== undefined) {
         const row = record(existing);
-        if (!row || row.version !== 1 || !validUuid(row.hostId))
+        if (!row || row.version !== 1 || Object.keys(row).length !== 2)
           throw new SigninFault("storage_invalid");
-        return row.hostId;
+        if (validHostId(row.hostId)) return row.hostId;
+        const migrated = hostIdFromUuid(row.hostId);
+        if (!migrated) throw new SigninFault("storage_invalid");
+        this.write(HOST_FILE, { version: 1, hostId: migrated });
+        return migrated;
       }
-      const hostId = this.uuid();
+      const hostId = hostIdFromUuid(this.uuid());
+      if (!hostId) throw new SigninFault("storage_failed");
       this.write(HOST_FILE, { version: 1, hostId });
       return hostId;
     });

@@ -1,4 +1,5 @@
 import * as crypto from "node:crypto";
+import * as fs from "node:fs";
 import type * as childProcess from "node:child_process";
 import { URL } from "node:url";
 
@@ -38,6 +39,8 @@ import {
   idTokens,
   json,
   LOCAL_ID,
+  HOST_UUID,
+  HOST_URI,
   makeConnection,
   makeOAuthFixture,
   makeStorage,
@@ -86,7 +89,7 @@ describe("S5 OAuth protocol and bounded callback", () => {
     );
     const redirectUri = "http://127.0.0.1:12345/auth/callback";
     const url = new URL(
-      buildAuthorizationUrl({ hostId: LOCAL_ID, redirectUri, pkce })
+      buildAuthorizationUrl({ hostId: HOST_URI, redirectUri, pkce })
     );
     expect(url.origin + url.pathname).toBe(AUTHORIZATION_ENDPOINT);
     expect(Object.fromEntries(url.searchParams)).toEqual({
@@ -100,11 +103,11 @@ describe("S5 OAuth protocol and bounded callback", () => {
       state: pkce.state,
       nonce: pkce.nonce,
       agent_name_hint: "Ableton Agent",
-      ext_agent_host_id: LOCAL_ID,
+      ext_agent_host_id: HOST_URI,
     });
     const reused = new URL(
       buildAuthorizationUrl({
-        hostId: LOCAL_ID,
+        hostId: HOST_URI,
         redirectUri,
         pkce,
         clientId: CLIENT,
@@ -112,8 +115,29 @@ describe("S5 OAuth protocol and bounded callback", () => {
     );
     expect(reused.searchParams.get("client_id")).toBe(CLIENT);
     expect(reused.searchParams.has("agent_name_hint")).toBe(false);
-    expect(reused.searchParams.get("ext_agent_host_id")).toBe(LOCAL_ID);
+    expect(reused.searchParams.get("ext_agent_host_id")).toBe(HOST_URI);
+    expect(reused.searchParams.get("ext_agent_host_id")).not.toBe(HOST_UUID);
+    expect(url.searchParams.getAll("ext_agent_host_id")).toEqual([HOST_URI]);
   });
+
+  it.each([
+    HOST_UUID,
+    "urn:uuid:01234567-89ab-1cde-8f01-23456789abcd",
+    "urn:uuid:01234567-89ab-4cde-0f01-23456789abcd",
+    "urn:uuid:not-a-uuid",
+    "https://example.invalid/host",
+  ])(
+    "rejects noncanonical or invalid host ID before creating an authorization URL (%s)",
+    (hostId) => {
+      expect(() =>
+        buildAuthorizationUrl({
+          hostId,
+          redirectUri: "http://127.0.0.1:12345/auth/callback",
+          pkce: createPkceMaterial(crypto),
+        })
+      ).toThrow("callback_invalid");
+    }
+  );
 
   it("rejects wrong-state, duplicate, wrong path and oversize callback without consuming the valid attempt", async () => {
     const callbacks = fakeCallbacks();
@@ -260,7 +284,7 @@ describe("S5 OAuth protocol and bounded callback", () => {
       })
     );
     const url = buildAuthorizationUrl({
-      hostId: LOCAL_ID,
+      hostId: HOST_URI,
       redirectUri: "http://127.0.0.1:12345/auth/callback",
       pkce: createPkceMaterial(crypto),
     });
@@ -646,6 +670,10 @@ describe("S5 OAuth lifecycle with fake HTTP/browser and actual protected storage
     expect(auth.searchParams.get("ext_agent_host_id")).toBe(
       s.store.ensureHostId()
     );
+    expect(auth.searchParams.get("ext_agent_host_id")).toMatch(
+      /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+    expect(auth.searchParams.getAll("ext_agent_host_id")).toHaveLength(1);
     const exchange = f.network.calls.find(
       (row) => row.url === TOKEN_ENDPOINT
     )?.init;
@@ -697,6 +725,26 @@ describe("S5 OAuth lifecycle with fake HTTP/browser and actual protected storage
     );
     expect(f.network.unexpected).toEqual([]);
   });
+  it("converts a synthetic legacy host record before the first mocked authorization and never transmits a bare host UUID", async () => {
+    const s = storage();
+    s.store.ensureHostId();
+    const budget = s.store.reserveInferenceAttempt();
+    fs.writeFileSync(
+      s.file("host.json"),
+      JSON.stringify({ version: 1, hostId: HOST_UUID })
+    );
+    const f = makeOAuthFixture(s);
+    f.network.enqueueDiscovery();
+    f.enqueueSignin();
+    const lifecycle = new OAuthLifecycle(f.deps);
+    await lifecycle.signIn(APPROVED);
+    const auth = new URL(f.browser.mock.calls[0]?.[0] ?? "");
+    expect(auth.searchParams.getAll("ext_agent_host_id")).toEqual([HOST_URI]);
+    expect(s.store.ensureHostId()).toBe(HOST_URI);
+    expect(s.store.getBudget()).toEqual(budget);
+    expect(f.network.unexpected).toEqual([]);
+  });
+
   it("denial without token exchange leaves no credential and no retry", async () => {
     const s = storage();
     const f = makeOAuthFixture(s);

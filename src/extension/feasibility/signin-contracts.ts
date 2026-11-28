@@ -144,6 +144,7 @@ export interface RequestBudget {
 /** All persistence is synchronous and atomic so a generation check can precede
  * the write without a cancellation/sign-out race. */
 export interface SigninPersistence {
+  /** Canonical persisted UUIDv4 URI; never a raw UUID or user identifier. */
   ensureHostId(): string;
   selectedRegistration(): Registration | undefined;
   loadSelectedConnection(): StoredConnection | undefined;
@@ -192,5 +193,28 @@ export function validUuid(value: unknown): value is string {
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
       value
     )
+  );
+}
+
+/** Derive the documented UUIDv4 host URI without changing the underlying UUID.
+ * Only raw, hyphenated RFC-variant v4 values are accepted for legacy migration. */
+export function hostIdFromUuid(value: unknown): string | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length !== 36 ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+      value
+    )
+  )
+    return undefined;
+  return `urn:uuid:${value.toLowerCase()}`;
+}
+
+/** Persisted and transmitted host IDs must be in the canonical URI form. */
+export function validHostId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.startsWith("urn:uuid:") &&
+    hostIdFromUuid(value.slice("urn:uuid:".length)) === value
   );
 }
