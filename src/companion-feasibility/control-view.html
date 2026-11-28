@@ -296,6 +296,25 @@
               failure or uncertainty.
             </p>
           </div>
+          <div id="sdk-diagnostic" hidden>
+            <p>
+              <strong>Official SDK offline checkpoint.</strong> No live model
+              request is authorized or available in this package. The original
+              and previous diagnostic budgets are frozen.
+            </p>
+            <p id="sdk-budget" class="muted">Previous budget: not checked.</p>
+            <label
+              ><input type="checkbox" id="sdk-consent" disabled /> Confirm the
+              separate synthetic SDK test authorization.</label
+            >
+            <button id="run-sdk-diagnostic" disabled>
+              Run fixed SDK text diagnostic
+            </button>
+            <p class="muted">
+              The native package cannot enable this action. No retry, budget
+              reset, or fallback is available.
+            </p>
+          </div>
         </section>
         <section>
           <h2>5 · Stop or sign out</h2>
@@ -340,6 +359,7 @@
         "cancellation",
         "authorize-diagnostic",
         "run-diagnostic",
+        "run-sdk-diagnostic",
         "signout",
         "quit",
       ];
@@ -357,6 +377,7 @@
           $("plan-only").disabled =
           $("credits-off").disabled =
           $("diagnostic-consent").disabled =
+          $("sdk-consent").disabled =
             true;
         $("control").hidden = true;
         $("pair-panel").hidden = false;
@@ -384,16 +405,23 @@
           healthy = r.storage.state === "ready",
           busy = s.busy || posting;
         const diagnostic = r.diagnostic;
+        const sdk = r.sdk;
+        const sdkMode = !!sdk;
         const diagnosticMode = !!diagnostic;
         const initialBudget = diagnosticMode
           ? s.attempts === 1 && diagnostic.originalAttempts === 1
           : s.attempts === 0;
         const diagnosticAvailable =
           diagnosticMode &&
-          ["not_authorized", "ready"].includes(diagnostic.budget.state);
+          (sdkMode
+            ? sdk.allowanceAvailable &&
+              diagnostic.budget.state === "exhausted" &&
+              diagnostic.budget.attempts === 1
+            : ["not_authorized", "ready"].includes(diagnostic.budget.state));
         $("legacy-probes").hidden = diagnosticMode;
         $("legacy-budget-note").hidden = diagnosticMode;
-        $("text-diagnostic").hidden = !diagnosticMode;
+        $("text-diagnostic").hidden = !diagnosticMode || sdkMode;
+        $("sdk-diagnostic").hidden = !sdkMode;
         message(
           s.code
             ? "Status: " + s.code.replaceAll("_", " ")
@@ -469,6 +497,7 @@
           $("model").value = selectedKey;
           $("plan-only").checked = $("credits-off").checked = false;
           $("diagnostic-consent").checked = false;
+          $("sdk-consent").checked = false;
         }
         const canSelect =
           !busy &&
@@ -529,13 +558,15 @@
           $("diagnostic-consent").checked = false;
         disable(
           "authorize-diagnostic",
-          !canAuthorize ||
+          sdkMode ||
+            !canAuthorize ||
             !$("diagnostic-consent").checked ||
             diagnostic?.budget.state !== "not_authorized"
         );
         disable(
           "run-diagnostic",
-          !canAuthorize ||
+          sdkMode ||
+            !canAuthorize ||
             !$("diagnostic-consent").checked ||
             diagnostic?.budget.state !== "ready" ||
             diagnostic?.budget.attempts !== 0
@@ -548,6 +579,19 @@
               ? "no verified allowance"
               : diagnostic.budget.attempts + "/1")
           : "Separate diagnostic unavailable.";
+        const canRunSdk =
+          sdkMode && sdk.allowanceAvailable === true && canAuthorize;
+        $("sdk-consent").disabled = !canRunSdk;
+        if (!canRunSdk && !busy) $("sdk-consent").checked = false;
+        disable("run-sdk-diagnostic", !canRunSdk || !$("sdk-consent").checked);
+        $("sdk-budget").textContent = sdkMode
+          ? "Previous diagnostic: " +
+            (diagnostic?.budget.attempts == null
+              ? "unknown"
+              : diagnostic.budget.attempts + "/1 (frozen)") +
+            " · SDK allowance: " +
+            (sdk.allowanceAvailable ? "synthetic test only" : "none")
+          : "SDK diagnostic unavailable.";
         $("evidence").textContent = JSON.stringify(
           { snapshot: s, runtime: r },
           null,
@@ -684,11 +728,23 @@
             experiment: "p15_3_text_response_diagnostic",
           });
       });
-      ["model", "plan-only", "credits-off", "diagnostic-consent"].forEach(
-        (id) =>
-          $(id).addEventListener("change", () => {
-            if (current) render(current);
-          })
+      $("run-sdk-diagnostic").addEventListener("click", () => {
+        if ($("sdk-consent").checked)
+          void action("run_sdk_diagnostic", {
+            ownerAuthorized: true,
+            experiment: "p15_3_official_sdk_diagnostic",
+          });
+      });
+      [
+        "model",
+        "plan-only",
+        "credits-off",
+        "diagnostic-consent",
+        "sdk-consent",
+      ].forEach((id) =>
+        $(id).addEventListener("change", () => {
+          if (current) render(current);
+        })
       );
       setInterval(() => void status(), 1500);
       (async () => {

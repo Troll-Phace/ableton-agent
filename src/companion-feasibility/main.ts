@@ -198,12 +198,19 @@ export type CompanionRuntimeHandle = Pick<
   "session" | "status" | "shutdown"
 > &
   Partial<
-    Pick<CompanionRuntime, "authorizeTextDiagnostic" | "runTextDiagnostic">
+    Pick<
+      CompanionRuntime,
+      "authorizeTextDiagnostic" | "runTextDiagnostic" | "runSdkDiagnostic"
+    >
   >;
 export interface CompanionControlContext {
   runtime: Pick<
     CompanionRuntimeHandle,
-    "session" | "status" | "authorizeTextDiagnostic" | "runTextDiagnostic"
+    | "session"
+    | "status"
+    | "authorizeTextDiagnostic"
+    | "runTextDiagnostic"
+    | "runSdkDiagnostic"
   >;
   origin: typeof COMPANION_CONTROL_ORIGIN;
   /** Invoke only for authenticated operator activity, not background polling. */

@@ -314,7 +314,8 @@ export class CompanionStorage {
 
   constructor(
     private readonly deps: CompanionStorageDependencies,
-    private readonly freezeOriginalBudget = false
+    private readonly freezeOriginalBudget = false,
+    private readonly freezeDiagnosticBudget = false
   ) {
     this.entries = prepareDirectories(deps);
     const root = this.entries[2];
@@ -447,6 +448,8 @@ export class CompanionStorage {
     ) {
       if (this.freezeOriginalBudget && ORIGINAL_TEMP.test(base))
         throw new CompanionStorageFault("storage_unsafe");
+      if (this.freezeDiagnosticBudget && DIAGNOSTIC_TEMP.test(base))
+        throw new CompanionStorageFault("storage_unsafe");
       if (optionalStat(native, name))
         throw new CompanionStorageFault("storage_unsafe");
       descriptor = { file: name, mode: "write" };
@@ -525,6 +528,12 @@ export class CompanionStorage {
     this.verifyTree();
     const sourceName = this.file(from);
     const targetName = this.file(to);
+    if (
+      this.freezeDiagnosticBudget &&
+      (targetName === DIAGNOSTIC_AUTHORIZATION_FILE ||
+        targetName === DIAGNOSTIC_BUDGET_FILE)
+    )
+      throw new CompanionStorageFault("storage_unsafe");
     if (this.freezeOriginalBudget && targetName === ORIGINAL_BUDGET)
       throw new CompanionStorageFault("storage_unsafe");
     const native = this.deps.fs;
@@ -581,6 +590,13 @@ export class CompanionStorage {
     this.assertReady();
     this.verifyTree();
     const base = this.file(name);
+    if (
+      this.freezeDiagnosticBudget &&
+      (base === DIAGNOSTIC_AUTHORIZATION_FILE ||
+        base === DIAGNOSTIC_BUDGET_FILE ||
+        DIAGNOSTIC_TEMP.test(base))
+    )
+      throw new CompanionStorageFault("storage_unsafe");
     if (
       this.freezeOriginalBudget &&
       (base === ORIGINAL_BUDGET || ORIGINAL_TEMP.test(base))
@@ -743,6 +759,8 @@ export class CompanionStorage {
       },
       read: (name) => this.syntheticRead(checked(name)),
       write: (name, value) => {
+        if (this.freezeDiagnosticBudget)
+          throw new SigninFault("budget_exhausted");
         this.frozenOriginalBudget();
         this.syntheticWrite(checked(name), value);
       },
@@ -866,7 +884,12 @@ export class CompanionStorage {
 /** Call only after the fixed-port singleton is acquired. */
 export function createCompanionStorage(
   deps: CompanionStorageDependencies = nativeCompanionStorageDependencies(),
-  freezeOriginalBudget = false
+  freezeOriginalBudget = false,
+  freezeDiagnosticBudget = false
 ): CompanionStorage {
-  return new CompanionStorage(deps, freezeOriginalBudget);
+  return new CompanionStorage(
+    deps,
+    freezeOriginalBudget,
+    freezeDiagnosticBudget
+  );
 }

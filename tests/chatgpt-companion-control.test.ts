@@ -17,6 +17,13 @@ import { createCompanionControl } from "../src/companion-feasibility/control-ser
 import { createCompanionRuntime } from "../src/companion-feasibility/runtime.js";
 import { createCompanionStorage } from "../src/companion-feasibility/storage.js";
 import {
+  DiagnosticBudget,
+  DIAGNOSTIC_EXPERIMENT,
+  DIAGNOSTIC_AUTHORIZATION_FILE,
+  DIAGNOSTIC_BUDGET_FILE,
+} from "../src/companion-feasibility/diagnostic-budget.js";
+import { SDK_EXPERIMENT } from "../src/companion-feasibility/sdk-responses.js";
+import {
   COMPANION_CONTROL_ORIGIN,
   type RunningCompanion,
 } from "../src/companion-feasibility/main.js";
@@ -480,12 +487,12 @@ describe("F3C owner-paired local control (in process only)", () => {
 async function actualPackageEntry() {
   const root = process.cwd();
   const script = fs.readFileSync("scripts/build-chatgpt-companion.ts", "utf8");
-  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.4");
+  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.5");
   const adapter = /const adapterEntry = `([\s\S]*?)`;/u.exec(script)?.[1];
   if (!adapter) throw Error("Missing companion entry adapter");
   const view = fs
     .readFileSync("src/companion-feasibility/control-view.html", "utf8")
-    .replaceAll("{{COMPANION_VERSION}}", "0.0.4")
+    .replaceAll("{{COMPANION_VERSION}}", "0.0.5")
     .replaceAll("{{BUILD_ID}}", "f3c-offline-test");
   return await build({
     absWorkingDir: root,
@@ -502,7 +509,7 @@ async function actualPackageEntry() {
     target: "node24",
     supported: { "dynamic-import": false },
     define: {
-      __COMPANION_VERSION__: JSON.stringify("0.0.4"),
+      __COMPANION_VERSION__: JSON.stringify("0.0.5"),
       __COMPANION_BUILD_ID__: JSON.stringify("f3c-offline-test"),
       __COMPANION_NODE__: JSON.stringify(">=24.14.1"),
       __COMPANION_VIEW__: JSON.stringify(view),
@@ -515,7 +522,7 @@ async function actualPackageEntry() {
   });
 }
 describe("F3C actual package entry, isolation and credential-free smoke", () => {
-  it("bundles only reviewed standalone and SDK-free shared modules plus pinned JWT closure, no production inclusion", async () => {
+  it("bundles only reviewed standalone and isolated shared modules plus pinned SDK/JWT closure, no production inclusion", async () => {
     const graph = await actualPackageEntry();
     const paths = Object.keys(graph.metafile.inputs);
     const modules = paths.filter((p) => !p.startsWith("node_modules/")).sort();
@@ -531,6 +538,7 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           "control-server",
           "diagnostic-budget",
           "response-diagnostic",
+          "sdk-responses",
         ].map((x) => "src/companion-feasibility/" + x + ".ts"),
         ...[
           "contracts",
@@ -555,6 +563,7 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     expect(packages).toEqual(
       [
         "jsonwebtoken",
+        "openai",
         "jws",
         "jwa",
         "lodash.includes",
@@ -613,7 +622,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
         (p) =>
           p.includes("/companion-feasibility/") ||
           p.includes("/feasibility/") ||
-          p.includes("/jsonwebtoken/")
+          p.includes("/jsonwebtoken/") ||
+          p.includes("/openai/")
       )
     ).toEqual([]);
   });
@@ -720,6 +730,11 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       AbortController,
       TextDecoder,
       URL,
+      URLSearchParams,
+      Response,
+      Request,
+      Headers,
+      TextEncoder,
       ReadableStream,
       fetch: fakeFetch,
       process: {
@@ -728,6 +743,7 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
         platform: "darwin",
         versions: { node: process.versions.node },
         version: process.version,
+        env: {},
         stdin: { isTTY: true },
         stdout: {
           isTTY: true,
@@ -759,22 +775,37 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     )
       throw Error("Missing launch export");
     expect(entry).toMatchObject({
-      version: "0.0.4",
+      version: "0.0.5",
       buildId: "f3c-offline-test",
       requiredNode: ">=24.14.1",
     });
     const launch = entry.launchCompanion as () => Promise<RunningCompanion>;
-    // Version 0.0.4 is a checkpoint for a frozen original 1/3 budget only.
-    // Seed that one synthetic accounting record; still no credentials/consent.
+    // Version 0.0.5 freezes both exhausted experiment records, with no new
+    // live allowance. Seed only synthetic accounting, not credentials/consent.
     const storage = createCompanionStorage(home.deps);
     expect(storage.store.reserveInferenceAttempt().attempts).toBe(1);
     const originalBudget = fs.readFileSync(home.file("run-budget.json"));
+    const budget = new DiagnosticBudget(
+      createCompanionStorage(home.deps, true).diagnosticRecords()
+    );
+    budget.authorize(true);
+    budget.reserve();
+    const diagnosticBudget = fs.readFileSync(home.file(DIAGNOSTIC_BUDGET_FILE));
+    const diagnosticAuthorization = fs.readFileSync(
+      home.file(DIAGNOSTIC_AUTHORIZATION_FILE)
+    );
     const running = await launch();
     try {
       expect(panel).toHaveBeenCalledTimes(1);
       expect(fakeFetch).not.toHaveBeenCalled();
       expect(external).toEqual([]);
-      expect(fs.readdirSync(home.directory)).toEqual(["run-budget.json"]);
+      expect(fs.readdirSync(home.directory).sort()).toEqual(
+        [
+          DIAGNOSTIC_AUTHORIZATION_FILE,
+          DIAGNOSTIC_BUDGET_FILE,
+          "run-budget.json",
+        ].sort()
+      );
       expect(terminal).toHaveLength(1);
       const pairing = /([A-Za-z0-9_-]{43})\s*$/u.exec(terminal[0] ?? "")?.[1];
       if (!pairing || !singleton)
@@ -797,7 +828,12 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           storage: { state: "ready" },
           diagnostic: {
             originalAttempts: 1,
-            budget: { state: "not_authorized", attempts: null, cap: 1 },
+            budget: { state: "exhausted", attempts: 1, cap: 1 },
+          },
+          sdk: {
+            experiment: SDK_EXPERIMENT,
+            mode: "offline_only",
+            allowanceAvailable: false,
           },
         },
       });
@@ -826,6 +862,32 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           },
         },
       });
+      for (const payload of [
+        {
+          action: "run_sdk_diagnostic",
+          operatorStarted: true,
+          ownerAuthorized: true,
+          experiment: SDK_EXPERIMENT,
+        },
+        {
+          action: "authorize_text_diagnostic",
+          operatorStarted: true,
+          ownerAuthorized: true,
+          experiment: DIAGNOSTIC_EXPERIMENT,
+        },
+        {
+          action: "run_text_diagnostic",
+          operatorStarted: true,
+          ownerAuthorized: true,
+          experiment: DIAGNOSTIC_EXPERIMENT,
+        },
+        { action: "run_roundtrip", operatorStarted: true },
+        { action: "run_cancellation", operatorStarted: true },
+      ]) {
+        const denied = await action(payload);
+        expect(denied.status).toBe(403);
+        expect(body(denied)).toEqual({ ok: false, code: "invalid_request" });
+      }
       expect(calls).toEqual(["/companion-stream", "/companion-abort"]);
       expect(external).toEqual([]);
       expect(panel).toHaveBeenCalledTimes(1);
@@ -845,6 +907,12 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       expect(logs.mock.calls).toEqual([]);
       expect(fs.readFileSync(home.file("run-budget.json"))).toEqual(
         originalBudget
+      );
+      expect(fs.readFileSync(home.file(DIAGNOSTIC_BUDGET_FILE))).toEqual(
+        diagnosticBudget
+      );
+      expect(fs.readFileSync(home.file(DIAGNOSTIC_AUTHORIZATION_FILE))).toEqual(
+        diagnosticAuthorization
       );
       expect(fs.lstatSync(legacy)).toMatchObject({
         ino: priorLegacy.ino,
