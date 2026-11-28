@@ -14,11 +14,12 @@ import { build, type Metafile } from "esbuild";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const output = join(root, "dist", "chatgpt-companion");
-const version = "0.0.4";
+const version = "0.0.5";
 const entry = "companion.cjs";
 const requiredNode = ">=24.14.1";
 
 const approvedPackages = [
+  { name: "openai", version: "7.65.0", license: "Apache-2.0", file: "LICENSE" },
   { name: "jsonwebtoken", version: "9.0.3", license: "MIT", file: "LICENSE" },
   { name: "jws", version: "4.0.1", license: "MIT", file: "LICENSE" },
   { name: "jwa", version: "2.0.1", license: "MIT", file: "LICENSE" },
@@ -112,6 +113,7 @@ const fixtureSources = [
     "control-server.ts",
     "diagnostic-budget.ts",
     "response-diagnostic.ts",
+    "sdk-responses.ts",
   ].map((name) => `src/companion-feasibility/${name}`),
 ];
 const viewSource = "src/companion-feasibility/control-view.html";
@@ -127,7 +129,7 @@ export const version = __COMPANION_VERSION__;
 export const buildId = __COMPANION_BUILD_ID__;
 export const requiredNode = __COMPANION_NODE__;
 export function launchCompanion(options: {foreground?: ForegroundDependencies; control?: CompanionControlDependencies; runtime?: CompanionRuntimeDependencies} = {}) {
-  const foreground = options.runtime ? { ...(options.foreground ?? nativeForegroundDependencies()), createRuntime: () => createCompanionRuntime({ ...options.runtime, diagnosticMode: true }) } : options.foreground;
+  const foreground = options.runtime ? { ...(options.foreground ?? nativeForegroundDependencies()), createRuntime: () => createCompanionRuntime({ ...options.runtime, diagnosticMode: true, sdkMode: true, sdkAuthorization: undefined }) } : options.foreground;
   return startForegroundCompanion(context => createCompanionControl(context, {view: __COMPANION_VIEW__, dependencies: options.control}), foreground);
 }
 async function main() {
@@ -175,6 +177,14 @@ const lock = object(JSON.parse(lockBytes.toString("utf8")) as unknown);
 const packages = object(lock.packages);
 const dev = object(packageManifest.devDependencies);
 const runtime = object(packageManifest.dependencies);
+const sdkLock = object(packages["node_modules/openai"]);
+if (
+  runtime.openai !== "7.65.0" ||
+  "openai" in dev ||
+  sdkLock.integrity !==
+    "sha512-n7tmWKiUptMIugQMGAEDsfeu8MsPLR4uHPFWRcUjy7Mn2w968TuAUMGOlvnh/AghLF1iz4zYop2RoxfHZFKaEw=="
+)
+  throw new Error("Official SDK pin/integrity mismatch");
 if (
   dev.jsonwebtoken !== "9.0.3" ||
   dev[typeOnly.name] !== typeOnly.version ||
@@ -207,6 +217,18 @@ const inventory: {
   integrity: string;
   licenseSha256: string;
 }[] = [];
+const sdkVendoredNotices = [
+  {
+    name: "partial-json-parser",
+    license: "MIT",
+    path: "node_modules/openai/src/_vendor/partial-json-parser/LICENSE",
+  },
+  {
+    name: "qs",
+    license: "BSD-3-Clause",
+    path: "node_modules/openai/src/internal/qs/LICENSE.md",
+  },
+] as const;
 for (const approved of approvedPackages) {
   const lockEntry = object(packages[`node_modules/${approved.name}`]);
   const installed = await json(
@@ -219,7 +241,9 @@ for (const approved of approvedPackages) {
     lockEntry.version !== approved.version ||
     lockEntry.license !== approved.license ||
     typeof lockEntry.integrity !== "string" ||
-    lockEntry.dev !== true
+    (approved.name === "openai"
+      ? lockEntry.dev === true
+      : lockEntry.dev !== true)
   )
     throw new Error(`Unreviewed dependency metadata: ${approved.name}`);
   const license = await readFile(
@@ -237,6 +261,20 @@ for (const approved of approvedPackages) {
   });
   notices.push(
     `------------------------------------------------------------\n${approved.name} ${approved.version} (${approved.license})\n------------------------------------------------------------\n${license.trimEnd()}\n`
+  );
+}
+const vendoredInventory: {
+  name: string;
+  license: string;
+  path: string;
+  licenseSha256: string;
+}[] = [];
+for (const vendor of sdkVendoredNotices) {
+  const license = await readFile(join(root, vendor.path), "utf8");
+  if (!license.trim()) throw new Error("Missing SDK vendored license");
+  vendoredInventory.push({ ...vendor, licenseSha256: sha(license) });
+  notices.push(
+    `------------------------------------------------------------\nOpenAI SDK bundled vendor: ${vendor.name} (${vendor.license})\n------------------------------------------------------------\n${license.trimEnd()}\n`
   );
 }
 const noticeText = notices.join("\n\n") + "\n";
@@ -310,6 +348,25 @@ function inspectGraph(graph: Metafile): {
   for (const required of fixtureSources)
     if (!inputs.includes(required))
       throw new Error(`Missing fixture source: ${required}`);
+  const sdkVendors = inputs.filter(
+    (input) =>
+      input.startsWith("node_modules/openai/_vendor/") ||
+      input.startsWith("node_modules/openai/internal/qs/")
+  );
+  if (
+    !sdkVendors.some((input) =>
+      input.startsWith("node_modules/openai/_vendor/partial-json-parser/")
+    ) ||
+    !sdkVendors.some((input) =>
+      input.startsWith("node_modules/openai/internal/qs/")
+    ) ||
+    sdkVendors.some(
+      (input) =>
+        !input.startsWith("node_modules/openai/_vendor/partial-json-parser/") &&
+        !input.startsWith("node_modules/openai/internal/qs/")
+    )
+  )
+    throw new Error("SDK vendored license closure changed");
   const externals = new Set<string>();
   for (const element of [
     ...Object.values(graph.inputs),
@@ -340,6 +397,7 @@ identity
   .update(JSON.stringify({ version, entry, requiredNode }))
   .update(adapterEntry)
   .update(JSON.stringify(inventory))
+  .update(JSON.stringify(vendoredInventory))
   .update(noticeText);
 const sourcePaths = [
   ...fixtureSources,
@@ -349,6 +407,7 @@ const sourcePaths = [
   "package.json",
   "package-lock.json",
   "LICENSE",
+  ...sdkVendoredNotices.map((vendor) => vendor.path),
 ];
 const sourceHashes: Record<string, string> = {};
 for (const path of sourcePaths) {
@@ -359,6 +418,9 @@ for (const path of sourcePaths) {
 if (
   sourceHashes[viewSource] !== sha(template) ||
   sourceHashes[runbookSource] !== sha(runbook) ||
+  vendoredInventory.some(
+    (vendor) => sourceHashes[vendor.path] !== vendor.licenseSha256
+  ) ||
   sourceHashes["LICENSE"] !== sha(projectLicense) ||
   sourceHashes["package-lock.json"] !== sha(lockBytes)
 )
@@ -403,6 +465,7 @@ const inventoryText =
       packageLockSha256: sha(lockBytes),
       embeddedViewSha256: sha(renderView(buildId)),
       runtimePackages: inventory,
+      sdkVendoredNotices: vendoredInventory,
       typeOnly,
       sourceHashes,
       inputHashes,

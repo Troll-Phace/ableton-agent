@@ -392,11 +392,19 @@ export function createCompanionControl(
   ): Promise<void> {
     const s = context.runtime.session;
     const operator = { operatorStarted: true };
-    const diagnosticMode = !!context.runtime.status().diagnostic;
+    const runtime = context.runtime.status();
+    const diagnosticMode = !!runtime.diagnostic;
+    const sdkMode = !!runtime.sdk;
     if (
       diagnosticMode &&
       (action.action === "run_roundtrip" ||
         action.action === "run_cancellation")
+    )
+      throw new ControlFault(403, "invalid_request");
+    if (
+      sdkMode &&
+      (action.action === "authorize_text_diagnostic" ||
+        action.action === "run_text_diagnostic")
     )
       throw new ControlFault(403, "invalid_request");
     switch (action.action) {
@@ -440,6 +448,14 @@ export function createCompanionControl(
         if (!diagnosticMode || !context.runtime.runTextDiagnostic)
           throw new ControlFault(403, "invalid_request");
         await context.runtime.runTextDiagnostic(action.ownerAuthorized);
+        break;
+      case "run_sdk_diagnostic":
+        if (
+          !runtime.sdk?.allowanceAvailable ||
+          !context.runtime.runSdkDiagnostic
+        )
+          throw new ControlFault(403, "invalid_request");
+        await context.runtime.runSdkDiagnostic(action.ownerAuthorized);
         break;
       case "sign_out":
         await s.signOut(operator);

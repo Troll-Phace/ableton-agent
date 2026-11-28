@@ -1,73 +1,24 @@
-# Phase 15.3 — standalone companion feasibility operator runbook
+# Phase 15.3 — standalone official SDK offline checkpoint
 
-**Scope:** This reviewed local package tests the documented ChatGPT sign-in and synthetic Responses path as an ordinary foreground macOS process, independently of Ableton Live. It is not a Live extension, service, privileged helper, production migration, or Live bridge. Live can remain closed. No automatic install or launch, no API key, and no paid fallback.
+**Scope:** companion 0.0.5 is an offline implementation and packaging checkpoint, not a live inference release. It uses the documented OpenAI SDK for ordinary streaming and leaves previous custom-parser code/history intact. It has no usable live allowance. Do not sign in, launch a live request, or use earlier packages to replay an experiment. Live can remain closed; no Live bridge or production integration.
 
-## Package and prerequisite verification
+## Package verification
 
-The offline build command in the repository root is:
-
-```sh
-npx --no-install tsx scripts/build-chatgpt-companion.ts
-```
-
-The package is produced in `dist/chatgpt-companion/0.0.4/`. Copy or keep that directory as a unit. It contains `companion.cjs` (including the static control HTML), this runbook, project license, exact third-party notices, dependency inventory, and `SHA256SUMS`. It does not contain the Ableton SDK, account credentials, a Node installer, or production extension files. The package requires Node **24.14.1 or later** on macOS and a controlling interactive terminal. No permission, Gatekeeper or sandbox changes are part of this test. Retained 0.0.1–0.0.3 packages are historical evidence; do not launch them for this diagnostic.
-
-Before running, Dot and Anthony review the exact version/build ID and digest. From the package directory:
+From the repository root:
 
 ```sh
+node --import tsx scripts/build-chatgpt-companion.ts
+cd dist/chatgpt-companion/0.0.5
 shasum -a 256 -c SHA256SUMS
-command -v node
-node --version
 node companion.cjs --version
 ```
 
-Compare the entry digest and build ID with the approved artifact evidence. Record the actual Node binary and version (locally; redact any user-specific path when reporting). If the file hashes do not match, the Node version is unsupported, or the binary is not the reviewed ordinary-user executable, stop. Do not run as root or with elevated permissions.
+The package contains companion.cjs (including the control panel), this runbook, license, third-party notices, exact dependency inventory and SHA256SUMS. Requires ordinary-user macOS Node >=24.14.1. The SDK is pinned to 7.65.0. Previous 0.0.1–0.0.4 packages are historical evidence; preserve them and do not launch for replay.
 
-## Foreground launch and pairing
+## Offline acceptance and future gate
 
-With user authorization, in the same interactive terminal:
+The official SDK's normal streaming behavior replaces the custom MIME, SSE framing and UTF-8 handling for this new path. The adapter uses the documented public Responses endpoint, existing selected OAuth connection, selected catalog model, store:false/stream:true, zero retries, disabled logging, bounded consumption and application deadline. A successful synthetic result requires the expected marker in a completed response; failed/incomplete/EOF, timeout or cancellation are not success. Cancellation stops local work, not a guarantee about provider-side usage. Evidence contains fixed sanitized classifications only.
 
-```sh
-node companion.cjs
-```
+The original experiment remains frozen at 1/3 and the previous diagnostic at 1/1 exhausted. Their accounting is read-only and cannot be replayed, reset or renewed in this build. The native composition will not dispatch SDK inference; the packaged UI reports no allowance. Offline tests use injected synthetic Fetch and synthetic reservation only. No real authorization or provider request was performed. Review this exact artifact and PR before separately planning and explicitly authorizing a new owner-operated experiment with its own cap; that future scope requires personal OAuth consent as needed, plan-only/no credit fallback, selected account model and safe cleanup. No alternate provider or credential, no paid fallback, no support contact.
 
-The version/build identity is printed first. The singleton binds the fixed `127.0.0.1:17863` port before opening its own storage. A port collision is a stop condition, not a request to choose another port or terminate another process. The companion uses the ordinary system browser to open the fixed control panel. No account sign-in or inference starts at launch.
-
-Enter the terminal's one-time pairing code at the local panel. Do not share, record, copy into logs, or send the code. The code expires in two minutes or after five failed attempts; it cannot be reused. It establishes an ephemeral HttpOnly SameSite=Strict local session and an in-memory CSRF token, not an OpenAI credential. Browser reload can rebootstrap only the current valid local session. If pairing or the session expires, stop/relaunch instead of attempting weaker access. The panel is served only on the fixed loopback origin. The session and foreground process time out after 15 minutes without authenticated operator activity; passive status polling does not reset that deadline.
-
-## Credential-free and official-route gates
-
-1. Select **Run preflight**. All checks are actual rather than assumed: protected storage, file and directory synchronization, atomic replacement, native synthetic streaming and pending-read abort, callback binding, and bundled JWT verification.
-2. A fresh storage root will report `restart_required`. Select **Stop (preserve credentials for restart)**, confirm the terminal reports cleanup complete, then relaunch the same approved package and pair again. Repeat preflight. The synthetic marker proves process restart, not power-loss safety.
-3. Once every local gate passes, that explicit preflight action may retrieve bounded official HTTPS discovery/JWKS. It does not start OAuth. Stop on storage, permission, TLS, transport, discovery or verification failure. Do not change directories, weaken storage checks, use alternate endpoints, or substitute API credits.
-4. Only after Dot reviews those results and Anthony personally agrees to consent, select **Continue with ChatGPT**. This uses the documented public-client flow with a separate loopback OAuth callback. Anthony personally reviews the consent screen; do not share callback URLs, codes, tokens or account identity.
-5. A successful connection must have the ChatGPT plan-use scope. The MIT source license is the reviewed integration basis, not proof of account entitlement, registration acceptance or a supported plan. This spike discards the ID token after validation; returning sign-in uses the saved issued client ID and stable companion host ID, without fabricating an ID-token hint.
-6. For the planned persistence test, stop (preserving validated credentials), relaunch, pair again, and run preflight. Verify the persisted connection and perform only one explicit refresh. A failed terminal refresh blocks dependent work.
-
-Versions 0.0.2 and 0.0.3 use the same fixed private root: `~/Library/Ableton Agent Feasibility Companion/`, with child `p15-3-signin`. Version 0.0.1 correctly refused an other-writable Application Support ancestor before creating its root or starting authorization. The revised root is directly below the owner-private Library; this is a new reviewed fixed layout, not a runtime fallback or migration. Do not launch the retained 0.0.1 or 0.0.2 artifacts, alter existing directory permissions, or access/copy files from the earlier location. The companion still checks ownership, no symlinks and no group/other write permission on home and Library; its root and credential child must both be exactly 0700. It is distinct from the installed Live fixture.
-
-Version 0.0.3 corrects the official authorization host-ID format. The [OpenAI host-ID documentation](https://developers.openai.com/siwc/token-sharing-open-source#a-client-vs-an-agent-host) requires a UUID-based identifier to be a persisted UUIDv4 URI. Before authorization, a valid legacy bare UUIDv4 record is atomically replaced by its canonical `urn:uuid:` URI using the same UUID, not a new host identity. Invalid host records fail closed. The durable inference budget is unchanged and no account record is migrated. Both initial registration and returning authorization use the same persisted URI. Do not edit or remove the old host record yourself; the reviewed storage operation performs this migration.
-
-Do not open, copy or edit credential files or reset the budget. A synchronization failure after a rename is an uncertain commit; stop and review rather than assuming rollback. The validated persisted record and counter are reconciled on restart.
-
-## Explicit plan-only one-request diagnostic (0.0.4 only)
-
-**Offline checkpoint only until the owner separately approves the reviewed PR and the exact additional one-request scope.** The previous 0.0.3 synthetic roundtrip consumed its first attempt, returned `invalid_response`, and did not establish provider completion. The displayed zero counters were not reliable. This package cannot replay the original roundtrip or run its cancellation action; `run-budget.json` must already be valid at exactly 1/3 and is read-only, with no recreation, reset or use of its remaining slots. Missing, invalid or uncertain original accounting blocks the new experiment.
-
-After successful restart/refresh:
-
-1. Load the account-specific model catalog and explicitly choose an available model; no default model is selected.
-2. Open the fixed **Manage usage** link (ChatGPT settings) and independently verify plan-only use and disabled credit fallback. In the companion confirm both statements. The application confirmation does not itself control provider billing settings.
-3. Only after separate owner authorization for this exact experiment, check the new authorization statement and select **Authorize named one-request diagnostic**. This creates a separate fixed authorization marker and `response-diagnostic-budget.json` with cap 1 and attempts 0. It makes no inference request. Missing half-records, unexpected temporaries or uncertain commits block; neither record is ever reset or replaced with a new experiment. Do not delete or edit either file.
-4. With the original 1/3 frozen and separate diagnostic 0/1 ready, select **Run fixed text diagnostic (one request)** once. The companion durably records intent and reserves 1/1 before Fetch. It uses the current catalog model, fixed `p15_3` text, explicit history, `store:false`, `stream:true`, and no tools. It accepts only the existing complete terminal/acknowledgment validation. A text-only success does not prove the previous function call works.
-5. Record only sanitized fixed stages, status/MIME category, nullable byte/chunk/event counts, observed terminal, allowlisted error/cleanup codes, and marker acknowledgment. Unknown counts are not zero. On failure, uncertain state, or cancellation, stop for review. Do not retry, run the original function/cancellation experiment, alter storage, or use alternate billing. There is no automatic continuation or diagnostic renewal.
-
-The original count remains 1/3 across sign-in, sign-out and restart; the separate cap is exactly 1. Failed or uncertain dispatch counts; an unfinished reservation intent blocks rather than restoring availability. No automatic replay, model substitution, counter reset, alternate provider or paid fallback exists. Denial, invalid identity, missing plan scope, account/eligibility rejection, usage limits or unsupported capability block dependent work. Manual Cancel is available only as an emergency interruption, not a cancellation experiment.
-
-## Cleanup and evidence
-
-Select **Sign out and clear local credentials** when the experiment ends. Verify the sanitized local cleanup result and remote revocation result separately; unconfirmed remote revocation is not success. Then select **Stop** and verify terminal cleanup status. Ctrl-C/SIGTERM and idle timeout cancel work and stop the foreground listener but do not revoke or clear credentials. Normal stop preserves validated credentials solely for the planned restart test; a crash may leave protected credentials. If necessary, reopen the same reviewed package, pair, and use explicit sign-out; do not manually tamper with its records.
-
-Report only the build ID, checksum, Node version, coarse preflight evidence, gate outcomes, attempt count, cleanup and revocation classifications. Never share pairing codes, cookie/CSRF values, credentials, registration IDs, raw account identity, provider content or exceptions. If a stop result says `pending`, the CLI exits nonzero; do not assume cleanup or revocation completed.
-
-**GO means standalone companion feasibility only.** It does not establish a Live-facing authentication bridge or preserved Live tool behavior. Production integration remains a separate reviewed phase.
+Do not share pairing codes, callback URLs, credentials, account details, raw SDK errors or response content. If ever authorized and launched for a future experiment, use ordinary foreground process and the authenticated loopback panel; personally sign out, wait for separately reported local credential deletion and remote revocation status, then stop. That is not an instruction to launch the offline checkpoint.

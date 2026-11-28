@@ -24,6 +24,11 @@ import { SyntheticResponses } from "../extension/feasibility/responses.js";
 import { SigninSession } from "../extension/feasibility/signin-session.js";
 import { DiagnosticBudget } from "./diagnostic-budget.js";
 import {
+  SdkResponses,
+  type SdkDiagnosticAuthorization,
+  type SdkDiagnosticStatus,
+} from "./sdk-responses.js";
+import {
   ResponseDiagnostic,
   type TextDiagnosticStatus,
 } from "./response-diagnostic.js";
@@ -54,8 +59,12 @@ export interface CompanionRuntimeDependencies extends OfficialHttpDependencies {
   jwt: CompanionJwt;
   pid: number;
   eligibilityBasisReady: boolean;
-  /** Fixed on in the 0.0.4 native package; legacy synthetic seams remain test-only. */
+  /** Legacy synthetic seams remain test-only. */
   diagnosticMode?: boolean;
+  /** Fixed on in 0.0.5; native and packaged launches have no usable allowance. */
+  sdkMode?: boolean;
+  /** Synthetic direct-runtime tests only. Never configured by the packaged CLI. */
+  sdkAuthorization?: SdkDiagnosticAuthorization;
   browser: BrowserLauncher;
 }
 
@@ -83,6 +92,7 @@ export function nativeCompanionRuntimeDependencies(): CompanionRuntimeDependenci
     // Reviewed MIT integration basis; not a claim about individual plan eligibility.
     eligibilityBasisReady: true,
     diagnosticMode: true,
+    sdkMode: true,
     browser: (url, cancellation) =>
       launchAuthorizationBrowser(
         url,
@@ -101,6 +111,7 @@ export interface CompanionRuntimeStatus {
   storage: CompanionStorageHealth;
   preflight?: CompanionPreflightReport;
   diagnostic?: TextDiagnosticStatus;
+  sdk?: SdkDiagnosticStatus;
 }
 export interface CompanionRuntimeShutdown {
   cleanup: "complete" | "pending";
@@ -115,17 +126,22 @@ export class CompanionRuntime {
   private readonly preflight: CompanionPreflight;
   private readonly oauth: OAuthLifecycle;
   private readonly diagnostic?: ResponseDiagnostic;
+  private readonly sdk?: SdkResponses;
+  private readonly priorDiagnosticBudget?: DiagnosticBudget;
   private readonly stopControl = createProbeCancellation();
   private readonly requests = new Set<Promise<unknown>>();
   private shutdownTask?: Promise<CompanionRuntimeShutdown>;
 
   constructor(private readonly deps: CompanionRuntimeDependencies) {
+    const sdkMode = deps.sdkMode === true;
+    const diagnosticMode = sdkMode || deps.diagnosticMode === true;
     this.storage = createCompanionStorage(
       deps.storage,
-      deps.diagnosticMode === true
+      diagnosticMode,
+      sdkMode
     );
     const persisted = this.storage.store;
-    const store: SigninPersistence = deps.diagnosticMode
+    const store: SigninPersistence = diagnosticMode
       ? {
           ensureHostId: () => persisted.ensureHostId(),
           selectedRegistration: () => persisted.selectedRegistration(),
@@ -146,7 +162,7 @@ export class CompanionRuntime {
     ): Promise<T> => {
       if (this.stopControl.cancelled) throw new SigninFault("cancelled");
       this.storage.assertReady();
-      if (deps.diagnosticMode) this.storage.frozenOriginalBudget();
+      if (diagnosticMode) this.storage.frozenOriginalBudget();
       const combined = createProbeCancellation();
       const removeShutdown = this.stopControl.onCancel(() => combined.cancel());
       const removeAction = request.cancellation?.onCancel(() =>
@@ -155,7 +171,7 @@ export class CompanionRuntime {
       const task = Promise.resolve().then(() => {
         if (combined.cancelled) throw new SigninFault("cancelled");
         this.storage.assertReady();
-        if (deps.diagnosticMode) this.storage.frozenOriginalBudget();
+        if (diagnosticMode) this.storage.frozenOriginalBudget();
         return run({ ...request, cancellation: combined });
       });
       this.requests.add(task);
@@ -204,7 +220,7 @@ export class CompanionRuntime {
       clock: deps.clock,
     });
     this.preflight = new CompanionPreflight({ ...deps, storage: this.storage });
-    if (deps.diagnosticMode)
+    if (diagnosticMode && !sdkMode)
       this.diagnostic = new ResponseDiagnostic({
         budget: new DiagnosticBudget(this.storage.diagnosticRecords()),
         http: client,
@@ -215,15 +231,33 @@ export class CompanionRuntime {
         clock: deps.clock,
         TextDecoder: deps.TextDecoder,
       });
+    if (sdkMode) {
+      const prior = new DiagnosticBudget(this.storage.diagnosticRecords());
+      this.priorDiagnosticBudget = prior;
+      this.sdk = new SdkResponses({
+        fetch: deps.fetch,
+        AbortController: deps.AbortController,
+        clock: deps.clock,
+        loadConnection: () => this.storage.store.loadSelectedConnection(),
+        assertFrozenBudgets: () => {
+          if (this.stopControl.cancelled) throw new SigninFault("cancelled");
+          this.storage.frozenOriginalBudget();
+          const state = prior.status();
+          if (state.state !== "exhausted" || state.attempts !== 1)
+            throw new SigninFault("storage_invalid");
+        },
+        authorization: deps.sdkAuthorization,
+      });
+    }
     this.session = new SigninSession({
       eligibilityBasisReady: deps.eligibilityBasisReady,
-      diagnosticMode: deps.diagnosticMode,
+      diagnosticMode,
       clock: deps.clock,
       oauth: this.oauth,
       responses,
       store,
       hostPreflight: (cancellation) => {
-        if (deps.diagnosticMode) this.storage.frozenOriginalBudget();
+        if (diagnosticMode) this.storage.frozenOriginalBudget();
         return this.preflight.run(cancellation);
       },
     });
@@ -231,10 +265,26 @@ export class CompanionRuntime {
 
   status(): CompanionRuntimeStatus {
     const preflight = this.preflight.report();
+    let prior: TextDiagnosticStatus | undefined;
+    if (this.priorDiagnosticBudget) {
+      let originalAttempts: 1 | null = null;
+      try {
+        this.storage.frozenOriginalBudget();
+        originalAttempts = 1;
+      } catch {
+        /* unknown */
+      }
+      prior = { originalAttempts, budget: this.priorDiagnosticBudget.status() };
+    }
     return {
       storage: this.storage.health(),
       ...(preflight ? { preflight } : {}),
-      ...(this.diagnostic ? { diagnostic: this.diagnostic.status() } : {}),
+      ...(this.diagnostic
+        ? { diagnostic: this.diagnostic.status() }
+        : prior
+          ? { diagnostic: prior }
+          : {}),
+      ...(this.sdk ? { sdk: this.sdk.status() } : {}),
     };
   }
 
@@ -256,6 +306,28 @@ export class CompanionRuntime {
       { operatorStarted: true },
       (context) => diagnostic.run(context, ownerAuthorized),
       (result) => diagnostic.publish(result)
+    );
+  }
+
+  /** Offline-only checkpoint. A valid control action cannot confer allowance. */
+  async runSdkDiagnostic(ownerAuthorized: boolean): Promise<void> {
+    const sdk = this.sdk;
+    if (!sdk || ownerAuthorized !== true)
+      throw new SigninFault("operator_required");
+    if (!sdk.status().allowanceAvailable)
+      throw new SigninFault("budget_exhausted");
+    await this.session.runTextDiagnostic(
+      { operatorStarted: true },
+      async (context) => {
+        const task = sdk.run(context, ownerAuthorized);
+        this.requests.add(task);
+        try {
+          return await task;
+        } finally {
+          this.requests.delete(task);
+        }
+      },
+      (result) => sdk.publish(result)
     );
   }
 

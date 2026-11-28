@@ -1,6 +1,7 @@
 import type { SigninSnapshot } from "../extension/feasibility/signin-session.js";
 import type { CompanionRuntimeStatus } from "./runtime.js";
 import { DIAGNOSTIC_EXPERIMENT } from "./diagnostic-budget.js";
+import { SDK_EXPERIMENT } from "./sdk-responses.js";
 
 export const CONTROL_PATH = "/" as const;
 export const PAIR_PATH = "/pair" as const;
@@ -34,6 +35,12 @@ export type ControlAction =
       operatorStarted: true;
       ownerAuthorized: true;
       experiment: typeof DIAGNOSTIC_EXPERIMENT;
+    }
+  | {
+      action: "run_sdk_diagnostic";
+      operatorStarted: true;
+      ownerAuthorized: true;
+      experiment: typeof SDK_EXPERIMENT;
     }
   | {
       action: "confirm_plan_only";
@@ -125,6 +132,17 @@ export function parseControlAction(value: unknown): ControlAction | undefined {
             operatorStarted: true,
             ownerAuthorized: true,
             experiment: DIAGNOSTIC_EXPERIMENT,
+          }
+        : undefined;
+    case "run_sdk_diagnostic":
+      return exact(row, [...keys, "ownerAuthorized", "experiment"]) &&
+        row.ownerAuthorized === true &&
+        row.experiment === SDK_EXPERIMENT
+        ? {
+            action,
+            operatorStarted: true,
+            ownerAuthorized: true,
+            experiment: SDK_EXPERIMENT,
           }
         : undefined;
     case "sign_in":
