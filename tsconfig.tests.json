@@ -5,8 +5,12 @@
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "target": "esnext",
-    "lib": ["esnext"],
-    "types": ["node"],
+    "lib": [
+      "esnext"
+    ],
+    "types": [
+      "node"
+    ],
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -16,7 +20,8 @@
     "tests/**/*",
     "src/shared/**/*",
     "src/extension/**/*",
-    "src/companion-feasibility/**/*"
+    "src/companion-feasibility/**/*",
+    "src/companion/**/*"
   ],
   "exclude": [
     "tests/webview-render.test.ts",
