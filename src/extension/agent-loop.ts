@@ -281,8 +281,28 @@ export async function runProviderLoop(
     const completed = turn.turn;
     const stopReason = completed.stopReason;
 
-    // Append the assistant message to the transcript (content blocks as params).
-    provider.appendAssistant(completed);
+    // Commit the provider-owned completed turn before executing any tools.
+    // A provider may reject a previously issued continuation if its selected
+    // account or operation was invalidated between completion and this append.
+    try {
+      provider.appendAssistant(completed);
+    } catch {
+      const err: ProviderError = signal?.aborted
+        ? {
+            error: "aborted",
+            detail:
+              "the agent loop was aborted before committing the completed turn",
+            hint: "the user cancelled; no tools were executed this iteration",
+          }
+        : {
+            error: "stream_error",
+            detail:
+              "the provider rejected the completed turn before local execution",
+            hint: "verify the selected conversation and account; no tools were executed this iteration",
+          };
+      events.error(err.detail);
+      return { ok: false, err };
+    }
 
     // 2. Terminal stop → done.
     if (stopReason !== "tool_use") {
@@ -476,7 +496,21 @@ export async function runProviderLoop(
         }
       );
     });
-    provider.appendToolResults(results);
+    try {
+      provider.appendToolResults(results);
+    } catch {
+      // Local tools may already have run and their undo step may be committed.
+      // A rejected history append cannot justify repeating them or dispatching
+      // another provider request. Preserve the emitted tool activity.
+      const err: ProviderError = {
+        error: signal?.aborted ? "aborted" : "stream_error",
+        detail:
+          "the provider could not accept tool results; local actions may already have completed",
+        hint: "inspect the local state before continuing; do not replay tool actions or retry automatically",
+      };
+      events.error(err.detail);
+      return { ok: false, err };
+    }
     // Continue: next streamed turn consumes these tool_result blocks.
   }
 
