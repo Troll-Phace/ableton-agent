@@ -12,5 +12,5 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/extension/**/*", "src/shared/**/*", "src/html.d.ts"]
+  "include": ["src/extension/**/*", "src/shared/**/*", "src/html.d.ts", "src/companion/channel/pairing.ts", "src/companion/channel/socket-endpoint.ts"]
 }
