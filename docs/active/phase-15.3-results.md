@@ -209,3 +209,5 @@ Coordinator final verification after diagnostic regression additions:
 lint, typecheck, 1218/1218 Vitest (32 files) and 14/14 framework tests PASS.
 Checkpoint remains BLOCKED for direct real sign-in and inference, not a
 production migration or Phase 15.3 acceptance.
+
+Owner merged [PR #8](https://github.com/Troll-Phace/ableton-agent/pull/8) on 2026-11-28 (0909e47 verified). Direct native checkpoint is preserved on main, still BLOCKED before OAuth. Awaiting separate direction on companion or documented durable host alternative.
