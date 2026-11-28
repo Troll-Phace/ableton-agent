@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ableton Agent · Companion Feasibility</title>
+    <style nonce="{{CSP_NONCE}}">
+      :root {
+        color-scheme: light dark;
+        font-family:
+          system-ui,
+          -apple-system,
+          sans-serif;
+        --ink: light-dark(#1e222a, #eceef2);
+        --paper: light-dark(#f2f4f7, #11141a);
+        --card: light-dark(#fff, #1c222c);
+        --line: light-dark(#d9dfe8, #35404e);
+        --muted: light-dark(#49576a, #b6c2d0);
+        --accent: light-dark(#215c88, #80cff6);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: var(--paper);
+        color: var(--ink);
+      }
+      main {
+        max-width: 780px;
+        margin: auto;
+        padding: 32px 18px 64px;
+      }
+      header {
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 20px;
+        margin-bottom: 18px;
+      }
+      h1 {
+        font-size: 1.65rem;
+        margin: 0 0 6px;
+      }
+      h2 {
+        font-size: 1.13rem;
+        margin: 0 0 10px;
+      }
+      p {
+        line-height: 1.5;
+        margin: 8px 0;
+      }
+      small,
+      .muted {
+        color: var(--muted);
+      }
+      section {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--card);
+        padding: 20px;
+        margin: 14px 0;
+      }
+      .actions {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 10px;
+        margin-top: 12px;
+      }
+      button,
+      input,
+      select {
+        font: inherit;
+      }
+      button,
+      select,
+      input[type="password"] {
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        padding: 10px 14px;
+        background: var(--paper);
+        color: var(--ink);
+      }
+      button {
+        cursor: pointer;
+      }
+      button:disabled,
+      select:disabled,
+      input:disabled {
+        cursor: default;
+        opacity: 0.48;
+      }
+      button.primary {
+        background: var(--accent);
+        color: light-dark(white, #142238);
+        border-color: transparent;
+      }
+      button.chatgpt {
+        background: #0d0d0d;
+        color: #fff;
+        border: 1px solid #4a4a4a;
+        border-radius: 8px;
+        font-weight: 600;
+        padding: 12px 20px;
+      }
+      a {
+        color: var(--accent);
+      }
+      input[type="password"] {
+        width: min(100%, 28rem);
+        font-family: monospace;
+      }
+      label {
+        display: block;
+        margin: 10px 0;
+        line-height: 1.5;
+      }
+      pre {
+        font-size: 0.78rem;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        overflow-wrap: anywhere;
+        margin: 8px 0 0;
+      }
+      button:focus-visible,
+      a:focus-visible,
+      input:focus-visible,
+      select:focus-visible {
+        outline: 3px solid var(--accent);
+        outline-offset: 3px;
+      }
+      .indicator {
+        display: inline-block;
+        font-size: 0.82rem;
+        color: var(--accent);
+        border: 1px solid var(--line);
+        padding: 4px 8px;
+        border-radius: 999px;
+      }
+      .indicator[hidden] {
+        display: none;
+      }
+      .warning {
+        border-left: 3px solid var(--accent);
+        padding-left: 12px;
+      }
+      [hidden] {
+        display: none !important;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Ableton Agent · Companion Feasibility</h1>
+        <p class="muted">
+          Version {{COMPANION_VERSION}} · Build {{BUILD_ID}} · Standalone
+          foreground process
+        </p>
+        <p>
+          No Live connection, no API key, no paid fallback. This experiment only
+          tests the standalone sign-in route.
+        </p>
+      </header>
+      <section id="pair-panel" aria-labelledby="pair-title">
+        <h2 id="pair-title">Pair this local browser</h2>
+        <p>
+          Enter the one-time code displayed in the controlling terminal. It
+          expires after two minutes or five failed attempts.
+        </p>
+        <form id="pair-form">
+          <label for="pair-code">Pairing code</label>
+          <input
+            type="password"
+            id="pair-code"
+            autocomplete="off"
+            spellcheck="false"
+            maxlength="43"
+            required
+          />
+          <button type="submit" class="primary" id="pair-submit">Pair</button>
+        </form>
+      </section>
+      <p id="message" role="status" aria-live="polite">
+        Checking the local companion…
+      </p>
+      <div id="control" hidden>
+        <section>
+          <h2>1 · Verify the companion</h2>
+          <p>
+            The first preflight checks protected local storage, streaming and
+            cancellation, callback binding and the bundled verifier. If a
+            restart is needed, stop and relaunch before continuing. Official
+            discovery/JWKS is contacted only after every local gate passes; no
+            authorization is started by preflight.
+          </p>
+          <div class="actions">
+            <button id="preflight" class="primary" disabled>
+              Run preflight</button
+            ><button id="cancel" disabled>Cancel active work</button>
+          </div>
+          <p id="storage-message" class="warning" hidden></p>
+        </section>
+        <section>
+          <h2>2 · Connect your ChatGPT account</h2>
+          <p>
+            Personally review any sign-in and plan-use consent in your browser.
+            This fixture does not presume account or workspace eligibility.
+          </p>
+          <button class="chatgpt" data-oai-siwc-button id="signin" disabled>
+            Continue with ChatGPT
+          </button>
+          <p id="account" class="muted">No verified connection.</p>
+          <div class="actions">
+            <button id="refresh" disabled>
+              Verify persisted connection and refresh</button
+            ><a
+              href="https://chatgpt.com/settings/usage"
+              target="_blank"
+              rel="noopener noreferrer"
+              >Manage usage</a
+            >
+          </div>
+          <div id="welcome" hidden>
+            <h3>Use your ChatGPT plan in Ableton Agent</h3>
+            <p>
+              Your connection granted ChatGPT plan-use permission. Plan limits
+              apply. This fixture has no paid fallback or purchase action.
+            </p>
+          </div>
+        </section>
+        <section>
+          <h2>3 · Choose your model</h2>
+          <span class="indicator" id="plan-indicator" hidden
+            >ChatGPT plan use</span
+          >
+          <div class="actions">
+            <button id="models" disabled>Load account model catalog</button
+            ><select aria-label="Account model" id="model" disabled>
+              <option value="">Choose a model</option></select
+            ><button id="select-model" disabled>Use selected model</button>
+          </div>
+        </section>
+        <section>
+          <h2>4 · Confirm plan-only use</h2>
+          <p>
+            Confirm your plan settings in ChatGPT first. This checkbox records
+            your confirmation; it cannot independently change or verify provider
+            billing settings.
+          </p>
+          <label
+            ><input type="checkbox" id="plan-only" disabled /> I confirm using
+            my ChatGPT plan only.</label
+          >
+          <label
+            ><input type="checkbox" id="credits-off" disabled /> I verified
+            credit fallback is disabled. Do not spend extra credits.</label
+          >
+          <button id="confirm" disabled>Confirm plan-only usage</button>
+          <p id="attempts" class="muted">Durable attempts: not checked.</p>
+          <div class="actions">
+            <button id="roundtrip" disabled>
+              Run fixed synthetic function round trip (2 attempts)</button
+            ><button id="cancellation" disabled>
+              Run final cancellation check (1 attempt)
+            </button>
+          </div>
+          <p class="muted">
+            Failed or uncertain sends consume their durable attempt. There is no
+            fourth request and no automatic replay.
+          </p>
+        </section>
+        <section>
+          <h2>5 · Stop or sign out</h2>
+          <p>
+            Stop preserves validated credentials for the planned restart. Sign
+            out is the explicit cleanup action; verify local cleanup and remote
+            revocation status separately.
+          </p>
+          <div class="actions">
+            <button id="signout" disabled>
+              Sign out and clear local credentials</button
+            ><button id="quit" disabled>
+              Stop (preserve credentials for restart)
+            </button>
+          </div>
+        </section>
+        <section>
+          <h2>Sanitized evidence</h2>
+          <pre id="evidence">No results yet.</pre>
+        </section>
+      </div>
+    </main>
+    <script nonce="{{CSP_NONCE}}">
+      "use strict";
+      const $ = (id) => document.getElementById(id);
+      let csrf = "",
+        current,
+        posting = false,
+        stopped = false,
+        listKey = "",
+        selectedKey = "",
+        polling = false;
+      const ids = [
+        "preflight",
+        "cancel",
+        "signin",
+        "refresh",
+        "models",
+        "select-model",
+        "confirm",
+        "roundtrip",
+        "cancellation",
+        "signout",
+        "quit",
+      ];
+      const disable = (id, disabled) => {
+        $(id).disabled = Boolean(disabled);
+      };
+      function message(text) {
+        $("message").textContent = text;
+      }
+      function disconnect(text) {
+        csrf = "";
+        current = undefined;
+        ids.forEach((id) => disable(id, true));
+        $("model").disabled =
+          $("plan-only").disabled =
+          $("credits-off").disabled =
+            true;
+        $("control").hidden = true;
+        $("pair-panel").hidden = false;
+        message(text);
+      }
+      async function request(path, body, authenticated = false) {
+        const headers = { "Content-Type": "application/json" };
+        if (authenticated) headers["X-Companion-CSRF"] = csrf;
+        const response = await fetch(path, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+          credentials: "same-origin",
+          cache: "no-store",
+          redirect: "error",
+        });
+        const data = await response.json();
+        return { response, data };
+      }
+      function render(data) {
+        if (stopped || !csrf || !data?.snapshot || !data?.runtime) return;
+        current = data;
+        const s = data.snapshot,
+          r = data.runtime,
+          healthy = r.storage.state === "ready",
+          busy = s.busy || posting;
+        message(
+          s.code
+            ? "Status: " + s.code.replaceAll("_", " ")
+            : "Status: " + s.state.replaceAll("_", " ")
+        );
+        const p = r.preflight?.storage;
+        $("storage-message").hidden = !(
+          p?.code === "restart_required" || !healthy
+        );
+        $("storage-message").textContent = !healthy
+          ? "Storage commit is uncertain. Stop and seek review before continuing."
+          : p?.code === "restart_required"
+            ? "Storage restart required. Stop, then relaunch the same package and pair again."
+            : "";
+        $("account").textContent = s.hasConnection
+          ? "Connection 1 · " +
+            (s.planScopeGranted
+              ? "plan permission granted"
+              : "plan permission not granted")
+          : "No verified connection.";
+        $("welcome").hidden = !(s.hasConnection && s.planScopeGranted);
+        $("plan-indicator").hidden = !(s.hasConnection && s.planScopeGranted);
+        disable(
+          "preflight",
+          busy ||
+            !healthy ||
+            p?.code === "restart_required" ||
+            s.preflightReady ||
+            !s.eligibilityBasisReady
+        );
+        disable(
+          "signin",
+          busy ||
+            !healthy ||
+            !s.preflightReady ||
+            !s.eligibilityBasisReady ||
+            (s.hasConnection &&
+              s.state !== "plan_disabled" &&
+              s.state !== "reconnect_required")
+        );
+        disable(
+          "refresh",
+          busy ||
+            !healthy ||
+            !s.preflightReady ||
+            !s.persistedConnectionLoaded ||
+            !s.hasConnection ||
+            s.refreshVerified
+        );
+        disable(
+          "models",
+          busy || !healthy || !s.refreshVerified || s.attempts !== 0
+        );
+        disable("cancel", !s.busy && !posting);
+        disable("signout", false);
+        disable("quit", false);
+        const list = s.models || [],
+          next = JSON.stringify(list);
+        if (next !== listKey) {
+          listKey = next;
+          $("model").replaceChildren(new Option("Choose a model", ""));
+          list.forEach((m) =>
+            $("model").append(new Option(m.displayName, m.slug))
+          );
+          $("model").value = s.selectedModelSlug || "";
+        }
+        if (selectedKey !== (s.selectedModelSlug || "")) {
+          selectedKey = s.selectedModelSlug || "";
+          $("model").value = selectedKey;
+          $("plan-only").checked = $("credits-off").checked = false;
+        }
+        const canSelect =
+          !busy &&
+          healthy &&
+          s.refreshVerified &&
+          s.attempts === 0 &&
+          list.length > 0;
+        $("model").disabled = !canSelect;
+        disable("select-model", !canSelect || !$("model").value);
+        const canConfirm =
+          !busy &&
+          healthy &&
+          s.selectedModelSlug &&
+          s.attempts === 0 &&
+          s.planScopeGranted;
+        $("plan-only").disabled = $("credits-off").disabled = !canConfirm;
+        disable(
+          "confirm",
+          !canConfirm || !$("plan-only").checked || !$("credits-off").checked
+        );
+        disable(
+          "roundtrip",
+          !canConfirm ||
+            !s.planOnlyConfirmed ||
+            !s.creditFallbackDisabled ||
+            !$("plan-only").checked ||
+            !$("credits-off").checked
+        );
+        disable(
+          "cancellation",
+          busy ||
+            !healthy ||
+            s.state !== "roundtrip_complete" ||
+            s.attempts !== 2 ||
+            !s.planOnlyConfirmed ||
+            !s.creditFallbackDisabled
+        );
+        $("attempts").textContent =
+          "Durable attempts: " +
+          (s.attempts == null ? "not checked" : s.attempts + "/3");
+        $("evidence").textContent = JSON.stringify(
+          { snapshot: s, runtime: r },
+          null,
+          2
+        );
+      }
+      async function status() {
+        if (!csrf || stopped || polling) return;
+        polling = true;
+        try {
+          const { response, data } = await request(
+            "/action",
+            { action: "status" },
+            true
+          );
+          if (response.status === 401) {
+            disconnect(
+              "Local session expired. Restart the companion to pair again."
+            );
+            return;
+          }
+          if (response.ok && data.ok) render(data);
+          else message("Local status unavailable.");
+        } catch {
+          message("Companion unavailable. Check the controlling terminal.");
+        } finally {
+          polling = false;
+        }
+      }
+      async function action(name, extra = {}) {
+        if (
+          !csrf ||
+          stopped ||
+          (posting && !["cancel", "sign_out", "quit"].includes(name))
+        )
+          return;
+        const interrupt = ["cancel", "sign_out", "quit"].includes(name);
+        if (!interrupt) posting = true;
+        if (current) render(current);
+        try {
+          const { response, data } = await request(
+            "/action",
+            { action: name, operatorStarted: true, ...extra },
+            true
+          );
+          if (response.status === 401) {
+            disconnect(
+              "Local session expired. Restart the companion to pair again."
+            );
+            return;
+          }
+          if (data.stopping) {
+            stopped = true;
+            csrf = "";
+            $("control").hidden = true;
+            message(
+              "Companion stopping. Check the controlling terminal for the cleanup result."
+            );
+            return;
+          }
+          if (!data.ok) {
+            message("Action rejected: " + data.code.replaceAll("_", " "));
+            return;
+          }
+          render(data);
+        } catch {
+          message("Companion action unavailable. No automatic retry.");
+        } finally {
+          if (!interrupt) posting = false;
+          if (current && !stopped) render(current);
+        }
+      }
+      async function paired(data) {
+        csrf = data.csrf;
+        $("pair-panel").hidden = true;
+        $("control").hidden = false;
+        await status();
+      }
+      $("pair-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (stopped) return;
+        const code = $("pair-code").value.trim();
+        $("pair-code").value = "";
+        disable("pair-submit", true);
+        try {
+          const { response, data } = await request("/pair", { code });
+          if (response.ok && data.ok) await paired(data);
+          else
+            message(
+              "Pairing failed or expired. Check the terminal; restart if necessary."
+            );
+        } catch {
+          message("Pairing unavailable. Check the terminal.");
+        } finally {
+          disable("pair-submit", false);
+        }
+      });
+      const controls = {
+        preflight: "preflight",
+        signin: "sign_in",
+        refresh: "refresh",
+        models: "load_models",
+        roundtrip: "run_roundtrip",
+        cancellation: "run_cancellation",
+        cancel: "cancel",
+        signout: "sign_out",
+        quit: "quit",
+      };
+      Object.entries(controls).forEach(([id, name]) =>
+        $(id).addEventListener("click", () => void action(name))
+      );
+      $("select-model").addEventListener(
+        "click",
+        () => void action("select_model", { modelSlug: $("model").value })
+      );
+      $("confirm").addEventListener("click", () => {
+        if ($("plan-only").checked && $("credits-off").checked)
+          void action("confirm_plan_only", {
+            planOnlyConfirmed: true,
+            creditFallbackDisabled: true,
+          });
+      });
+      ["model", "plan-only", "credits-off"].forEach((id) =>
+        $(id).addEventListener("change", () => {
+          if (current) render(current);
+        })
+      );
+      setInterval(() => void status(), 1500);
+      (async () => {
+        try {
+          const { response, data } = await request("/session", {});
+          if (response.ok && data.ok) await paired(data);
+          else message("Enter the one-time pairing code from your terminal.");
+        } catch {
+          message("Companion unavailable. Check the terminal.");
+        }
+      })();
+    </script>
+  </body>
+</html>

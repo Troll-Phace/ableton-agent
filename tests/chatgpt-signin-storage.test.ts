@@ -15,6 +15,8 @@ import {
   CLIENT,
   SUBJECT,
   LOCAL_ID,
+  HOST_UUID,
+  HOST_URI,
   makeConnection,
   makeStorage,
   makeOAuthFixture,
@@ -36,6 +38,9 @@ describe("S5 private sign-in persistence", () => {
   it("stores host ID, registration and credentials privately; reloads across store instances", () => {
     const f = fixture();
     const host = f.store.ensureHostId();
+    expect(host).toMatch(
+      /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
     const connection = makeConnection();
     f.store.saveConnection(connection);
     const restart = new CredentialStore(f.base, f.deps);
@@ -611,4 +616,118 @@ describe("S5 mandatory native storage flags", () => {
     expect(JSON.stringify(report)).not.toContain(hostId);
     expect(JSON.stringify(report)).not.toContain(f.base);
   });
+});
+
+describe("S5 canonical persisted UUIDv4 host URI", () => {
+  it.each([HOST_UUID, HOST_UUID.toUpperCase()])(
+    "converts a legacy bare UUID atomically without changing registration, credentials or durable budget (%s)",
+    (legacyUuid) => {
+      const f = fixture();
+      f.store.ensureHostId();
+      f.store.saveConnection(makeConnection());
+      f.store.reserveInferenceAttempt();
+      const before = f.store.reserveInferenceAttempt();
+      const registration = f.store.selectedRegistration();
+      const legacy = { version: 1, hostId: legacyUuid };
+      fs.writeFileSync(f.file("host.json"), JSON.stringify(legacy) + "\n");
+      const renameSync = vi.fn<typeof fs.renameSync>((from, to) => {
+        expect(String(to)).toBe(f.file("host.json"));
+        expect(JSON.parse(fs.readFileSync(to, "utf8")) as unknown).toEqual(
+          legacy
+        );
+        expect(
+          JSON.parse(fs.readFileSync(from, "utf8")) as unknown
+        ).toMatchObject({ hostId: HOST_URI });
+        expect(fs.lstatSync(from).mode & 0o777).toBe(0o600);
+        fs.renameSync(from, to);
+      });
+      const restarted = new CredentialStore(f.base, {
+        ...f.deps,
+        fs: { ...fs, renameSync },
+      });
+      expect(restarted.ensureHostId()).toBe(HOST_URI);
+      expect(renameSync).toHaveBeenCalledTimes(1);
+      expect(restarted.ensureHostId()).toBe(HOST_URI);
+      expect(renameSync).toHaveBeenCalledTimes(1);
+      expect(new CredentialStore(f.base, f.deps).ensureHostId()).toBe(HOST_URI);
+      expect(restarted.selectedRegistration()).toEqual(registration);
+      expect(restarted.loadSelectedConnection()).toEqual(makeConnection());
+      expect(restarted.getBudget()).toEqual(before);
+      expect(
+        fs.readdirSync(f.directory).some((name) => name.endsWith(".tmp"))
+      ).toBe(false);
+      expect(
+        JSON.parse(fs.readFileSync(f.file("host.json"), "utf8")) as unknown
+      ).toMatchObject({ hostId: HOST_URI });
+    }
+  );
+  it("leaves a legacy host record and budget intact when atomic conversion cannot commit, then recovers on restart", () => {
+    const f = fixture();
+    f.store.ensureHostId();
+    const budget = f.store.reserveInferenceAttempt();
+    const legacy = { version: 1, hostId: HOST_UUID };
+    fs.writeFileSync(f.file("host.json"), JSON.stringify(legacy) + "\n");
+    const renameSync = vi.fn<typeof fs.renameSync>(() => {
+      throw Object.assign(new Error(DETAIL), { code: "EACCES" });
+    });
+    const blocked = new CredentialStore(f.base, {
+      ...f.deps,
+      fs: { ...fs, renameSync },
+    });
+    expect(() => blocked.ensureHostId()).toThrow("permission_denied");
+    expect(renameSync).toHaveBeenCalledTimes(1);
+    expect(
+      JSON.parse(fs.readFileSync(f.file("host.json"), "utf8")) as unknown
+    ).toEqual(legacy);
+    expect(f.store.getBudget()).toEqual(budget);
+    expect(
+      fs.readdirSync(f.directory).some((name) => name.endsWith(".tmp"))
+    ).toBe(false);
+    expect(new CredentialStore(f.base, f.deps).ensureHostId()).toBe(HOST_URI);
+    expect(f.store.getBudget()).toEqual(budget);
+  });
+  it("rejects an invalid newly generated UUID rather than creating a host record", () => {
+    const f = fixture();
+    const invalid = new CredentialStore(f.base, {
+      ...f.deps,
+      randomUUID: () => "01234567-89ab-1cde-8f01-23456789abcd",
+    });
+    expect(() => invalid.ensureHostId()).toThrow("storage_failed");
+    expect(fs.readdirSync(f.directory)).toEqual([]);
+  });
+  it.each([
+    "not-a-uuid",
+    "01234567-89ab-1cde-8f01-23456789abcd",
+    "01234567-89ab-4cde-0f01-23456789abcd",
+    "urn:uuid:01234567-89ab-1cde-8f01-23456789abcd",
+    "urn:uuid:01234567-89ab-4cde-0f01-23456789abcd",
+    "urn:uuid:" + HOST_UUID.toUpperCase(),
+    "https://example.invalid/host",
+    42,
+  ])(
+    "fails closed on a malformed or non-v4 stored host ID (%s), never replacing it",
+    (hostId) => {
+      const f = fixture();
+      f.store.ensureHostId();
+      const budget = f.store.reserveInferenceAttempt();
+      const bad = { version: 1, hostId };
+      fs.writeFileSync(f.file("host.json"), JSON.stringify(bad));
+      const randomUUID = vi.fn(() => f.deps.randomUUID());
+      const renameSync = vi.fn<typeof fs.renameSync>((from, to) =>
+        fs.renameSync(from, to)
+      );
+      const store = new CredentialStore(f.base, {
+        ...f.deps,
+        randomUUID,
+        fs: { ...fs, renameSync },
+      });
+      expect(() => store.ensureHostId()).toThrow("storage_invalid");
+      expect(randomUUID).not.toHaveBeenCalled();
+      expect(renameSync).not.toHaveBeenCalled();
+      expect(
+        JSON.parse(fs.readFileSync(f.file("host.json"), "utf8")) as unknown
+      ).toEqual(bad);
+      expect(f.store.getBudget()).toEqual(budget);
+    }
+  );
 });

@@ -17,6 +17,7 @@ import {
   validToken,
   record,
   validUuid,
+  validHostId,
   errorCode,
   systemSigninClock,
   type SigninAuthorization,
@@ -91,7 +92,7 @@ export function buildAuthorizationUrl(
     options.redirectUri
   )?.[1];
   if (
-    !validUuid(options.hostId) ||
+    !validHostId(options.hostId) ||
     !port ||
     Number(port) > 65535 ||
     (options.clientId !== undefined &&
