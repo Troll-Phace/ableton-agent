@@ -24,6 +24,21 @@ import {
 } from "../src/companion-feasibility/diagnostic-budget.js";
 import { SDK_EXPERIMENT } from "../src/companion-feasibility/sdk-responses.js";
 import {
+  SDK_AUTHORIZATION_FILE,
+  SDK_BUDGET_FILE,
+} from "../src/companion-feasibility/sdk-budget.js";
+import { CompanionPreflight } from "../src/companion-feasibility/preflight.js";
+import {
+  MODELS_ENDPOINT,
+  RESPONSES_ENDPOINT,
+  TOKEN_ENDPOINT,
+} from "../src/extension/feasibility/signin-contracts.js";
+import {
+  sdkCompleted,
+  sdkStream,
+  SDK_MODEL,
+} from "./fixtures/chatgpt-sdk-responses.js";
+import {
   COMPANION_CONTROL_ORIGIN,
   type RunningCompanion,
 } from "../src/companion-feasibility/main.js";
@@ -53,6 +68,9 @@ import {
   LOCAL_ID,
   DETAIL,
   NOW,
+  makeConnection,
+  tokenPayload,
+  json,
 } from "./fixtures/chatgpt-signin.js";
 
 const disposals: (() => void)[] = [];
@@ -135,11 +153,27 @@ function assertError(reply: Reply, status: number, code: string) {
   expect(reply.headers["access-control-allow-origin"]).toBeUndefined();
   expect(reply.body).not.toContain(DETAIL);
 }
-function fixture() {
+function fixture(sdkMode = false) {
   const home = companionHome();
   disposals.push(home.dispose);
+  if (sdkMode) {
+    const storage = createCompanionStorage(home.deps);
+    storage.store.saveConnection(makeConnection());
+    storage.store.reserveInferenceAttempt();
+    const old = new DiagnosticBudget(
+      createCompanionStorage(home.deps, true).diagnosticRecords()
+    );
+    old.authorize(true);
+    old.reserve();
+    vi.spyOn(CompanionPreflight.prototype, "run").mockResolvedValue({
+      nativeTransport: true,
+      callbackBinding: true,
+      privateStorage: true,
+      bundledVerifier: true,
+    });
+  }
   const f = runtimeFixture(home);
-  const runtime = createCompanionRuntime(f.deps);
+  const runtime = createCompanionRuntime({ ...f.deps, sdkLiveProbe: sdkMode });
   let now = NOW,
     serial = 0;
   const showPairingCode = vi.fn<(code: string) => void>();
@@ -213,6 +247,126 @@ function fixture() {
   };
 }
 describe("F3C owner-paired local control (in process only)", () => {
+  it("authorizes and runs SDK only as separate paired and CSRF-protected actions, and prevents concurrent duplicate dispatch", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(() => Promise.reject(new Error("Unexpected non-injected Fetch")))
+    );
+    const f = fixture(true);
+    try {
+      const authorize = {
+        action: "authorize_sdk_diagnostic",
+        operatorStarted: true,
+        ownerAuthorized: true,
+        experiment: SDK_EXPERIMENT,
+      };
+      const run = { ...authorize, action: "run_sdk_diagnostic" };
+      const auth = await f.pair(await f.start());
+      for (const payload of [authorize, run]) {
+        assertError(
+          await f.send(ACTION_PATH, payload),
+          401,
+          "session_required"
+        );
+        assertError(
+          await f.action(auth, payload, { [CSRF_HEADER]: undefined }),
+          403,
+          "csrf_rejected"
+        );
+        assertError(
+          await f.action(auth, { ...payload, ownerAuthorized: false }),
+          400,
+          "invalid_request"
+        );
+      }
+      const send = (action: string, extra: object = {}) =>
+        f.action(auth, { action, operatorStarted: true, ...extra });
+      f.network.enqueueDiscovery();
+      f.network.enqueueJwks();
+      expect(body(await send("preflight"))).toMatchObject({
+        snapshot: { preflightReady: true },
+      });
+      f.network.enqueue(
+        TOKEN_ENDPOINT,
+        json(tokenPayload({ id_token: undefined }))
+      );
+      expect(body(await send("refresh"))).toMatchObject({
+        snapshot: { refreshVerified: true },
+      });
+      f.network.enqueue(
+        MODELS_ENDPOINT,
+        json({
+          models: [
+            {
+              visibility: "list",
+              slug: SDK_MODEL,
+              display_name: "Synthetic model",
+            },
+          ],
+        })
+      );
+      expect(body(await send("load_models"))).toMatchObject({
+        snapshot: { code: "models_loaded" },
+      });
+      expect(
+        body(await send("select_model", { modelSlug: SDK_MODEL }))
+      ).toMatchObject({ snapshot: { selectedModelSlug: SDK_MODEL } });
+      expect(
+        body(
+          await send("confirm_plan_only", {
+            planOnlyConfirmed: true,
+            creditFallbackDisabled: true,
+          })
+        )
+      ).toMatchObject({
+        snapshot: { planOnlyConfirmed: true, creditFallbackDisabled: true },
+      });
+      assertError(await f.action(auth, run), 403, "invalid_request");
+      expect(fs.existsSync(f.home.file(SDK_AUTHORIZATION_FILE))).toBe(false);
+      expect(fs.existsSync(f.home.file(SDK_BUDGET_FILE))).toBe(false);
+      const authorized = await f.action(auth, authorize);
+      expect(authorized.status).toBe(200);
+      expect(body(authorized)).toMatchObject({
+        runtime: { sdk: { allowanceAvailable: true } },
+      });
+      expect(
+        JSON.parse(fs.readFileSync(f.home.file(SDK_BUDGET_FILE), "utf8"))
+      ).toMatchObject({ attempts: 0 });
+      const started = Promise.withResolvers<void>();
+      const reply = Promise.withResolvers<Response>();
+      f.network.enqueue(RESPONSES_ENDPOINT, () => {
+        started.resolve();
+        return reply.promise;
+      });
+      const running = f.action(auth, run);
+      await started.promise;
+      expect(
+        JSON.parse(fs.readFileSync(f.home.file(SDK_BUDGET_FILE), "utf8"))
+      ).toMatchObject({ attempts: 1 });
+      assertError(await f.action(auth, run), 409, "operation_busy");
+      assertError(await f.action(auth, authorize), 409, "operation_busy");
+      reply.resolve(sdkStream(sdkCompleted()).response);
+      const done = await running;
+      expect(body(done)).toMatchObject({
+        runtime: {
+          sdk: {
+            allowanceAvailable: false,
+            result: { outcome: "pass", markerAcknowledged: true },
+          },
+        },
+      });
+      assertError(await f.action(auth, run), 403, "invalid_request");
+      expect(
+        f.network.calls.filter((call) => call.url === RESPONSES_ENDPOINT)
+      ).toHaveLength(1);
+      expect(f.network.unexpected).toEqual([]);
+    } finally {
+      await f.control.close?.();
+      await f.runtime.shutdown();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("starts only the fixed panel and pairs once with HttpOnly Strict cookie, ephemeral CSRF and no provider activity", async () => {
     const f = fixture();
     const code = await f.start();
@@ -487,12 +641,12 @@ describe("F3C owner-paired local control (in process only)", () => {
 async function actualPackageEntry() {
   const root = process.cwd();
   const script = fs.readFileSync("scripts/build-chatgpt-companion.ts", "utf8");
-  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.5");
+  expect(/const version = "([^"]+)";/.exec(script)?.[1]).toBe("0.0.6");
   const adapter = /const adapterEntry = `([\s\S]*?)`;/u.exec(script)?.[1];
   if (!adapter) throw Error("Missing companion entry adapter");
   const view = fs
     .readFileSync("src/companion-feasibility/control-view.html", "utf8")
-    .replaceAll("{{COMPANION_VERSION}}", "0.0.5")
+    .replaceAll("{{COMPANION_VERSION}}", "0.0.6")
     .replaceAll("{{BUILD_ID}}", "f3c-offline-test");
   return await build({
     absWorkingDir: root,
@@ -509,7 +663,7 @@ async function actualPackageEntry() {
     target: "node24",
     supported: { "dynamic-import": false },
     define: {
-      __COMPANION_VERSION__: JSON.stringify("0.0.5"),
+      __COMPANION_VERSION__: JSON.stringify("0.0.6"),
       __COMPANION_BUILD_ID__: JSON.stringify("f3c-offline-test"),
       __COMPANION_NODE__: JSON.stringify(">=24.14.1"),
       __COMPANION_VIEW__: JSON.stringify(view),
@@ -539,6 +693,7 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           "diagnostic-budget",
           "response-diagnostic",
           "sdk-responses",
+          "sdk-budget",
         ].map((x) => "src/companion-feasibility/" + x + ".ts"),
         ...[
           "contracts",
@@ -775,13 +930,13 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
     )
       throw Error("Missing launch export");
     expect(entry).toMatchObject({
-      version: "0.0.5",
+      version: "0.0.6",
       buildId: "f3c-offline-test",
       requiredNode: ">=24.14.1",
     });
     const launch = entry.launchCompanion as () => Promise<RunningCompanion>;
-    // Version 0.0.5 freezes both exhausted experiment records, with no new
-    // live allowance. Seed only synthetic accounting, not credentials/consent.
+    // Version 0.0.6 freezes both exhausted experiment records and permits no
+    // SDK request until explicitly authorized. Seed only old accounting.
     const storage = createCompanionStorage(home.deps);
     expect(storage.store.reserveInferenceAttempt().attempts).toBe(1);
     const originalBudget = fs.readFileSync(home.file("run-budget.json"));
@@ -832,7 +987,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
           },
           sdk: {
             experiment: SDK_EXPERIMENT,
-            mode: "offline_only",
+            mode: "operator_test",
+            budget: { cap: 1, state: "not_authorized", attempts: null },
             allowanceAvailable: false,
           },
         },
@@ -890,6 +1046,8 @@ describe("F3C actual package entry, isolation and credential-free smoke", () => 
       }
       expect(calls).toEqual(["/companion-stream", "/companion-abort"]);
       expect(external).toEqual([]);
+      expect(fs.existsSync(home.file(SDK_AUTHORIZATION_FILE))).toBe(false);
+      expect(fs.existsSync(home.file(SDK_BUDGET_FILE))).toBe(false);
       expect(panel).toHaveBeenCalledTimes(1);
       expect(checked.body).not.toContain(pairing);
       expect(checked.body).not.toContain(csrf);
