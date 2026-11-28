@@ -29,6 +29,7 @@
     "src/extension/feasibility/contracts.ts",
     "src/companion/**/*",
     "src/shared/provider.ts",
+    "src/shared/companion-channel.ts",
     "src/shared/tools.ts",
     "src/shared/refs.ts"
   ]
