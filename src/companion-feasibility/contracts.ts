@@ -44,7 +44,7 @@ export type ControlAction =
       experiment: typeof SDK_EXPERIMENT;
     }
   | {
-      action: "run_sdk_tool_roundtrip";
+      action: "authorize_sdk_tool_roundtrip" | "run_sdk_tool_roundtrip";
       operatorStarted: true;
       ownerAuthorized: true;
       experiment: typeof SDK_TOOL_EXPERIMENT;
@@ -153,6 +153,7 @@ export function parseControlAction(value: unknown): ControlAction | undefined {
             experiment: SDK_EXPERIMENT,
           }
         : undefined;
+    case "authorize_sdk_tool_roundtrip":
     case "run_sdk_tool_roundtrip":
       return exact(row, [...keys, "ownerAuthorized", "experiment"]) &&
         row.ownerAuthorized === true &&

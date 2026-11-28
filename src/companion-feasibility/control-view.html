@@ -321,7 +321,7 @@
             </p>
           </div>
           <div id="sdk-tool-roundtrip" hidden>
-            <p>
+            <p id="sdk-tool-summary">
               <strong
                 >SDK synthetic tool roundtrip — offline checkpoint.</strong
               >
@@ -332,13 +332,19 @@
               Historical budgets: not checked.
             </p>
             <label
-              ><input type="checkbox" id="sdk-tool-consent" disabled /> Confirm
-              the separate synthetic-only two-step test allowance.</label
+              ><input type="checkbox" id="sdk-tool-consent" disabled />
+              <span id="sdk-tool-consent-label"
+                >Confirm the separate synthetic-only two-step test
+                allowance.</span
+              ></label
             >
+            <button id="authorize-sdk-tool-roundtrip" hidden disabled>
+              Authorize named SDK tool roundtrip (up to two requests)
+            </button>
             <button id="run-sdk-tool-roundtrip" disabled>
               Run fixed SDK echo roundtrip (synthetic only)
             </button>
-            <p class="muted">
+            <p id="sdk-tool-note" class="muted">
               The native package has no usable allowance. No new budget,
               arbitrary tools, replay, retry, or Live bridge.
             </p>
@@ -389,6 +395,7 @@
         "run-diagnostic",
         "run-sdk-diagnostic",
         "authorize-sdk-diagnostic",
+        "authorize-sdk-tool-roundtrip",
         "run-sdk-tool-roundtrip",
         "signout",
         "quit",
@@ -440,6 +447,8 @@
         const sdkMode = !!sdk;
         const sdkTool = r.sdkToolRoundtrip;
         const sdkToolMode = !!sdkTool;
+        const sdkToolLiveProbe =
+          sdkTool?.mode === "operator_test" && !!sdkTool.budget;
         const sdkLiveProbe = sdk?.mode === "operator_test" && !!sdk.budget;
         const diagnosticMode = !!diagnostic;
         const initialBudget = diagnosticMode
@@ -449,7 +458,9 @@
           diagnosticMode &&
           (sdkMode
             ? (sdkToolMode
-                ? sdkTool.allowanceAvailable === true &&
+                ? (sdkToolLiveProbe
+                    ? ["not_authorized", "ready"].includes(sdkTool.budget.state)
+                    : sdkTool.allowanceAvailable === true) &&
                   sdk?.budget?.state === "exhausted" &&
                   sdk.budget.attempts === 1
                 : sdkLiveProbe
@@ -463,6 +474,16 @@
         $("text-diagnostic").hidden = !diagnosticMode || sdkMode;
         $("sdk-diagnostic").hidden = !sdkMode || sdkToolMode;
         $("sdk-tool-roundtrip").hidden = !sdkToolMode;
+        $("authorize-sdk-tool-roundtrip").hidden = !sdkToolLiveProbe;
+        $("sdk-tool-summary").textContent = sdkToolLiveProbe
+          ? "Official SDK fixed synthetic echo — owner-operated experiment. Review the exact artifact and PR before operating. All three historical allowances remain frozen."
+          : "SDK synthetic tool roundtrip — offline checkpoint. No live tool request is authorized or available.";
+        $("sdk-tool-consent-label").textContent = sdkToolLiveProbe
+          ? "I reviewed this artifact and authorize at most two additional fixed synthetic SDK requests, using my ChatGPT plan only with credit fallback disabled. Preserve all three historical budgets."
+          : "Confirm the separate synthetic-only two-step test allowance.";
+        $("sdk-tool-note").textContent = sdkToolLiveProbe
+          ? "Authorization and Run are separate actions. Each request is durably reserved before dispatch; the second is available only after validated echo in this same run. No restart continuation, replay, retry, reset, refund, third request, arbitrary tools or fallback."
+          : "The native package has no usable allowance. No new budget, arbitrary tools, replay, retry, or Live bridge.";
         $("authorize-sdk-diagnostic").hidden = !sdkLiveProbe;
         $("sdk-summary").textContent = sdkLiveProbe
           ? "Official SDK one-request operator test. Review the exact artifact and PR before personally operating this experiment. The original and previous diagnostic budgets are frozen."
@@ -668,10 +689,24 @@
               ? "no verified allowance"
               : sdk.budget.attempts + "/1");
         }
+        const canAuthorizeTool =
+          sdkToolLiveProbe &&
+          canAuthorize &&
+          sdkTool.budget.state === "not_authorized";
         const canRunTool =
-          sdkToolMode && sdkTool.allowanceAvailable === true && canAuthorize;
-        $("sdk-tool-consent").disabled = !canRunTool;
-        if (!canRunTool && !busy) $("sdk-tool-consent").checked = false;
+          sdkToolMode &&
+          sdkTool.allowanceAvailable === true &&
+          canAuthorize &&
+          (!sdkToolLiveProbe ||
+            (sdkTool.budget.state === "ready" &&
+              sdkTool.budget.attempts === 0));
+        $("sdk-tool-consent").disabled = !canRunTool && !canAuthorizeTool;
+        if (!canRunTool && !canAuthorizeTool && !busy)
+          $("sdk-tool-consent").checked = false;
+        disable(
+          "authorize-sdk-tool-roundtrip",
+          !canAuthorizeTool || !$("sdk-tool-consent").checked
+        );
         disable(
           "run-sdk-tool-roundtrip",
           !canRunTool || !$("sdk-tool-consent").checked
@@ -690,7 +725,15 @@
               ? "unknown"
               : sdk.budget.attempts + "/1 (frozen)") +
             " · Tool allowance: " +
-            (sdkTool.allowanceAvailable ? "synthetic test only" : "none")
+            (sdkToolLiveProbe
+              ? sdkTool.budget.state.replaceAll("_", " ") +
+                " · " +
+                (sdkTool.budget.attempts == null
+                  ? "no verified allowance"
+                  : sdkTool.budget.attempts + "/2")
+              : sdkTool.allowanceAvailable
+                ? "synthetic test only"
+                : "none")
           : "SDK tool roundtrip unavailable.";
         $("evidence").textContent = JSON.stringify(
           { snapshot: s, runtime: r },
@@ -845,6 +888,13 @@
       $("run-sdk-tool-roundtrip").addEventListener("click", () => {
         if ($("sdk-tool-consent").checked)
           void action("run_sdk_tool_roundtrip", {
+            ownerAuthorized: true,
+            experiment: "p15_3_official_sdk_tool_roundtrip",
+          });
+      });
+      $("authorize-sdk-tool-roundtrip").addEventListener("click", () => {
+        if ($("sdk-tool-consent").checked)
+          void action("authorize_sdk_tool_roundtrip", {
             ownerAuthorized: true,
             experiment: "p15_3_official_sdk_tool_roundtrip",
           });

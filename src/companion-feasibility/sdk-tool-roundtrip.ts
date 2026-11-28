@@ -39,7 +39,7 @@ export interface SdkToolRoundtripAuthorization {
 }
 export interface SdkToolRoundtripDependencies
   extends SdkStreamDependencies, SdkConnectionDependencies {
-  /** Test seam only; the native package has no authorization or reservation. */
+  /** Runtime-owned reservation seam; synthetic injection is used only offline. */
   authorization?: SdkToolRoundtripAuthorization;
 }
 export interface SdkToolRoundtripResult {

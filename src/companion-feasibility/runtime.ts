@@ -27,6 +27,7 @@ import {
 import { SigninSession } from "../extension/feasibility/signin-session.js";
 import { DiagnosticBudget } from "./diagnostic-budget.js";
 import { SdkBudget, type SdkBudgetStatus } from "./sdk-budget.js";
+import { SdkToolBudget, type SdkToolBudgetStatus } from "./sdk-tool-budget.js";
 import {
   SDK_EXPERIMENT,
   SdkResponses,
@@ -80,6 +81,8 @@ export interface CompanionRuntimeDependencies extends OfficialHttpDependencies {
   sdkLiveProbe?: boolean;
   /** 0.0.7 offline tool proof; no live allowance or durable new budget. */
   sdkToolRoundtripMode?: boolean;
+  /** 0.0.8: separate explicit durable owner-operated tool experiment. */
+  sdkToolLiveProbe?: boolean;
   sdkToolRoundtripAuthorization?: SdkToolRoundtripAuthorization;
   /** Synthetic direct-runtime tests only. Never configured by the packaged CLI. */
   sdkAuthorization?: SdkDiagnosticAuthorization;
@@ -112,6 +115,7 @@ export function nativeCompanionRuntimeDependencies(): CompanionRuntimeDependenci
     diagnosticMode: true,
     sdkMode: true,
     sdkToolRoundtripMode: true,
+    sdkToolLiveProbe: true,
     browser: (url, cancellation) =>
       launchAuthorizationBrowser(
         url,
@@ -131,7 +135,14 @@ export interface CompanionRuntimeStatus {
   preflight?: CompanionPreflightReport;
   diagnostic?: TextDiagnosticStatus;
   sdk?: SdkRuntimeStatus;
-  sdkToolRoundtrip?: SdkToolRoundtripStatus;
+  sdkToolRoundtrip?: SdkToolRuntimeStatus;
+}
+export interface SdkToolRuntimeStatus extends Omit<
+  SdkToolRoundtripStatus,
+  "mode"
+> {
+  mode: "offline_only" | "operator_test";
+  budget?: SdkToolBudgetStatus;
 }
 export interface SdkRuntimeStatus extends Omit<SdkDiagnosticStatus, "mode"> {
   mode: "offline_only" | "operator_test";
@@ -154,13 +165,15 @@ export class CompanionRuntime {
   private readonly sdkLiveBudget?: SdkBudget;
   private readonly priorSdkBudget?: SdkBudget;
   private readonly sdkToolRoundtrip?: SdkToolRoundtrip;
+  private readonly sdkToolLiveBudget?: SdkToolBudget;
   private readonly priorDiagnosticBudget?: DiagnosticBudget;
   private readonly stopControl = createProbeCancellation();
   private readonly requests = new Set<Promise<unknown>>();
   private shutdownTask?: Promise<CompanionRuntimeShutdown>;
 
   constructor(private readonly deps: CompanionRuntimeDependencies) {
-    const sdkToolMode = deps.sdkToolRoundtripMode === true;
+    const sdkToolLiveProbe = deps.sdkToolLiveProbe === true;
+    const sdkToolMode = deps.sdkToolRoundtripMode === true || sdkToolLiveProbe;
     const sdkLiveProbe = deps.sdkLiveProbe === true && !sdkToolMode;
     const sdkMode = deps.sdkMode === true || sdkLiveProbe || sdkToolMode;
     const diagnosticMode = sdkMode || deps.diagnosticMode === true;
@@ -312,6 +325,11 @@ export class CompanionRuntime {
       if (sdkToolMode) {
         const priorSdk = new SdkBudget(this.storage.sdkDiagnosticRecords());
         this.priorSdkBudget = priorSdk;
+        const toolBudget = sdkToolLiveProbe
+          ? new SdkToolBudget(this.storage.sdkToolDiagnosticRecords())
+          : undefined;
+        this.sdkToolLiveBudget = toolBudget;
+        let reservedStep: 0 | 1 | 2 = 0;
         this.sdkToolRoundtrip = new SdkToolRoundtrip({
           fetch: deps.fetch,
           AbortController: deps.AbortController,
@@ -329,8 +347,43 @@ export class CompanionRuntime {
               sdkText.attempts !== 1
             )
               throw new SigninFault("storage_invalid");
+            if (toolBudget) {
+              const current = toolBudget.status();
+              const expected =
+                reservedStep === 0
+                  ? "ready"
+                  : reservedStep === 1
+                    ? "active"
+                    : "exhausted";
+              if (
+                current.state !== expected ||
+                current.attempts !== reservedStep
+              )
+                throw new SigninFault("storage_invalid");
+            }
           },
-          authorization: deps.sdkToolRoundtripAuthorization,
+          authorization: toolBudget
+            ? {
+                isAuthorized: () => {
+                  const current = toolBudget.status();
+                  return (
+                    (reservedStep === 0 && current.state === "ready") ||
+                    (reservedStep === 1 && current.state === "active")
+                  );
+                },
+                reserve: (step) => {
+                  if (step !== reservedStep + 1) return false;
+                  const confirmed = toolBudget.reserve(step);
+                  if (
+                    confirmed.attempts !== step ||
+                    confirmed.state !== (step === 1 ? "active" : "exhausted")
+                  )
+                    return false;
+                  reservedStep = step;
+                  return true;
+                },
+              }
+            : deps.sdkToolRoundtripAuthorization,
         });
       }
     }
@@ -390,7 +443,15 @@ export class CompanionRuntime {
             }
           : {}),
       ...(this.sdkToolRoundtrip
-        ? { sdkToolRoundtrip: this.sdkToolRoundtrip.status() }
+        ? {
+            sdkToolRoundtrip: this.sdkToolLiveBudget
+              ? {
+                  ...this.sdkToolRoundtrip.status(),
+                  mode: "operator_test" as const,
+                  budget: this.sdkToolLiveBudget.status(),
+                }
+              : this.sdkToolRoundtrip.status(),
+          }
         : {}),
     };
   }
@@ -476,7 +537,21 @@ export class CompanionRuntime {
     );
   }
 
-  /** One session generation spans both fixed SDK requests. No native allowance. */
+  /** Explicit named authorization, separate from Run and plan-only consent. */
+  async authorizeSdkToolRoundtrip(ownerAuthorized: boolean): Promise<void> {
+    const budget = this.sdkToolLiveBudget;
+    if (!budget || ownerAuthorized !== true)
+      throw new SigninFault("operator_required");
+    await this.session.authorizeTextDiagnostic(
+      { operatorStarted: true },
+      (context) => {
+        this.verifySdkAuthorizationConnection(context);
+        budget.authorize(ownerAuthorized);
+      }
+    );
+  }
+
+  /** One session generation spans both fixed SDK requests. */
   async runSdkToolRoundtrip(ownerAuthorized: boolean): Promise<void> {
     const tool = this.sdkToolRoundtrip;
     if (!tool || ownerAuthorized !== true)
@@ -486,11 +561,16 @@ export class CompanionRuntime {
     await this.session.runSdkToolRoundtrip(
       { operatorStarted: true },
       async (context) => {
+        const remove = context.cancellation?.onCancel(() =>
+          this.sdkToolLiveBudget?.finish()
+        );
         const task = tool.run(context, ownerAuthorized);
         this.requests.add(task);
         try {
           return await task;
         } finally {
+          remove?.();
+          this.sdkToolLiveBudget?.finish();
           this.requests.delete(task);
         }
       },
